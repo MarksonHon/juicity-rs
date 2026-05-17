@@ -49,9 +49,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Zig
-        run: |
-          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew install zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: master
 
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2.78.3
@@ -109,9 +109,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Zig
-        run: |
-          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew install zig
+        uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: master
 
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2.78.3
