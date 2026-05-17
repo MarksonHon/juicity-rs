@@ -334,17 +334,16 @@ async fn handle_udp_datagram(
 }
 
 /// Read one UDP response from a QUIC recv stream.
-/// Returns the raw payload (the addr/port are already known from the session).
+/// Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
 async fn read_one_udp_response(
     recv: &mut quinn::RecvStream,
 ) -> anyhow::Result<Vec<u8>> {
-    let (network, _resp_addr, _resp_port) =
-        tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, protocol::read_proxy_header_async(recv))
-            .await??;
-
-    if network != protocol::NETWORK_UDP {
-        anyhow::bail!("unexpected network in UDP response: {}", network);
-    }
+    // Discard the per-response address — the session already knows the target
+    tokio::time::timeout(
+        consts::DEFAULT_NAT_TIMEOUT,
+        protocol::read_trojanc_addr_async(recv),
+    )
+    .await??;
 
     let mut len_buf = [0u8; 2];
     tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, recv.read_exact(&mut len_buf)).await??;

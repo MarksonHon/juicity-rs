@@ -222,7 +222,11 @@ impl JuicityClient {
         Ok((send, recv))
     }
 
-    /// Open a UDP stream with first datagram: proxy_header(UDP) + len(2) + payload
+    /// Open a UDP stream with first datagram.
+    ///
+    /// Wire format (upstream-compatible):
+    ///   stream header:   [network=3][trojanc_addr]
+    ///   first datagram:  [trojanc_addr][len(2)][payload]
     pub async fn open_udp_stream(
         &self,
         addr: &str,
@@ -232,9 +236,13 @@ impl JuicityClient {
         let conn = self.connect().await?;
         let (mut send, recv) = conn.open_bi().await?;
 
-        // Build and send proxy_header(UDP) + len(2) + payload
-        let header = protocol::build_proxy_header(protocol::NETWORK_UDP, addr, port)?;
-        send.write_all(&header).await?;
+        // Stream header: [network=3][trojanc_addr]
+        let stream_header = protocol::build_proxy_header(protocol::NETWORK_UDP, addr, port)?;
+        send.write_all(&stream_header).await?;
+
+        // First datagram: [trojanc_addr][len(2)][payload]
+        let dgram_addr = protocol::build_trojanc_addr(addr, port)?;
+        send.write_all(&dgram_addr).await?;
         let len = (first_packet.len() as u16).to_be_bytes();
         send.write_all(&len).await?;
         send.write_all(first_packet).await?;
@@ -242,16 +250,18 @@ impl JuicityClient {
         Ok((send, recv))
     }
 
-    /// Send a subsequent UDP datagram on an existing stream
-    /// Each datagram = proxy_header(UDP=3) + addr/port + len(2) + payload
+    /// Send a subsequent UDP datagram on an existing stream.
+    ///
+    /// Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
+    /// No leading network byte — each datagram carries only its own address.
     pub async fn send_udp_datagram(
         send: &mut SendStream,
         addr: &str,
         port: u16,
         data: &[u8],
     ) -> anyhow::Result<()> {
-        let header = protocol::build_proxy_header(protocol::NETWORK_UDP, addr, port)?;
-        send.write_all(&header).await?;
+        let addr_header = protocol::build_trojanc_addr(addr, port)?;
+        send.write_all(&addr_header).await?;
         let len = (data.len() as u16).to_be_bytes();
         send.write_all(&len).await?;
         send.write_all(data).await?;

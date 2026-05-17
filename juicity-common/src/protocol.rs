@@ -58,18 +58,21 @@ pub const NETWORK_TCP: u8 = 1;
 pub const NETWORK_UDP: u8 = 3;
 
 // ============================================================
-// Address type codes (per spec)
+// Address type codes — trojanc encoding used by the Go upstream implementation.
+// NOTE: These differ from the Juicity spec document (which lists 0/1/2) but
+// the actual Go code uses trojanc.MetadataTypeToByte which maps IPv4→1,
+// Domain→3, IPv6→4.  All proxy headers and UDP datagrams use this encoding.
 // ============================================================
-pub const ADDR_TYPE_IPV4: u8 = 0;
-pub const ADDR_TYPE_IPV6: u8 = 1;
-pub const ADDR_TYPE_DOMAIN: u8 = 2;
-pub const ADDR_TYPE_NONE: u8 = 255;
+pub const ADDR_TYPE_IPV4: u8 = 1;   // trojanc MetadataTypeIPv4
+pub const ADDR_TYPE_IPV6: u8 = 4;   // trojanc MetadataTypeIPv6
+pub const ADDR_TYPE_DOMAIN: u8 = 3; // trojanc MetadataTypeDomain
+pub const ADDR_TYPE_NONE: u8 = 255; // unused in trojanc; kept for internal use
 
-// trojanc metadata address type codes used in upstream underlay auth payload
-const TROJAN_METADATA_TYPE_IPV4: u8 = 1;
+// trojanc metadata type codes reused for underlay auth payload
+const TROJAN_METADATA_TYPE_IPV4: u8 = ADDR_TYPE_IPV4;
 const TROJAN_METADATA_TYPE_MSG: u8 = 2;
-const TROJAN_METADATA_TYPE_DOMAIN: u8 = 3;
-const TROJAN_METADATA_TYPE_IPV6: u8 = 4;
+const TROJAN_METADATA_TYPE_DOMAIN: u8 = ADDR_TYPE_DOMAIN;
+const TROJAN_METADATA_TYPE_IPV6: u8 = ADDR_TYPE_IPV6;
 const UNDERLAY_PSK_LEN: usize = 32;
 
 // ============================================================
@@ -378,4 +381,81 @@ pub fn gen_token_via_connection(
     conn.export_keying_material(&mut token, uuid.as_bytes(), password.as_bytes())
         .map_err(|e| anyhow::anyhow!("export_keying_material failed: {:?}", e))?;
     Ok(token)
+}
+
+/// Build a trojanc-format address header: [addr_type][addr][port]
+/// Used for UDP per-datagram headers — **no** leading network byte.
+/// Compatible with upstream Go: trojanc.Metadata.PackTo / SealUDP.
+pub fn build_trojanc_addr(addr: &str, port: u16) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(32);
+
+    let addr_type = if addr.contains(':') {
+        ADDR_TYPE_IPV6
+    } else if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+        ADDR_TYPE_IPV4
+    } else {
+        ADDR_TYPE_DOMAIN
+    };
+
+    buf.push(addr_type);
+
+    match addr_type {
+        ADDR_TYPE_IPV4 => {
+            let ip: std::net::Ipv4Addr = addr.parse()?;
+            buf.extend_from_slice(&ip.octets());
+        }
+        ADDR_TYPE_IPV6 => {
+            let ip: std::net::Ipv6Addr = addr.parse()?;
+            buf.extend_from_slice(&ip.octets());
+        }
+        ADDR_TYPE_DOMAIN => {
+            let domain_bytes = addr.as_bytes();
+            let domain_len = u8::try_from(domain_bytes.len())
+                .map_err(|_| anyhow::anyhow!("domain too long: {}", domain_bytes.len()))?;
+            buf.push(domain_len);
+            buf.extend_from_slice(domain_bytes);
+        }
+        _ => anyhow::bail!("unexpected address type"),
+    }
+
+    buf.extend_from_slice(&port.to_be_bytes());
+    Ok(buf)
+}
+
+/// Read a trojanc-format address header: [addr_type][addr][port]
+/// Used for UDP per-datagram headers — **no** leading network byte.
+/// Compatible with upstream Go: trojanc.Metadata.Unpack / PacketConn.ReadFrom.
+pub async fn read_trojanc_addr_async<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<(String, u16)> {
+    let mut addr_type_buf = [0u8; 1];
+    reader.read_exact(&mut addr_type_buf).await?;
+    let addr_type = addr_type_buf[0];
+
+    let addr = match addr_type {
+        ADDR_TYPE_IPV4 => {
+            let mut ip = [0u8; 4];
+            reader.read_exact(&mut ip).await?;
+            std::net::Ipv4Addr::from(ip).to_string()
+        }
+        ADDR_TYPE_IPV6 => {
+            let mut ip = [0u8; 16];
+            reader.read_exact(&mut ip).await?;
+            std::net::Ipv6Addr::from(ip).to_string()
+        }
+        ADDR_TYPE_DOMAIN => {
+            let mut len_buf = [0u8; 1];
+            reader.read_exact(&mut len_buf).await?;
+            let len = len_buf[0] as usize;
+            anyhow::ensure!(len > 0, "trojanc domain length is zero");
+            let mut domain = vec![0u8; len];
+            reader.read_exact(&mut domain).await?;
+            String::from_utf8_lossy(&domain).into_owned()
+        }
+        other => anyhow::bail!("unknown trojanc address type: {}", other),
+    };
+
+    let mut port_buf = [0u8; 2];
+    reader.read_exact(&mut port_buf).await?;
+    Ok((addr, u16::from_be_bytes(port_buf)))
 }

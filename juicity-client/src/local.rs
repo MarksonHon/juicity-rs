@@ -330,13 +330,12 @@ async fn start_udp_assoc_session(
 async fn read_one_udp_response(
     recv: &mut quinn::RecvStream,
 ) -> anyhow::Result<(String, u16, Vec<u8>)> {
-    let (network, resp_addr, resp_port) =
-        tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, protocol::read_proxy_header_async(recv))
-            .await??;
-
-    if network != protocol::NETWORK_UDP {
-        anyhow::bail!("unexpected network in UDP response: {}", network);
-    }
+    // Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
+    let (resp_addr, resp_port) = tokio::time::timeout(
+        consts::DEFAULT_NAT_TIMEOUT,
+        protocol::read_trojanc_addr_async(recv),
+    )
+    .await??;
 
     let mut len_buf = [0u8; 2];
     tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, recv.read_exact(&mut len_buf)).await??;

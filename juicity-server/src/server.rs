@@ -487,12 +487,8 @@ async fn handle_stream(
             handle_tcp_relay(send_stream, recv_stream, dialer, &target).await
         }
         protocol::NETWORK_UDP => {
-            if disable_udp_443 && port == 443 {
-                tracing::debug!("Blocked UDP/443: {}", target);
-                return Ok(());
-            }
-            tracing::debug!("UDP relay: {} -> {}", user_uuid, target);
-            handle_udp_relay(send_stream, recv_stream, dialer, &hostname, port).await
+            tracing::debug!("UDP relay: {}", user_uuid);
+            handle_udp_relay(send_stream, recv_stream, dialer, disable_udp_443).await
         }
         _ => anyhow::bail!("unknown network type: {}", network),
     }
@@ -521,21 +517,31 @@ async fn handle_tcp_relay(
 }
 
 /// UDP over Stream relay.
-/// Per spec: each UDP datagram = [proxy_header(Network=UDP=3)][len(2)][payload]
+/// UDP over Stream relay — upstream-compatible wire format.
+///
+/// Each UDP datagram on the stream (both directions):
+///   [trojanc_addr][len(2)][payload]
+/// No network byte per datagram; the stream header already carries it.
 async fn handle_udp_relay(
     mut send_stream: SendStream,
     mut recv_stream: RecvStream,
     dialer: Arc<dyn crate::dialer::Dialer>,
-    hostname: &str,
-    port: u16,
+    disable_udp_443: bool,
 ) -> anyhow::Result<()> {
     let mut domain_ip_map: HashMap<(String, u16), SocketAddr> = HashMap::new();
-    let first_target_addr = resolve_udp_target(hostname, port, &mut domain_ip_map).await?;
 
+    // First datagram: [trojanc_addr][len(2)][payload]
+    let (first_host, first_port) = protocol::read_trojanc_addr_async(&mut recv_stream).await?;
+
+    if disable_udp_443 && first_port == 443 {
+        tracing::debug!("Blocked UDP/443: {}:{}", first_host, first_port);
+        return Ok(());
+    }
+
+    let first_target_addr = resolve_udp_target(&first_host, first_port, &mut domain_ip_map).await?;
     let remote = dialer.dial_udp(&first_target_addr.to_string()).await?;
     let remote = Arc::new(remote);
 
-    // Read first datagram payload (header already consumed)
     let mut len_buf = [0u8; 2];
     recv_stream.read_exact(&mut len_buf).await?;
     let pkt_len = u16::from_be_bytes(len_buf) as usize;
@@ -549,74 +555,12 @@ async fn handle_udp_relay(
         let mut domain_ip_map = domain_ip_map;
         tokio::spawn(async move {
             loop {
-                // Each subsequent datagram: [proxy_header][len(2)][payload]
-                let mut network = [0u8; 1];
-                if recv_stream.read_exact(&mut network).await.is_err() {
-                    break;
-                }
-                if network[0] != protocol::NETWORK_UDP {
-                    break;
-                }
-
-                let mut addr_type = [0u8; 1];
-                if recv_stream.read_exact(&mut addr_type).await.is_err() {
-                    break;
-                }
-
-                let (t_addr, t_port) = match addr_type[0] {
-                    protocol::ADDR_TYPE_NONE => {
-                        // Skip reading addr, keep current target
-                        ("".to_string(), 0u16)
-                    }
-                    protocol::ADDR_TYPE_IPV4 => {
-                        let mut ip = [0u8; 4];
-                        if recv_stream.read_exact(&mut ip).await.is_err() {
-                            break;
-                        }
-                        let mut pb = [0u8; 2];
-                        if recv_stream.read_exact(&mut pb).await.is_err() {
-                            break;
-                        }
-                        (
-                            std::net::Ipv4Addr::from(ip).to_string(),
-                            u16::from_be_bytes(pb),
-                        )
-                    }
-                    protocol::ADDR_TYPE_IPV6 => {
-                        let mut ip = [0u8; 16];
-                        if recv_stream.read_exact(&mut ip).await.is_err() {
-                            break;
-                        }
-                        let mut pb = [0u8; 2];
-                        if recv_stream.read_exact(&mut pb).await.is_err() {
-                            break;
-                        }
-                        (
-                            std::net::Ipv6Addr::from(ip).to_string(),
-                            u16::from_be_bytes(pb),
-                        )
-                    }
-                    protocol::ADDR_TYPE_DOMAIN => {
-                        let mut lb = [0u8; 1];
-                        if recv_stream.read_exact(&mut lb).await.is_err() {
-                            break;
-                        }
-                        let dlen = lb[0] as usize;
-                        let mut domain = vec![0u8; dlen];
-                        if recv_stream.read_exact(&mut domain).await.is_err() {
-                            break;
-                        }
-                        let mut pb = [0u8; 2];
-                        if recv_stream.read_exact(&mut pb).await.is_err() {
-                            break;
-                        }
-                        (
-                            String::from_utf8_lossy(&domain).to_string(),
-                            u16::from_be_bytes(pb),
-                        )
-                    }
-                    _ => break,
-                };
+                // Each subsequent datagram: [trojanc_addr][len(2)][payload]
+                let (t_addr, t_port) =
+                    match protocol::read_trojanc_addr_async(&mut recv_stream).await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
 
                 let mut len_bytes = [0u8; 2];
                 if recv_stream.read_exact(&mut len_bytes).await.is_err() {
@@ -628,17 +572,14 @@ async fn handle_udp_relay(
                     break;
                 }
 
-                let target = if t_addr.is_empty() {
-                    first_target_addr
-                } else {
+                let target =
                     match resolve_udp_target(&t_addr, t_port, &mut domain_ip_map).await {
                         Ok(addr) => addr,
                         Err(e) => {
                             tracing::debug!("UDP target resolve error: {:?}", e);
                             break;
                         }
-                    }
-                };
+                    };
                 if let Err(e) = remote.send_to(&payload, target).await {
                     tracing::debug!("UDP relay write error: {:?}", e);
                     break;
@@ -654,12 +595,10 @@ async fn handle_udp_relay(
             loop {
                 match remote.recv_from(&mut buf).await {
                     Ok((n, addr)) => {
-                        // Relay back: proxy_header + len + payload
+                        // Response: [trojanc_addr][len(2)][payload] (no network byte)
                         let addr_str = addr.ip().to_string();
                         let addr_port = addr.port();
-                        if let Ok(hdr) =
-                            protocol::build_proxy_header(protocol::NETWORK_UDP, &addr_str, addr_port)
-                        {
+                        if let Ok(hdr) = protocol::build_trojanc_addr(&addr_str, addr_port) {
                             if send_stream.write_all(&hdr).await.is_err() {
                                 break;
                             }
