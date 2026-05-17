@@ -333,10 +333,11 @@ jobs:
       - name: Upload to Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           shopt -s globstar
           for zipfile in artifacts/**/*.zip; do
             echo "Uploading: $zipfile"
-            gh release upload "${{ github.event.release.tag_name }}" "$zipfile" --clobber
+            gh release upload "${{ github.event.release.tag_name }}" "$zipfile" --clobber -R "$GH_REPO"
           done
