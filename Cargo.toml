@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "juicity-common",
+    "juicity-client",
+    "juicity-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["juicity-rs contributors"]
+license = "GPL-3.0"
+description = "A QUIC-based proxy tool (Rust rewrite of juicity)"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+quinn = "0.11"
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+rcgen = "0.13"
+base64 = "0.22"
+sha2 = "0.10"
+bytes = "1"
+hex = "0.4"
+rand = "0.8"
+dns-lookup = "2.0"
+hickory-resolver = "0.24"
+socket2 = "0.5"
+async-trait = "0.1"
+hkdf = "0.12"
+qrcode = "0.14"
+image = "0.25"
+url = "2"

@@ -1,0 +1,22 @@
+{
+  "listen": "0.0.0.0:443",
+  "users": {
+    "00000000-0000-0000-0000-000000000000": "your-password"
+  },
+  "certificate": "/path/to/certificate.pem",
+  "private_key": "/path/to/private_key.pem",
+  "fwmark": "",
+  "send_through": "",
+  "dialer_link": "",
+  "disable_outbound_udp443": false,
+  "server": "",
+  "uuid": "",
+  "password": "",
+  "sni": "",
+  "allow_insecure": false,
+  "pinned_certchain_sha256": "",
+  "protect_path": "",
+  "forward": {},
+  "congestion_control": "bbr",
+  "log_level": "info"
+}

@@ -1,0 +1,323 @@
+# ============================================
+# Juicity-RS Build & Release CI
+# ============================================
+# Supported platforms:
+#   Linux glibc  (zigbuild): x86_64, aarch64, i686, armv7, riscv64gc, loongarch64
+#   Linux musl   (zigbuild): x86_64, aarch64, i686, armv7, riscv64gc, loongarch64
+#   Windows gnu  (static)  : x86_64, aarch64, i686
+#   macOS        (native)  : x86_64, aarch64
+#   FreeBSD      (VM)      : x86_64
+# ============================================
+
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --------------------------------------------------
+  # Linux glibc — zigbuild
+  # --------------------------------------------------
+  linux-glibc:
+    name: Linux glibc (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - i686-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - riscv64gc-unknown-linux-gnu
+          - loongarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2.78.3
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build with zigbuild
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          PKG_NAME="juicity-linux-glibc-${{ matrix.target }}"
+          mkdir -p "dist/${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
+          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+
+      - name: Package zip
+        run: |
+          cd dist
+          zip -r "../juicity-linux-glibc-${{ matrix.target }}.zip" "juicity-linux-glibc-${{ matrix.target }}/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: juicity-linux-glibc-${{ matrix.target }}
+          path: juicity-linux-glibc-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # Linux musl — zigbuild
+  # --------------------------------------------------
+  linux-musl:
+    name: Linux musl (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - i686-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - riscv64gc-unknown-linux-musl
+          - loongarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2.78.3
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build with zigbuild
+        continue-on-error: ${{ contains(matrix.target, 'loongarch64') }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Check if build succeeded
+        id: check_build
+        shell: bash
+        run: |
+          if [ -f "target/${{ matrix.target }}/release/juicity-client" ] && [ -f "target/${{ matrix.target }}/release/juicity-server" ]; then
+            echo "build_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare package
+        if: steps.check_build.outputs.build_ok == 'true'
+        shell: bash
+        run: |
+          PKG_NAME="juicity-linux-musl-${{ matrix.target }}"
+          mkdir -p "dist/${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
+          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+
+      - name: Package zip
+        if: steps.check_build.outputs.build_ok == 'true'
+        run: |
+          cd dist
+          zip -r "../juicity-linux-musl-${{ matrix.target }}.zip" "juicity-linux-musl-${{ matrix.target }}/"
+
+      - name: Upload artifact
+        if: steps.check_build.outputs.build_ok == 'true'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: juicity-linux-musl-${{ matrix.target }}
+          path: juicity-linux-musl-${{ matrix.target }}.zip
+          if-no-files-found: warn
+
+  # --------------------------------------------------
+  # Windows gnu — static compile
+  # --------------------------------------------------
+  windows-gnu:
+    name: Windows gnu (${{ matrix.target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-gnu
+          - aarch64-pc-windows-gnu
+          - i686-pc-windows-gnu
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build (static CRT)
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          PKG_NAME="juicity-windows-gnu-${{ matrix.target }}"
+          mkdir -p "dist/${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client.exe" "dist/${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server.exe" "dist/${PKG_NAME}/"
+          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+
+      - name: Package zip
+        shell: bash
+        run: |
+          cd dist
+          7z a -tzip "../juicity-windows-gnu-${{ matrix.target }}.zip" "juicity-windows-gnu-${{ matrix.target }}/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: juicity-windows-gnu-${{ matrix.target }}
+          path: juicity-windows-gnu-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # macOS — native build
+  # --------------------------------------------------
+  macos:
+    name: macOS (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          PKG_NAME="juicity-macos-${{ matrix.target }}"
+          mkdir -p "dist/${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
+          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+
+      - name: Package zip
+        run: |
+          cd dist
+          zip -r "../juicity-macos-${{ matrix.target }}.zip" "juicity-macos-${{ matrix.target }}/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: juicity-macos-${{ matrix.target }}
+          path: juicity-macos-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # FreeBSD — VM build
+  # --------------------------------------------------
+  freebsd:
+    name: FreeBSD x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.5
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y curl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source $HOME/.cargo/env
+          run: |
+            source $HOME/.cargo/env
+            cargo build --release --target x86_64-unknown-freebsd
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          PKG_NAME="juicity-freebsd-x86_64"
+          mkdir -p "dist/${PKG_NAME}"
+          # Binaries are built inside the VM; copy from the FreeBSD VM output
+          cp -r "target/x86_64-unknown-freebsd/release/juicity-client" "dist/${PKG_NAME}/" || true
+          cp -r "target/x86_64-unknown-freebsd/release/juicity-server" "dist/${PKG_NAME}/" || true
+          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+
+      - name: Package zip
+        run: |
+          cd dist
+          zip -r "../juicity-freebsd-x86_64.zip" "juicity-freebsd-x86_64/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: juicity-freebsd-x86_64
+          path: juicity-freebsd-x86_64.zip
+          if-no-files-found: warn
+
+  # --------------------------------------------------
+  # Release — attach all artifacts to GitHub Release
+  # --------------------------------------------------
+  release:
+    name: Attach to Release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs:
+      - linux-glibc
+      - linux-musl
+      - windows-gnu
+      - macos
+      - freebsd
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          path: artifacts
+
+      - name: Upload to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s globstar
+          for zipfile in artifacts/**/*.zip; do
+            echo "Uploading: $zipfile"
+            gh release upload "${{ github.event.release.tag_name }}" "$zipfile" --clobber
+          done

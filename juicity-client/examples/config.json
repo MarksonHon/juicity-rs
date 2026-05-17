@@ -1,0 +1,22 @@
+{
+  "listen": "127.0.0.1:1080",
+  "server": "example.com:443",
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "password": "your-password",
+  "sni": "example.com",
+  "allow_insecure": false,
+  "pinned_certchain_sha256": "",
+  "protect_path": "",
+  "forward": {
+    "127.0.0.1:8080": "example.com:80"
+  },
+  "users": {},
+  "certificate": "",
+  "private_key": "",
+  "fwmark": "",
+  "send_through": "",
+  "dialer_link": "",
+  "disable_outbound_udp443": false,
+  "congestion_control": "bbr",
+  "log_level": "info"
+}
