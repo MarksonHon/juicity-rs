@@ -132,4 +132,86 @@ impl Config {
         }
         Ok(())
     }
+
+    /// Serialize server-relevant fields to a pretty-printed JSON string.
+    pub fn to_server_json(&self) -> anyhow::Result<String> {
+        let mut map = serde_json::Map::new();
+        map.insert("listen".into(), serde_json::Value::String(self.listen.clone()));
+        map.insert("users".into(), serde_json::to_value(&self.users)?);
+        map.insert("certificate".into(), serde_json::Value::String(self.certificate.clone()));
+        map.insert("private_key".into(), serde_json::Value::String(self.private_key.clone()));
+        map.insert("congestion_control".into(), serde_json::Value::String(self.congestion_control.clone()));
+        map.insert("log_level".into(), serde_json::Value::String(self.log_level.clone()));
+        if !self.fwmark.is_empty() {
+            map.insert("fwmark".into(), serde_json::Value::String(self.fwmark.clone()));
+        }
+        if !self.send_through.is_empty() {
+            map.insert("send_through".into(), serde_json::Value::String(self.send_through.clone()));
+        }
+        if !self.dialer_link.is_empty() {
+            map.insert("dialer_link".into(), serde_json::Value::String(self.dialer_link.clone()));
+        }
+        if self.disable_outbound_udp443 {
+            map.insert("disable_outbound_udp443".into(), serde_json::Value::Bool(true));
+        }
+        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(map))?)
+    }
+
+    /// Serialize client-relevant fields to a pretty-printed JSON string.
+    /// Used when exporting from an existing client config (fields kept as-is).
+    pub fn to_client_json(&self) -> anyhow::Result<String> {
+        let mut map = serde_json::Map::new();
+        map.insert("server".into(), serde_json::Value::String(self.server.clone()));
+        map.insert("uuid".into(), serde_json::Value::String(self.uuid.clone()));
+        map.insert("password".into(), serde_json::Value::String(self.password.clone()));
+        if !self.sni.is_empty() {
+            map.insert("sni".into(), serde_json::Value::String(self.sni.clone()));
+        }
+        if self.allow_insecure {
+            map.insert("allow_insecure".into(), serde_json::Value::Bool(true));
+        }
+        if !self.pinned_certchain_sha256.is_empty() {
+            map.insert("pinned_certchain_sha256".into(), serde_json::Value::String(self.pinned_certchain_sha256.clone()));
+        }
+        map.insert("congestion_control".into(), serde_json::Value::String(self.congestion_control.clone()));
+        if !self.listen.is_empty() {
+            map.insert("listen".into(), serde_json::Value::String(self.listen.clone()));
+        }
+        if !self.forward.is_empty() {
+            map.insert("forward".into(), serde_json::to_value(&self.forward)?);
+        }
+        map.insert("log_level".into(), serde_json::Value::String(self.log_level.clone()));
+        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(map))?)
+    }
+
+    /// Derive a client config JSON from a server config.
+    ///
+    /// The first entry in `users` is used as `uuid`/`password`.
+    /// `server` is set to the server's `listen` address.
+    /// `listen` is set to `0.0.0.0:<socks_port>` (default 1080).
+    pub fn to_client_json_from_server(&self, socks_port: u16) -> anyhow::Result<String> {
+        let (uuid, password) = self
+            .users
+            .iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no users defined in server config"))?;
+
+        let mut map = serde_json::Map::new();
+        map.insert("server".into(), serde_json::Value::String(self.listen.clone()));
+        map.insert("uuid".into(), serde_json::Value::String(uuid.clone()));
+        map.insert("password".into(), serde_json::Value::String(password.clone()));
+        if !self.sni.is_empty() {
+            map.insert("sni".into(), serde_json::Value::String(self.sni.clone()));
+        }
+        if self.allow_insecure {
+            map.insert("allow_insecure".into(), serde_json::Value::Bool(true));
+        }
+        if !self.pinned_certchain_sha256.is_empty() {
+            map.insert("pinned_certchain_sha256".into(), serde_json::Value::String(self.pinned_certchain_sha256.clone()));
+        }
+        map.insert("congestion_control".into(), serde_json::Value::String(self.congestion_control.clone()));
+        map.insert("listen".into(), serde_json::Value::String(format!("0.0.0.0:{}", socks_port)));
+        map.insert("log_level".into(), serde_json::Value::String(self.log_level.clone()));
+        Ok(serde_json::to_string_pretty(&serde_json::Value::Object(map))?)
+    }
 }

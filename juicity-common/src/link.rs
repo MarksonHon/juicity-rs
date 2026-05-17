@@ -16,8 +16,13 @@ pub fn generate_share_link(config: &Config) -> Result<String, String> {
         return Err("No valid user credentials found in config".to_string());
     };
 
-    // Parse server host:port
-    let (host, port) = parse_host_port(&config.server)?;
+    // Parse server host:port; for server configs, fall back to the listen address
+    let server_addr = if !config.server.is_empty() {
+        &config.server
+    } else {
+        &config.listen
+    };
+    let (host, port) = parse_host_port(server_addr)?;
 
     // URL-encode uuid and password
     let encoded_uuid = Serializer::new(String::new())

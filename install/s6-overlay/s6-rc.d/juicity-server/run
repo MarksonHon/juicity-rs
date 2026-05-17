@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/local/bin/juicity-server run -c /usr/local/etc/juicity/server.json
