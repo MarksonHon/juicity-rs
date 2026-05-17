@@ -64,7 +64,7 @@ jobs:
       - name: Prepare package
         shell: bash
         run: |
-          PKG_NAME="juicity-linux-glibc-${{ matrix.target }}"
+          PKG_NAME="juicity-${{ matrix.target }}"
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
@@ -74,13 +74,13 @@ jobs:
       - name: Package zip
         run: |
           cd dist
-          zip -r "../juicity-linux-glibc-${{ matrix.target }}.zip" "juicity-linux-glibc-${{ matrix.target }}/"
+          zip -r "../juicity-${{ matrix.target }}.zip" "juicity-${{ matrix.target }}/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: juicity-linux-glibc-${{ matrix.target }}
-          path: juicity-linux-glibc-${{ matrix.target }}.zip
+          name: juicity-${{ matrix.target }}
+          path: juicity-${{ matrix.target }}.zip
           if-no-files-found: error
 
   # --------------------------------------------------
@@ -136,7 +136,7 @@ jobs:
         if: steps.check_build.outputs.build_ok == 'true'
         shell: bash
         run: |
-          PKG_NAME="juicity-linux-musl-${{ matrix.target }}"
+          PKG_NAME="juicity-${{ matrix.target }}"
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
@@ -147,14 +147,14 @@ jobs:
         if: steps.check_build.outputs.build_ok == 'true'
         run: |
           cd dist
-          zip -r "../juicity-linux-musl-${{ matrix.target }}.zip" "juicity-linux-musl-${{ matrix.target }}/"
+          zip -r "../juicity-${{ matrix.target }}.zip" "juicity-${{ matrix.target }}/"
 
       - name: Upload artifact
         if: steps.check_build.outputs.build_ok == 'true'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: juicity-linux-musl-${{ matrix.target }}
-          path: juicity-linux-musl-${{ matrix.target }}.zip
+          name: juicity-${{ matrix.target }}
+          path: juicity-${{ matrix.target }}.zip
           if-no-files-found: warn
 
   # --------------------------------------------------
@@ -197,7 +197,7 @@ jobs:
       - name: Prepare package
         shell: msys2 {0}
         run: |
-          PKG_NAME="juicity-windows-gnullvm-${{ matrix.target }}"
+          PKG_NAME="juicity-${{ matrix.target }}"
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client.exe" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server.exe" "dist/${PKG_NAME}/"
@@ -205,16 +205,16 @@ jobs:
           cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
 
       - name: Package zip
-        shell: bash
+        shell: pwsh
         run: |
-          cd dist
-          zip -r "../juicity-windows-gnullvm-${{ matrix.target }}.zip" "juicity-windows-gnullvm-${{ matrix.target }}/"
+          Set-Location -Path dist
+          Compress-Archive -Path "juicity-${{ matrix.target }}/" -DestinationPath "../juicity-${{ matrix.target }}.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: juicity-windows-gnullvm-${{ matrix.target }}
-          path: juicity-windows-gnullvm-${{ matrix.target }}.zip
+          name: juicity-${{ matrix.target }}
+          path: juicity-${{ matrix.target }}.zip
           if-no-files-found: error
 
   # --------------------------------------------------
@@ -246,7 +246,7 @@ jobs:
       - name: Prepare package
         shell: bash
         run: |
-          PKG_NAME="juicity-macos-${{ matrix.target }}"
+          PKG_NAME="juicity-${{ matrix.target }}"
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
@@ -256,13 +256,13 @@ jobs:
       - name: Package zip
         run: |
           cd dist
-          zip -r "../juicity-macos-${{ matrix.target }}.zip" "juicity-macos-${{ matrix.target }}/"
+          zip -r "../juicity-${{ matrix.target }}.zip" "juicity-${{ matrix.target }}/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: juicity-macos-${{ matrix.target }}
-          path: juicity-macos-${{ matrix.target }}.zip
+          name: juicity-${{ matrix.target }}
+          path: juicity-${{ matrix.target }}.zip
           if-no-files-found: error
 
   # --------------------------------------------------
@@ -290,7 +290,7 @@ jobs:
       - name: Prepare package
         shell: bash
         run: |
-          PKG_NAME="juicity-freebsd-x86_64"
+          PKG_NAME="juicity-x86_64-unknown-freebsd"
           mkdir -p "dist/${PKG_NAME}"
           cp "target/x86_64-unknown-freebsd/release/juicity-client" "dist/${PKG_NAME}/" || true
           cp "target/x86_64-unknown-freebsd/release/juicity-server" "dist/${PKG_NAME}/" || true
@@ -300,13 +300,13 @@ jobs:
       - name: Package zip
         run: |
           cd dist
-          zip -r "../juicity-freebsd-x86_64.zip" "juicity-freebsd-x86_64/"
+          zip -r "../juicity-x86_64-unknown-freebsd.zip" "juicity-x86_64-unknown-freebsd/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: juicity-freebsd-x86_64
-          path: juicity-freebsd-x86_64.zip
+          name: x86_64-unknown-freebsd
+          path: juicity-x86_64-unknown-freebsd.zip
           if-no-files-found: warn
 
   # --------------------------------------------------
