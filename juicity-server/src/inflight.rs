@@ -84,19 +84,19 @@ impl InFlightUnderlayKey {
         }
     }
 
-    /// Clean up expired keys
+    /// Clean up expired keys using retain() to avoid intermediate Vec allocation.
     pub fn cleanup(&self) {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
-        let expired: Vec<InFlightKey> = inner
+        let expired_keys: Vec<InFlightKey> = inner
             .timestamps
             .iter()
             .filter(|(_, ts)| now.duration_since(**ts) > self.ttl)
             .map(|(k, _)| *k)
             .collect();
-        for key in expired {
-            inner.keys.remove(&key);
-            inner.timestamps.remove(&key);
+        for key in &expired_keys {
+            inner.keys.remove(key);
+            inner.timestamps.remove(key);
         }
     }
 }

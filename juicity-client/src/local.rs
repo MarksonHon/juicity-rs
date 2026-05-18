@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use juicity_common::consts;
 use juicity_common::protocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,7 +22,7 @@ pub struct LocalServer {
 struct UdpOutboundDatagram {
     addr: String,
     port: u16,
-    payload: Vec<u8>,
+    payload: Bytes,
 }
 
 struct UdpSessionEntry {
@@ -259,7 +260,7 @@ async fn start_udp_assoc_session(
         .open_udp_stream(
             &first_datagram.addr,
             first_datagram.port,
-            &first_datagram.payload,
+            &first_datagram.payload[..],
         )
         .await?;
 
@@ -277,7 +278,7 @@ async fn start_udp_assoc_session(
                             &mut send,
                             &datagram.addr,
                             datagram.port,
-                            &datagram.payload,
+                            &datagram.payload[..],
                         )
                         .await
                         .is_err()
@@ -424,7 +425,7 @@ fn parse_socks5_udp_request(packet: &[u8]) -> Option<UdpOutboundDatagram> {
     Some(UdpOutboundDatagram {
         addr,
         port,
-        payload: packet[offset..].to_vec(),
+        payload: Bytes::copy_from_slice(&packet[offset..]),
     })
 }
 

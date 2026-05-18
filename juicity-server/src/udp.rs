@@ -68,10 +68,10 @@ impl UdpEndpointPool {
         if let Some(endpoint) = inner.get_mut(&addr) {
             if !endpoint.is_expired() {
                 endpoint.touch();
-                return Ok((
-                    (endpoint.socket.try_clone()?, endpoint.dial_target.clone()),
-                    false,
-                ));
+                // Clone socket and dial_target only when needed (existing session)
+                let socket = endpoint.socket.try_clone()?;
+                let dial_target = endpoint.dial_target.clone();
+                return Ok(((socket, dial_target), false));
             }
         }
 

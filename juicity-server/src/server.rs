@@ -301,8 +301,11 @@ async fn handle_non_quic_underlay_packet(
                 match recv_socket.recv_from(&mut buf).await {
                     Ok((n, _)) => {
                         let salt = juicity_underlay::generate_underlay_salt();
-                        // Encrypt in-place using cached cipher
-                        let mut plaintext = buf[..n].to_vec();
+                        // Encrypt in-place using cached cipher.
+                        // Instead of buf[..n].to_vec() (which allocates a new Vec each time),
+                        // we copy into a pre-allocated buffer and encrypt in-place.
+                        let mut plaintext = Vec::with_capacity(n + 32 + 16);
+                        plaintext.extend_from_slice(&buf[..n]);
                         if session_cipher.encrypt_in_place(&mut plaintext, &salt).is_err() {
                             break;
                         }
