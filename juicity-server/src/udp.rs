@@ -6,7 +6,6 @@ use tokio::sync::Mutex;
 
 /// Options for creating a UDP endpoint
 pub struct UdpEndpointOptions {
-    pub handler: Box<dyn Fn(&[u8], SocketAddr) -> anyhow::Result<()> + Send + Sync>,
     pub nat_timeout: Duration,
     pub dial_target: String,
 }
@@ -17,9 +16,6 @@ pub struct UdpEndpoint {
     pub dial_target: String,
     created_at: Instant,
     nat_timeout: Duration,
-    // handler is kept for API compatibility but unused internally
-    #[allow(dead_code)]
-    handler: Box<dyn Fn(&[u8], SocketAddr) -> anyhow::Result<()> + Send + Sync>,
 }
 
 impl UdpEndpoint {
@@ -35,7 +31,6 @@ impl UdpEndpoint {
             dial_target: options.dial_target,
             created_at: Instant::now(),
             nat_timeout: options.nat_timeout,
-            handler: options.handler,
         })
     }
 

@@ -4,27 +4,30 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UnderlayPacket {
     pub peer: SocketAddr,
-    pub payload: Bytes,
+    pub payload: Vec<u8>,
 }
+
+/// Maximum number of non-QUIC underlay packets that can be queued before new ones are dropped.
+/// This provides back-pressure and prevents unbounded memory growth under high load.
+pub const UNDERLAY_CHANNEL_CAPACITY: usize = 1024;
 
 /// Split non-QUIC packets away from Quinn while keeping one shared UDP port.
 #[derive(Debug)]
 pub struct DemuxUdpSocket {
     inner: Arc<dyn AsyncUdpSocket>,
-    underlay_tx: tokio::sync::mpsc::UnboundedSender<UnderlayPacket>,
+    underlay_tx: tokio::sync::mpsc::Sender<UnderlayPacket>,
 }
 
 impl DemuxUdpSocket {
     pub fn new(
         inner: Arc<dyn AsyncUdpSocket>,
-        underlay_tx: tokio::sync::mpsc::UnboundedSender<UnderlayPacket>,
+        underlay_tx: tokio::sync::mpsc::Sender<UnderlayPacket>,
     ) -> Self {
         Self { inner, underlay_tx }
     }
@@ -94,9 +97,11 @@ impl AsyncUdpSocket for DemuxUdpSocket {
                     let end = (offset + stride).min(meta[i].len);
                     // Use Bytes::copy_from_slice to create a reference-counted
                     // copy of the payload, avoiding per-packet Vec allocation overhead.
-                    let _ = self.underlay_tx.send(UnderlayPacket {
+                    // Allocate a Vec<u8> directly — avoids the extra to_vec() copy
+                    // that would be needed if we used Bytes here.
+                    let _ = self.underlay_tx.try_send(UnderlayPacket {
                         peer: meta[i].addr,
-                        payload: Bytes::copy_from_slice(&bufs[i][offset..end]),
+                        payload: bufs[i][offset..end].to_vec(),
                     });
                     offset = end;
                 }

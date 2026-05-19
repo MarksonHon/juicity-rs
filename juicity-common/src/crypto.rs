@@ -5,17 +5,22 @@ use sha2::{Digest, Sha256};
 /// Generate a SHA-256 hash chain from certificate raw bytes
 /// (same algorithm as the Go version: hash each cert, then hash accumulated result)
 pub fn generate_cert_chain_hash(raw_certs: &[&[u8]]) -> Vec<u8> {
-    let mut chain_hash = Vec::new();
+    // Use a fixed-size array for intermediate results (SHA-256 output is always 32 bytes)
+    // to avoid heap allocation per iteration.
+    let mut chain: Option<[u8; 32]> = None;
     for cert in raw_certs {
-        let cert_hash = Sha256::digest(cert);
-        if chain_hash.is_empty() {
-            chain_hash = cert_hash.to_vec();
-        } else {
-            chain_hash.extend_from_slice(&cert_hash);
-            chain_hash = Sha256::digest(&chain_hash).to_vec();
-        }
+        let cert_hash: [u8; 32] = Sha256::digest(cert).into();
+        chain = Some(match chain {
+            None => cert_hash,
+            Some(prev) => {
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(&prev);
+                combined[32..].copy_from_slice(&cert_hash);
+                Sha256::digest(&combined).into()
+            }
+        });
     }
-    chain_hash
+    chain.map(|h| h.to_vec()).unwrap_or_default()
 }
 
 /// Deduplicate a slice while preserving order
@@ -62,7 +67,8 @@ pub mod aead {
 
     /// Decrypt ciphertext using AES-128-GCM in-place.
     /// `buffer` must contain ciphertext + tag (last 16 bytes).
-    /// Returns the plaintext length on success.
+    /// On success, the tag is removed and the buffer contains only plaintext.
+    /// Returns the plaintext length.
     pub fn decrypt_in_place(
         key: &[u8; 16],
         buffer: &mut Vec<u8>,
@@ -71,9 +77,9 @@ pub mod aead {
         let key_typed = aes_gcm::Key::<Aes128Gcm>::from_slice(key);
         let cipher = Aes128Gcm::new(key_typed);
         let nonce_typed = Nonce::from_slice(nonce);
+        // AeadInPlace::decrypt_in_place removes the tag and shrinks the buffer to plaintext.
         cipher.decrypt_in_place(nonce_typed, b"", buffer)?;
-        let pt_len = buffer.len() - 16; // tag is 16 bytes for AES-128-GCM
-        Ok(pt_len)
+        Ok(buffer.len())
     }
 
     /// Encrypt plaintext using AES-128-GCM (returns a new Vec, convenience wrapper)
@@ -91,7 +97,8 @@ pub mod aead {
     pub fn decrypt(key: &[u8; 16], ciphertext: &[u8], nonce: &[u8; 12]) -> Option<Vec<u8>> {
         let mut buffer = ciphertext.to_vec();
         decrypt_in_place(key, &mut buffer, nonce).ok()?;
-        buffer.truncate(buffer.len() - 16);
+        // `decrypt_in_place` already removes the 16-byte tag via AeadInPlace,
+        // so `buffer` now contains only plaintext — no further truncation needed.
         Some(buffer)
     }
 
@@ -120,51 +127,44 @@ impl UnderlayCipher {
 
     /// Decrypt a packet in-place.
     /// `packet` should be [salt(32)][ciphertext+tag].
-    /// On success, the packet buffer is replaced with plaintext.
+    /// On success, the buffer is shrunk to contain only the plaintext (no allocation).
     pub fn decrypt_in_place(&self, packet: &mut Vec<u8>) -> anyhow::Result<()> {
         use chacha20poly1305::aead::AeadInPlace;
         use crate::crypto::juicity_underlay::SALT_LEN;
 
+        if packet.len() <= SALT_LEN {
+            anyhow::bail!("underlay packet too short to contain salt");
+        }
+
         let nonce = chacha20poly1305::Nonce::from_slice(&[0u8; 12]);
-        // Remove the salt prefix, decrypt in-place.
-        // We use `Vec::split_off` to get a Vec<u8> for the ciphertext portion,
-        // because AeadInPlace requires &mut dyn Buffer (implemented for Vec<u8> but not [u8]).
-        let mut ciphertext = packet.split_off(SALT_LEN);
+        // drain(..SALT_LEN) removes the salt prefix by shifting bytes left in-place —
+        // no heap allocation, unlike split_off which creates a second Vec.
+        packet.drain(..SALT_LEN);
         self.cipher
-            .decrypt_in_place(nonce, b"", &mut ciphertext)
+            .decrypt_in_place(nonce, b"", packet)
             .map_err(|e| anyhow::anyhow!("underlay decrypt failed: {:?}", e))?;
-        // Truncate the tag (16 bytes for ChaCha20Poly1305)
-        let pt_len = ciphertext.len() - 16;
-        ciphertext.truncate(pt_len);
-        // Replace packet with plaintext
-        *packet = ciphertext;
+        // AeadInPlace removes the tag: packet now contains only plaintext.
         Ok(())
     }
 
     /// Encrypt a packet in-place, prepending salt.
-    /// `plaintext` is the data to encrypt. The salt is prepended and tag appended.
+    /// `plaintext` contains the data to encrypt; on return it holds [salt(32)][ciphertext+tag].
     pub fn encrypt_in_place(&self, plaintext: &mut Vec<u8>, salt: &[u8; 32]) -> anyhow::Result<()> {
         use chacha20poly1305::aead::AeadInPlace;
         use crate::crypto::juicity_underlay::SALT_LEN;
 
         let nonce = chacha20poly1305::Nonce::from_slice(&[0u8; 12]);
-        // Reserve space for salt at the front
-        let original_len = plaintext.len();
-        plaintext.reserve(SALT_LEN + 16);
-        // Shift content right by SALT_LEN to make room for salt
-        plaintext.resize(original_len + SALT_LEN, 0);
-        plaintext.copy_within(..original_len, SALT_LEN);
-        plaintext[..SALT_LEN].copy_from_slice(salt);
 
-        // Encrypt in-place (the ciphertext portion starts after salt).
-        // We use split_off to get a Vec<u8> for the ciphertext portion,
-        // because AeadInPlace requires &mut dyn Buffer (implemented for Vec<u8> but not [u8]).
-        let mut ciphertext = plaintext.split_off(SALT_LEN);
+        // Step 1: encrypt plaintext in-place (appends 16-byte tag).
         self.cipher
-            .encrypt_in_place(nonce, b"", &mut ciphertext)
+            .encrypt_in_place(nonce, b"", plaintext)
             .map_err(|e| anyhow::anyhow!("underlay encrypt failed: {:?}", e))?;
-        // Reassemble: salt + encrypted ciphertext
-        plaintext.extend_from_slice(&ciphertext);
+
+        // Step 2: prepend salt by shifting ciphertext right by SALT_LEN.
+        let ct_len = plaintext.len();
+        plaintext.resize(ct_len + SALT_LEN, 0);
+        plaintext.copy_within(..ct_len, SALT_LEN);
+        plaintext[..SALT_LEN].copy_from_slice(salt);
         Ok(())
     }
 }

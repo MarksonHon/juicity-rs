@@ -30,3 +30,6 @@ pub const ETHERNET_MTU_VAL: usize = 1500;
 pub const JUICIY_VERSION_0: u8 = 0;
 /// Underlay salt length
 pub const UNDERLAY_SALT_LEN: usize = 32;
+/// Maximum number of cached (domain, port) -> SocketAddr entries per UDP relay stream.
+/// Prevents domain_ip_map from growing without bound across long-lived UDP sessions.
+pub const MAX_UDP_DNS_CACHE: usize = 256;

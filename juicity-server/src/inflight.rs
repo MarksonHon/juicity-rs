@@ -27,9 +27,14 @@ pub struct InFlightUnderlayKey {
     notify: Notify,
 }
 
+/// Single-map entry combining auth data and insertion timestamp for cache locality.
+struct InFlightEntry {
+    auth: UnderlayAuth,
+    inserted_at: Instant,
+}
+
 struct InFlightInner {
-    keys: HashMap<InFlightKey, UnderlayAuth>,
-    timestamps: HashMap<InFlightKey, Instant>,
+    entries: HashMap<InFlightKey, InFlightEntry>,
 }
 
 impl InFlightUnderlayKey {
@@ -37,8 +42,7 @@ impl InFlightUnderlayKey {
         Self {
             ttl,
             inner: Mutex::new(InFlightInner {
-                keys: HashMap::new(),
-                timestamps: HashMap::new(),
+                entries: HashMap::new(),
             }),
             notify: Notify::new(),
         }
@@ -47,8 +51,7 @@ impl InFlightUnderlayKey {
     /// Store an authentication for later retrieval
     pub fn store(&self, key: InFlightKey, auth: UnderlayAuth) {
         let mut inner = self.inner.lock().unwrap();
-        inner.keys.insert(key, auth);
-        inner.timestamps.insert(key, Instant::now());
+        inner.entries.insert(key, InFlightEntry { auth, inserted_at: Instant::now() });
         // Notify any waiting evict() call that a new key is available
         self.notify.notify_waiters();
     }
@@ -59,9 +62,8 @@ impl InFlightUnderlayKey {
         // First attempt without waiting
         {
             let mut inner = self.inner.lock().unwrap();
-            if let Some(auth) = inner.keys.remove(key) {
-                inner.timestamps.remove(key);
-                return Some(auth);
+            if let Some(entry) = inner.entries.remove(key) {
+                return Some(entry.auth);
             }
         }
 
@@ -76,9 +78,8 @@ impl InFlightUnderlayKey {
                 _ = wait => {
                     // Woken up - check if our key arrived
                     let mut guard = self.inner.lock().unwrap();
-                    if let Some(auth) = guard.keys.remove(key) {
-                        guard.timestamps.remove(key);
-                        return Some(auth);
+                    if let Some(entry) = guard.entries.remove(key) {
+                        return Some(entry.auth);
                     }
                     // Not our key, loop back to wait again (if within deadline)
                     if Instant::now() >= deadline {
@@ -88,21 +89,17 @@ impl InFlightUnderlayKey {
                 _ = tokio::time::sleep_until(deadline.into()) => {
                     // Timeout - try one last time
                     let mut guard = self.inner.lock().unwrap();
-                    let auth = guard.keys.remove(key);
-                    guard.timestamps.remove(key);
-                    return auth;
+                    return guard.entries.remove(key).map(|e| e.auth);
                 }
             }
         }
     }
 
-    /// Clean up expired keys. Uses split-borrow retain to avoid intermediate Vec allocation.
+    /// Clean up expired keys.
     pub fn cleanup(&self) {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
         let ttl = self.ttl;
-        let InFlightInner { keys, timestamps } = &mut *inner;
-        keys.retain(|k, _| timestamps.get(k).map_or(false, |ts| now.duration_since(*ts) <= ttl));
-        timestamps.retain(|_, ts| now.duration_since(*ts) <= ttl);
+        inner.entries.retain(|_, e| now.duration_since(e.inserted_at) <= ttl);
     }
 }

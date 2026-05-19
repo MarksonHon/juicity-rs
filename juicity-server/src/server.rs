@@ -109,7 +109,9 @@ impl JuicityServer {
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for quinn"))?;
         let wrapped_socket = runtime.wrap_udp_socket(udp_socket)?;
 
-        let (underlay_tx, underlay_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (underlay_tx, underlay_rx) = tokio::sync::mpsc::channel(
+            crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY,
+        );
         let demux_socket = Arc::new(crate::underlay_socket::DemuxUdpSocket::new(
             wrapped_socket,
             underlay_tx,
@@ -180,14 +182,14 @@ impl JuicityServer {
 }
 
 async fn run_underlay_packet_loop(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::underlay_socket::UnderlayPacket>,
+    mut rx: tokio::sync::mpsc::Receiver<crate::underlay_socket::UnderlayPacket>,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_pool: Arc<crate::udp::UdpEndpointPool>,
     server_socket: Arc<tokio::net::UdpSocket>,
     disable_udp_443: bool,
 ) {
-    let sessions: Arc<tokio::sync::Mutex<HashMap<SocketAddr, UnderlaySession>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let sessions: Arc<std::sync::Mutex<HashMap<SocketAddr, UnderlaySession>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     while let Some(packet) = rx.recv().await {
         // Spawn each packet handler so that a slow evict() (up to 100 ms wait for
@@ -217,7 +219,7 @@ async fn handle_non_quic_underlay_packet(
     packet: crate::underlay_socket::UnderlayPacket,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_pool: Arc<crate::udp::UdpEndpointPool>,
-    sessions: Arc<tokio::sync::Mutex<HashMap<SocketAddr, UnderlaySession>>>,
+    sessions: Arc<std::sync::Mutex<HashMap<SocketAddr, UnderlaySession>>>,
     server_socket: Arc<tokio::net::UdpSocket>,
     disable_udp_443: bool,
 ) -> anyhow::Result<()> {
@@ -226,11 +228,11 @@ async fn handle_non_quic_underlay_packet(
     }
 
     let source = packet.peer;
-    // Convert Bytes to Vec<u8> for in-place decryption
-    let mut payload = packet.payload.to_vec();
+    // payload is already Vec<u8>; move it directly without copying.
+    let mut payload = packet.payload;
 
     let existing_session = {
-        let guard = sessions.lock().await;
+        let guard = sessions.lock().unwrap();
         guard.get(&source).cloned()
     };
 
@@ -289,7 +291,7 @@ async fn handle_non_quic_underlay_packet(
         };
 
         {
-            let mut guard = sessions.lock().await;
+            let mut guard = sessions.lock().unwrap();
             guard.insert(source, session.clone());
         }
         tracing::debug!("new underlay session {} -> {}", source, session.target);
@@ -300,8 +302,6 @@ async fn handle_non_quic_underlay_packet(
         .get_or_create(
             source,
             crate::udp::UdpEndpointOptions {
-                // Response path is handled by the dedicated reader spawned below.
-                handler: Box::new(|_, _| Ok(())),
                 nat_timeout: Duration::from_secs(180),
                 dial_target: session.target.clone(),
             },
@@ -315,20 +315,20 @@ async fn handle_non_quic_underlay_packet(
         let sessions_for_task = sessions.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; consts::ETHERNET_MTU * 4];
+            // Pre-allocate output buffer for encrypt_in_place reuse across packets.
+            // Capacity: max payload + 32-byte salt prefix + 16-byte AEAD tag.
+            let mut outbuf = Vec::with_capacity(consts::ETHERNET_MTU * 4 + 48);
             loop {
                 match recv_socket.recv_from(&mut buf).await {
                     Ok((n, _)) => {
                         let salt = juicity_underlay::generate_underlay_salt();
-                        // Encrypt in-place using cached cipher.
-                        // Instead of buf[..n].to_vec() (which allocates a new Vec each time),
-                        // we copy into a pre-allocated buffer and encrypt in-place.
-                        let mut plaintext = Vec::with_capacity(n + 32 + 16);
-                        plaintext.extend_from_slice(&buf[..n]);
-                        if session_cipher.encrypt_in_place(&mut plaintext, &salt).is_err() {
+                        outbuf.clear();
+                        outbuf.extend_from_slice(&buf[..n]);
+                        if session_cipher.encrypt_in_place(&mut outbuf, &salt).is_err() {
                             break;
                         }
 
-                        if relay_back.send_to(&plaintext, source).await.is_err() {
+                        if relay_back.send_to(&outbuf, source).await.is_err() {
                             break;
                         }
                     }
@@ -339,7 +339,7 @@ async fn handle_non_quic_underlay_packet(
                 }
             }
 
-            let mut guard = sessions_for_task.lock().await;
+            let mut guard = sessions_for_task.lock().unwrap();
             guard.remove(&source);
         });
     }
@@ -347,7 +347,7 @@ async fn handle_non_quic_underlay_packet(
     let send_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
     if let Err(e) = send_socket.send_to(&payload[..pt_len], &dial_target).await {
         udp_pool.remove(&source).await;
-        let mut guard = sessions.lock().await;
+        let mut guard = sessions.lock().unwrap();
         guard.remove(&source);
         return Err(anyhow::anyhow!("underlay send_to {} failed: {:?}", dial_target, e));
     }
@@ -568,6 +568,8 @@ async fn handle_udp_relay(
         let remote = remote.clone();
         let mut domain_ip_map = domain_ip_map;
         tokio::spawn(async move {
+            // Reuse a single buffer across all datagrams to avoid per-packet allocation.
+            let mut payload = Vec::with_capacity(consts::ETHERNET_MTU);
             loop {
                 // Each subsequent datagram: [trojanc_addr][len(2)][payload]
                 let (t_addr, t_port) =
@@ -581,7 +583,7 @@ async fn handle_udp_relay(
                     break;
                 }
                 let pkt_len = u16::from_be_bytes(len_bytes) as usize;
-                let mut payload = vec![0u8; pkt_len];
+                payload.resize(pkt_len, 0);
                 if recv_stream.read_exact(&mut payload).await.is_err() {
                     break;
                 }
@@ -606,6 +608,9 @@ async fn handle_udp_relay(
         let remote = remote.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; consts::ETHERNET_MTU];
+            // Pre-allocate frame buffer for reuse across all response datagrams.
+            // Max: trojanc_addr header (up to ~261 bytes) + 2-byte length + payload.
+            let mut frame = Vec::with_capacity(264 + consts::ETHERNET_MTU);
             loop {
                 match remote.recv_from(&mut buf).await {
                     Ok((n, addr)) => {
@@ -616,10 +621,9 @@ async fn handle_udp_relay(
                             Ok(h) => h,
                             Err(_) => break,
                         };
-                        // Batch header + length + payload into a single write to reduce
-                        // async round-trips through the QUIC send state machine.
+                        // Reuse frame buffer: clear then fill to avoid per-packet allocation.
                         let pkt_len = (n as u16).to_be_bytes();
-                        let mut frame = Vec::with_capacity(hdr.len() + 2 + n);
+                        frame.clear();
                         frame.extend_from_slice(&hdr);
                         frame.extend_from_slice(&pkt_len);
                         frame.extend_from_slice(&buf[..n]);
@@ -658,6 +662,11 @@ async fn resolve_udp_target(
     let resolved = addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no DNS result for {}:{}", host, port))?;
+    // Evict all entries when the cache is full to bound memory usage.
+    // In practice a single UDP stream rarely targets more than a handful of distinct hosts.
+    if domain_ip_map.len() >= consts::MAX_UDP_DNS_CACHE {
+        domain_ip_map.clear();
+    }
     domain_ip_map.insert(key, resolved);
     Ok(resolved)
 }

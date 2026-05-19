@@ -171,11 +171,21 @@ async fn handle_socks5(mut stream: TcpStream, client: JuicityClient) -> anyhow::
             // address triplet SHOULD share one stream and be recycled by NAT timeout.
             tokio::spawn(async move {
                 let mut buf = vec![0u8; consts::ETHERNET_MTU];
+                // Use a persistent sleep_until so the timer is only created once and
+                // can be reset on each received datagram without recreating the future.
+                let nat_deadline = tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT;
+                let nat_timer = tokio::time::sleep_until(nat_deadline);
+                tokio::pin!(nat_timer);
                 loop {
                     tokio::select! {
                         result = bind_socket_clone.recv_from(&mut buf) => {
                             match result {
                                 Ok((n, src)) => {
+                                    // Reset the NAT timeout on each received datagram.
+                                    nat_timer.as_mut().reset(
+                                        tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT,
+                                    );
+
                                     let datagram = match parse_socks5_udp_request(&buf[..n]) {
                                         Some(v) => v,
                                         None => continue,
@@ -225,7 +235,7 @@ async fn handle_socks5(mut stream: TcpStream, client: JuicityClient) -> anyhow::
                                 }
                             }
                         }
-                        _ = tokio::time::sleep(consts::DEFAULT_NAT_TIMEOUT) => {
+                        _ = &mut nat_timer => {
                             // NAT timeout — clean up all sessions before breaking
                             let mut guard = sessions.lock().await;
                             guard.clear();
