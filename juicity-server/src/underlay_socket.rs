@@ -99,10 +99,17 @@ impl AsyncUdpSocket for DemuxUdpSocket {
                     // copy of the payload, avoiding per-packet Vec allocation overhead.
                     // Allocate a Vec<u8> directly — avoids the extra to_vec() copy
                     // that would be needed if we used Bytes here.
-                    let _ = self.underlay_tx.try_send(UnderlayPacket {
+                    if self.underlay_tx.try_send(UnderlayPacket {
                         peer: meta[i].addr,
                         payload: bufs[i][offset..end].to_vec(),
-                    });
+                    }).is_err() {
+                        // Channel full: drop the packet and warn. Under sustained high
+                        // underlay load this may cause UDP handshake failures.
+                        tracing::warn!(
+                            "underlay channel full, dropping non-QUIC packet from {}",
+                            meta[i].addr
+                        );
+                    }
                     offset = end;
                 }
             }

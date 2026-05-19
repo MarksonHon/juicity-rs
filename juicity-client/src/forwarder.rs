@@ -214,6 +214,21 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
     let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // Periodic cleanup: remove sessions whose writer channel has been closed
+    // (writer exits after NAT timeout or QUIC stream error). This ensures the
+    // map doesn't accumulate stale entries between the writer exit and the
+    // supervisor-task cleanup.
+    {
+        let sessions_cleanup = sessions.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(consts::DEFAULT_NAT_TIMEOUT);
+            loop {
+                interval.tick().await;
+                sessions_cleanup.lock().await.retain(|_, s| !s.tx.is_closed());
+            }
+        });
+    }
+
     let mut buf = vec![0u8; consts::ETHERNET_MTU];
 
     loop {

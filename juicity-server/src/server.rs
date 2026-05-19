@@ -15,6 +15,10 @@ use uuid::Uuid;
 struct UnderlaySession {
     target: String,
     cipher: UnderlayCipher,
+    /// Last time a packet was handled for this session (updated under the sessions lock).
+    last_used: std::time::Instant,
+    /// Abort handle for the relay-back task; `None` until the task is spawned.
+    relay_abort: Option<tokio::task::AbortHandle>,
 }
 
 /// Juicity proxy server
@@ -144,7 +148,8 @@ impl JuicityServer {
         // Spawn periodic cleanup task for in-flight underlay keys
         let inflight_cleanup = self.in_flight.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            // Run at half the IN_FLIGHT_UNDERLAY_TTL interval to halve worst-case key residue.
+            let mut interval = tokio::time::interval(consts::IN_FLIGHT_UNDERLAY_TTL / 2);
             loop {
                 interval.tick().await;
                 inflight_cleanup.cleanup();
@@ -206,6 +211,28 @@ async fn run_underlay_packet_loop(
     let sessions: Arc<std::sync::Mutex<HashMap<SocketAddr, UnderlaySession>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+    // Periodic cleanup: remove sessions that have been idle for longer than the NAT
+    // timeout and abort their relay-back tasks so they don't run indefinitely.
+    {
+        let sessions_cleanup = sessions.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(consts::DEFAULT_NAT_TIMEOUT);
+            loop {
+                interval.tick().await;
+                sessions_cleanup.lock().unwrap().retain(|_, s| {
+                    if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
+                        if let Some(h) = &s.relay_abort {
+                            h.abort();
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        });
+    }
+
     while let Some(packet) = rx.recv().await {
         // Spawn each packet handler so that a slow evict() (up to 100 ms wait for
         // in-flight underlay auth) in one handler cannot block subsequent packets.
@@ -247,8 +274,13 @@ async fn handle_non_quic_underlay_packet(
     let mut payload = packet.payload;
 
     let existing_session = {
-        let guard = sessions.lock().unwrap();
-        guard.get(&source).cloned()
+        let mut guard = sessions.lock().unwrap();
+        if let Some(s) = guard.get_mut(&source) {
+            s.last_used = std::time::Instant::now();
+            Some(s.clone())
+        } else {
+            None
+        }
     };
 
     let (session, pt_len) = if let Some(existing) = existing_session {
@@ -303,6 +335,8 @@ async fn handle_non_quic_underlay_packet(
         let session = UnderlaySession {
             target: auth.metadata.target_addr(),
             cipher,
+            last_used: std::time::Instant::now(),
+            relay_abort: None,
         };
 
         {
@@ -328,7 +362,7 @@ async fn handle_non_quic_underlay_packet(
         let relay_back = server_socket.clone();
         let session_cipher = session.cipher.clone();
         let sessions_for_task = sessions.clone();
-        tokio::spawn(async move {
+        let relay_handle = tokio::spawn(async move {
             let mut buf = vec![0u8; consts::ETHERNET_MTU * 4];
             // Pre-allocate output buffer for encrypt_in_place reuse across packets.
             // Capacity: max payload + 32-byte salt prefix + 16-byte AEAD tag.
@@ -357,6 +391,10 @@ async fn handle_non_quic_underlay_packet(
             let mut guard = sessions_for_task.lock().unwrap();
             guard.remove(&source);
         });
+        // Store the abort handle so periodic cleanup can cancel this task.
+        if let Some(s) = sessions.lock().unwrap().get_mut(&source) {
+            s.relay_abort = Some(relay_handle.abort_handle());
+        }
     }
 
     let send_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
@@ -579,7 +617,7 @@ async fn handle_udp_relay(
     remote.send_to(&data, first_target_addr).await?;
 
     // Bidirectional relay
-    let quic_to_remote = {
+    let mut quic_to_remote = {
         let remote = remote.clone();
         let mut domain_ip_map = domain_ip_map;
         tokio::spawn(async move {
@@ -619,7 +657,7 @@ async fn handle_udp_relay(
         })
     };
 
-    let remote_to_quic = {
+    let mut remote_to_quic = {
         let remote = remote.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; consts::ETHERNET_MTU];
@@ -653,8 +691,14 @@ async fn handle_udp_relay(
     };
 
     tokio::select! {
-        _ = quic_to_remote => {}
-        _ = remote_to_quic => {}
+        _ = &mut quic_to_remote => {
+            remote_to_quic.abort();
+            let _ = remote_to_quic.await;
+        }
+        _ = &mut remote_to_quic => {
+            quic_to_remote.abort();
+            let _ = quic_to_remote.await;
+        }
     }
     Ok(())
 }
