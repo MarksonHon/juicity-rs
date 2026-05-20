@@ -316,4 +316,4 @@ The following improvements have been made during the Rust rewrite, including com
 
 ## License
 
-GNU Affero General Public License v3.0 (AGPL-3.0)
+GNU AFFERO GENERAL PUBLIC LICENSE Version 3 (AGPL-3.0), see [LICENSE](LICENSE) for details.
