@@ -119,6 +119,19 @@ jobs:
         shell: msys2 {0}
         run: cargo build --workspace --release --target ${{ matrix.target }} --exclude juicity-server
 
+      # ── Test ────────────────────────────────────────────────────────────
+
+      - name: Run tests (Linux/macOS)
+        if: matrix.os != 'windows'
+        run: cargo test -p juicity-gui --target ${{ matrix.target }}
+
+      - name: Run tests (Windows, clear POSIX env vars to validate i18n fallback)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $env:LANG=$null; $env:LC_ALL=$null; $env:LC_MESSAGES=$null
+          cargo test -p juicity-gui
+
       # ── Download shadowsocks-rust ─────────────────────────────────────────
 
       - name: Download shadowsocks-rust (Linux/macOS)

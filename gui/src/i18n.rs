@@ -17,13 +17,19 @@ pub fn init() {
 }
 
 /// Return a rust-i18n locale tag that best matches the system environment.
+///
+/// Priority:
+///   1. `LANG` env var (POSIX)
+///   2. `LC_ALL` env var (POSIX)
+///   3. `LC_MESSAGES` env var (POSIX)
+///   4. OS-native API (Windows: `GetUserDefaultLocaleName`, macOS/Linux: `CFLocale`/`locale.conf`)
+///   5. Fallback to `"en"`
 pub fn detect() -> String {
-    // Check common POSIX env vars in priority order.
-    let raw = std::env::var("LANG")
+    let from_env = std::env::var("LANG")
         .or_else(|_| std::env::var("LC_ALL"))
         .or_else(|_| std::env::var("LC_MESSAGES"))
-        .unwrap_or_default();
-
+        .ok();
+    let raw = from_env.unwrap_or_else(|| sys_locale::get_locale().unwrap_or_default());
     normalise(&raw)
 }
 
