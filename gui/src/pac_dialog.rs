@@ -33,9 +33,10 @@ pub fn open(
         .resizable(false)
         .build();
 
-    let toolbar_view = adw::ToolbarView::new();
-    let header_bar = adw::HeaderBar::new();
-    toolbar_view.add_top_bar(&header_bar);
+    // ── Root layout ───────────────────────────────────────────────────────
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
 
     // ── Scrollable content ────────────────────────────────────────────────
     let scroll = gtk::ScrolledWindow::builder()
@@ -130,7 +131,8 @@ pub fn open(
     content.append(&online_group);
 
     scroll.set_child(Some(&content));
-    toolbar_view.set_content(Some(&scroll));
+    root.append(&scroll);
+    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     // ── Bottom action bar ─────────────────────────────────────────────────
     let btn_bar = gtk::Box::builder()
@@ -152,9 +154,9 @@ pub fn open(
     btn_bar.append(&spacer);
     btn_bar.append(&cancel_btn);
     btn_bar.append(&save_btn);
-    toolbar_view.add_bottom_bar(&btn_bar);
+    root.append(&btn_bar);
 
-    window.set_child(Some(&toolbar_view));
+    window.set_child(Some(&root));
 
     // ── Shared callbacks wrapped in Rc so they can be used in two closures ─
     let on_save = std::rc::Rc::new(on_save);

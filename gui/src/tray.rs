@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Copy)]
 pub enum TrayEvent {
     ShowEditServers,
+    ShowPacSettings,
     SetSystemProxy(SystemProxyMode),
     SetPacRuleMode(PacRuleMode),
     UpdatePacRules,
@@ -196,6 +197,15 @@ impl ksni::Tray for LinuxTray {
                 label: t!("tray.update_rules").to_string(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.event_tx.send(TrayEvent::UpdatePacRules);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: t!("tray.pac_settings").to_string(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.event_tx.send(TrayEvent::ShowPacSettings);
                 }),
                 ..Default::default()
             }
@@ -458,11 +468,13 @@ fn build_native_menu(
     ids.insert(r_gfw.id().clone(), TrayEvent::SetPacRuleMode(PacRuleMode::ProxyGfw));
     let update_rules = MenuItem::new(&t!("tray.update_rules").to_string(), true, None);
     ids.insert(update_rules.id().clone(), TrayEvent::UpdatePacRules);
+    let pac_settings_item = MenuItem::new(&t!("tray.pac_settings").to_string(), true, None);
+    ids.insert(pac_settings_item.id().clone(), TrayEvent::ShowPacSettings);
 
     let pac_sub = Submenu::with_items(
         &t!("tray.pac_rules").to_string(),
         true,
-        &[&r_bypass, &r_gfw, &PredefinedMenuItem::separator(), &update_rules],
+        &[&r_bypass, &r_gfw, &PredefinedMenuItem::separator(), &update_rules, &PredefinedMenuItem::separator(), &pac_settings_item],
     )
     .expect("pac submenu");
 

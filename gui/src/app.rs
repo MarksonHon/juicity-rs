@@ -1002,6 +1002,56 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
             loop {
                 match tray_rx.try_recv() {
                     Ok(TrayEvent::ShowEditServers) => window.present(),
+                    Ok(TrayEvent::ShowPacSettings) => {
+                        let cfg_snapshot = state.borrow().config.clone();
+                        let state_s = state.clone();
+                        let sl_s = status_label.clone();
+                        let on_save = move |new_cfg: crate::config::AppConfig| {
+                            let mut s = state_s.borrow_mut();
+                            let pac_listen_changed = s.config.pac_listen != new_cfg.pac_listen;
+                            s.config = new_cfg;
+                            if let Err(err) = s.flush() {
+                                sl_s.set_text(&t!("status.save_failed", err = err.to_string()));
+                                return;
+                            }
+                            if pac_listen_changed || s.pac_server.is_none() {
+                                let (direct, proxy) = pac::load_rules(&s.storage.paths().config_dir);
+                                let content = pac::generate_pac(
+                                    s.config.pac_rule_mode,
+                                    &s.config.socks_listen,
+                                    &direct,
+                                    &proxy,
+                                );
+                                match pac::start(&s.config.pac_listen, content) {
+                                    Ok(srv) => s.pac_server = Some(srv),
+                                    Err(e) => tracing::warn!("PAC server restart failed: {e}"),
+                                }
+                            }
+                            sl_s.set_text(&*t!("status.saved"));
+                        };
+                        let state_u = state.clone();
+                        let sl_u = status_label.clone();
+                        let on_update_now = move || {
+                            let (data_dir, direct_url, proxy_url) = {
+                                let s = state_u.borrow();
+                                if s.pac_update_rx.is_some() { return; }
+                                (
+                                    s.storage.paths().config_dir.clone(),
+                                    s.config.pac_direct_url.clone(),
+                                    s.config.pac_proxy_url.clone(),
+                                )
+                            };
+                            let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(
+                                    pac::download_rules(&data_dir, &direct_url, &proxy_url).map(|_| ()),
+                                );
+                            });
+                            state_u.borrow_mut().pac_update_rx = Some(rx);
+                            sl_u.set_text(&*t!("status.pac_downloading"));
+                        };
+                        crate::pac_dialog::open(&window, cfg_snapshot, on_save, on_update_now);
+                    }
                     Ok(TrayEvent::SetSystemProxy(mode)) => {
                         let mut s = state.borrow_mut();
                         s.config.system_proxy_mode = mode;
