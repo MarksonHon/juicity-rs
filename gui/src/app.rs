@@ -117,7 +117,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         }
     }
     // ── Window ────────────────────────────────────────────────────────────
-    let window = adw::ApplicationWindow::builder()
+    let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title(&*t!("window.title"))
         .default_width(530)
@@ -393,7 +393,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
     bottom_bar.append(&apply_btn);
     outer_box.append(&bottom_bar);
 
-    window.set_content(Some(&outer_box));
+    window.set_child(Some(&outer_box));
 
     // ── Shared tray state ─────────────────────────────────────────────────
     let tray_shared: Arc<Mutex<TraySharedState>> = Arc::new(Mutex::new(TraySharedState::default()));

@@ -20,7 +20,7 @@ use crate::pac;
 ///                     rule download.  The caller is responsible for actually
 ///                     starting the download thread and updating the status label.
 pub fn open(
-    parent: &adw::ApplicationWindow,
+    parent: &gtk::ApplicationWindow,
     cfg: AppConfig,
     on_save: impl Fn(AppConfig) + 'static,
     on_update_now: impl Fn() + 'static,
