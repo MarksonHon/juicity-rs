@@ -253,6 +253,12 @@ pub struct AppConfig {
     /// Address the local PAC HTTP server listens on.
     pub pac_listen: String,
     pub online_pac_url: Option<String>,
+    /// URL for the "bypass / direct" domain list (Loyalsoldier direct-list.txt or custom mirror).
+    pub pac_direct_url: String,
+    /// URL for the "proxy / GFW" domain list (Loyalsoldier proxy-list.txt or custom mirror).
+    pub pac_proxy_url: String,
+    /// Auto-update interval in hours; 0 = disabled.
+    pub pac_auto_update_hours: u32,
 }
 
 impl Default for AppConfig {
@@ -267,6 +273,13 @@ impl Default for AppConfig {
             pac_rule_mode: PacRuleMode::BypassChina,
             pac_listen: "127.0.0.1:1090".to_string(),
             online_pac_url: None,
+            pac_direct_url:
+                "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt"
+                    .to_string(),
+            pac_proxy_url:
+                "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt"
+                    .to_string(),
+            pac_auto_update_hours: 0,
         }
     }
 }

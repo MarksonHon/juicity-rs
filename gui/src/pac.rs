@@ -93,23 +93,38 @@ pub fn pac_url(listen_addr: &str) -> String {
 
 // ── Rule download ─────────────────────────────────────────────────────────────
 
-const DIRECT_LIST_URL: &str =
+pub const DIRECT_LIST_URL: &str =
     "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt";
-const PROXY_LIST_URL: &str =
+pub const PROXY_LIST_URL: &str =
     "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt";
+
+/// Return how many hours ago the downloaded rule files were last modified.
+/// Returns `None` if the files don't exist yet.
+pub fn rules_age_hours(data_dir: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(data_dir.join("china-list.txt")).ok()?;
+    let elapsed = meta.modified().ok()?.elapsed().ok()?;
+    Some(elapsed.as_secs() / 3600)
+}
 
 /// Download fresh rule lists into `data_dir` (blocking, intended for a
 /// background thread).  Returns `(direct_count, proxy_count)` on success.
-pub fn download_rules(data_dir: &Path) -> anyhow::Result<(usize, usize)> {
+///
+/// `direct_url` and `proxy_url` override the built-in defaults and allow
+/// users to specify custom mirror URLs.
+pub fn download_rules(
+    data_dir: &Path,
+    direct_url: &str,
+    proxy_url: &str,
+) -> anyhow::Result<(usize, usize)> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create data_dir {}", data_dir.display()))?;
 
     let china_path = data_dir.join("china-list.txt");
     let gfw_path = data_dir.join("gfw.txt");
 
-    download_file(DIRECT_LIST_URL, &china_path)
+    download_file(direct_url, &china_path)
         .context("failed to download direct-list (china-list)")?;
-    download_file(PROXY_LIST_URL, &gfw_path).context("failed to download proxy-list (gfw)")?;
+    download_file(proxy_url, &gfw_path).context("failed to download proxy-list (gfw)")?;
 
     let direct = parse_domain_list(&std::fs::read_to_string(&china_path)?);
     let proxy = parse_domain_list(&std::fs::read_to_string(&gfw_path)?);

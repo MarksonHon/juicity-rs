@@ -7,11 +7,10 @@ use crate::link;
 use crate::pac;
 use crate::system_proxy;
 use crate::tray::{self, TrayEvent, TraySharedState};
-use gtk::glib;
 use adw::prelude::*;
+use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
-use libadwaita as adw;
 use rust_i18n::t;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -374,6 +373,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         .width_chars(5)
         .build();
     let close_to_tray_check = gtk::CheckButton::with_label(&*t!("field.close_to_tray"));
+    let pac_settings_btn = gtk::Button::with_label(&*t!("btn.pac_settings"));
     let spacer = gtk::Box::builder().hexpand(true).build();
     let import_btn = gtk::Button::with_label(&*t!("btn.import_url"));
     let export_btn = gtk::Button::with_label(&*t!("btn.export_url"));
@@ -384,6 +384,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
     bottom_bar.append(&gtk::Label::new(Some(&*t!("field.proxy_port"))));
     bottom_bar.append(&proxy_port_entry);
     bottom_bar.append(&close_to_tray_check);
+    bottom_bar.append(&pac_settings_btn);
     bottom_bar.append(&spacer);
     bottom_bar.append(&import_btn);
     bottom_bar.append(&export_btn);
@@ -876,6 +877,91 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         });
     }
 
+    // ── PAC Settings button ───────────────────────────────────────────────
+    {
+        let state = state.clone();
+        let status_label = status_label.clone();
+        let window = window.clone();
+        pac_settings_btn.connect_clicked(move |_| {
+            let cfg_snapshot = state.borrow().config.clone();
+
+            // on_save: update config, persist, restart PAC server if listen addr changed.
+            let state_save = state.clone();
+            let sl_save = status_label.clone();
+            let on_save = move |new_cfg: crate::config::AppConfig| {
+                let mut s = state_save.borrow_mut();
+                let pac_listen_changed = s.config.pac_listen != new_cfg.pac_listen;
+                s.config = new_cfg;
+                if let Err(err) = s.flush() {
+                    sl_save.set_text(&t!("status.save_failed", err = err.to_string()));
+                    return;
+                }
+                if pac_listen_changed || s.pac_server.is_none() {
+                    let (direct, proxy) = pac::load_rules(&s.storage.paths().config_dir);
+                    let content = pac::generate_pac(
+                        s.config.pac_rule_mode,
+                        &s.config.socks_listen,
+                        &direct,
+                        &proxy,
+                    );
+                    match pac::start(&s.config.pac_listen, content) {
+                        Ok(srv) => s.pac_server = Some(srv),
+                        Err(e) => tracing::warn!("PAC server restart failed: {e}"),
+                    }
+                }
+                sl_save.set_text(&*t!("status.saved"));
+            };
+
+            // on_update_now: spawn background download thread.
+            let state_upd = state.clone();
+            let sl_upd = status_label.clone();
+            let on_update_now = move || {
+                let (data_dir, direct_url, proxy_url) = {
+                    let s = state_upd.borrow();
+                    if s.pac_update_rx.is_some() {
+                        return;
+                    }
+                    (
+                        s.storage.paths().config_dir.clone(),
+                        s.config.pac_direct_url.clone(),
+                        s.config.pac_proxy_url.clone(),
+                    )
+                };
+                let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+                std::thread::spawn(move || {
+                    let _ = tx.send(
+                        pac::download_rules(&data_dir, &direct_url, &proxy_url).map(|_| ()),
+                    );
+                });
+                state_upd.borrow_mut().pac_update_rx = Some(rx);
+                sl_upd.set_text(&*t!("status.pac_downloading"));
+            };
+
+            crate::pac_dialog::open(&window, cfg_snapshot, on_save, on_update_now);
+        });
+    }
+
+    // ── Auto-update PAC rules on startup if interval is set and overdue ────
+    {
+        let mut s = state.borrow_mut();
+        if s.config.pac_auto_update_hours > 0 {
+            let age_h = pac::rules_age_hours(&s.storage.paths().config_dir);
+            let overdue = age_h.map_or(true, |h| h >= s.config.pac_auto_update_hours as u64);
+            if overdue {
+                let data_dir = s.storage.paths().config_dir.clone();
+                let direct_url = s.config.pac_direct_url.clone();
+                let proxy_url = s.config.pac_proxy_url.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+                std::thread::spawn(move || {
+                    let _ = tx.send(
+                        pac::download_rules(&data_dir, &direct_url, &proxy_url).map(|_| ()),
+                    );
+                });
+                s.pac_update_rx = Some(rx);
+            }
+        }
+    }
+
     // ── Tray ──────────────────────────────────────────────────────────────
     let (tray_tx, tray_rx) = std::sync::mpsc::channel::<TrayEvent>();
     {
@@ -950,10 +1036,12 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                             drop(s);
                         } else {
                             let data_dir = s.storage.paths().config_dir.clone();
+                            let direct_url = s.config.pac_direct_url.clone();
+                            let proxy_url = s.config.pac_proxy_url.clone();
                             drop(s);
                             let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
                             std::thread::spawn(move || {
-                                let result = pac::download_rules(&data_dir)
+                                let result = pac::download_rules(&data_dir, &direct_url, &proxy_url)
                                     .map(|_| ());
                                 let _ = tx.send(result);
                             });

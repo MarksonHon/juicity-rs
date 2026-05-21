@@ -5,6 +5,7 @@ mod i18n;
 mod icon;
 mod link;
 mod pac;
+mod pac_dialog;
 mod system_proxy;
 mod tray;
 
