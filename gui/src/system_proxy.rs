@@ -187,11 +187,12 @@ fn apply_linux_kde(mode: SystemProxyMode, pac_url: &str, http_listen: &str, sock
         }
     }
 
-    // Refresh KIO where available.
-    ok |= run_if_available(
+    // Refresh KIO where available (best-effort; must not affect `ok` so that
+    // a missing kwriteconfig5 isn't falsely counted as a success).
+    let _ = run_if_available(
         "qdbus",
         &["org.kde.KIO", "/KIO/Scheduler", "reparseSlaveConfiguration"],
-    )?;
+    );
 
     Ok(ok)
 }
@@ -202,11 +203,6 @@ fn apply_macos(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_li
     if services.is_empty() {
         bail!("no active macOS network services found")
     }
-
-    let (http_host, http_port) = split_host_port(http_listen)
-        .ok_or_else(|| anyhow::anyhow!("invalid http listen address: {}", http_listen))?;
-    let (socks_host, socks_port) = split_host_port(socks_listen)
-        .ok_or_else(|| anyhow::anyhow!("invalid socks listen address: {}", socks_listen))?;
 
     for service in services {
         match mode {
@@ -224,6 +220,12 @@ fn apply_macos(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_li
                 run_required("networksetup", &["-setsocksfirewallproxystate", &service, "off"])?;
             }
             SystemProxyMode::Global => {
+                // Only parse host/port in the branch that actually needs them.
+                let (http_host, http_port) = split_host_port(http_listen)
+                    .ok_or_else(|| anyhow::anyhow!("invalid http listen address: {}", http_listen))?;
+                let (socks_host, socks_port) = split_host_port(socks_listen)
+                    .ok_or_else(|| anyhow::anyhow!("invalid socks listen address: {}", socks_listen))?;
+
                 run_required(
                     "networksetup",
                     &["-setwebproxy", &service, &http_host, &http_port.to_string()],
@@ -295,16 +297,19 @@ fn apply_windows(mode: SystemProxyMode, pac_url: &str, http_listen: &str, _socks
                     "/f",
                 ],
             )?;
-            run_required(
-                "reg",
-                &[
+            // `reg delete` exits non-zero when the value doesn't exist (e.g. proxy
+            // was previously set to Global mode and AutoConfigURL was never written).
+            // Ignore the exit code — the desired end-state (no AutoConfigURL) is the
+            // same regardless of whether the value was present beforehand.
+            let _ = Command::new("reg")
+                .args(&[
                     "delete",
                     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
                     "/v",
                     "AutoConfigURL",
                     "/f",
-                ],
-            )?;
+                ])
+                .status();
         }
         SystemProxyMode::Pac => {
             run_required(
