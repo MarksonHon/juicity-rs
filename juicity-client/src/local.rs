@@ -8,7 +8,7 @@ use juicity_common::consts;
 use juicity_common::protocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::JuicityClient;
@@ -18,6 +18,7 @@ pub struct LocalServer {
     bind_addr: String,
     client: JuicityClient,
 }
+
 
 #[derive(Clone)]
 struct UdpOutboundDatagram {
@@ -40,11 +41,19 @@ impl LocalServer {
         let listener = TcpListener::bind(&self.bind_addr).await?;
         tracing::info!("Local proxy listening on {}", self.bind_addr);
 
+        // Limit concurrent inbound TCP connections to avoid unbounded memory growth
+        // during connection bursts (mirrors the UDP Semaphore(256) in the Forwarder).
+        let sem = Arc::new(Semaphore::new(consts::MAX_CONCURRENT_TCP_CONNECTIONS));
+
         loop {
+            // Acquire a permit before accepting; this blocks new accepts when the
+            // limit is reached, providing back-pressure at the OS TCP accept queue.
+            let permit = sem.clone().acquire_owned().await?;
             let (stream, addr) = listener.accept().await?;
             let client = self.client.clone();
 
             tokio::spawn(async move {
+                let _permit = permit; // held for the lifetime of the connection
                 if let Err(e) = handle_connection(stream, addr, client).await {
                     tracing::debug!("Connection handler error: {:?}", e);
                 }
