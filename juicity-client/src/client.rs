@@ -186,8 +186,16 @@ impl JuicityClient {
         // Format: [version=0][cmd_type=Authenticate(0x00)][uuid(16)][token(32)]
         let mut uni = quinn_conn.open_uni().await?;
 
-        // Token using TLS ExportKeyingMaterial(uuid, password, 32) per RFC 5705
-        let token = protocol::gen_token_via_connection(&quinn_conn, &self.uuid, &self.password)?;
+        // Token using TLS ExportKeyingMaterial(uuid, password, 32) per RFC 5705.
+        // export_keying_material is CPU-bound (HKDF); run it in spawn_blocking to
+        // avoid occupying the async event loop on every connection attempt.
+        let conn_for_token = quinn_conn.clone();
+        let uuid_for_token = self.uuid;
+        let password_for_token = self.password.clone();
+        let token = tokio::task::spawn_blocking(move || {
+            protocol::gen_token_via_connection(&conn_for_token, &uuid_for_token, &password_for_token)
+        })
+        .await??;
 
         // Batch all 50 auth bytes into a single write to reduce async round-trips:
         // [version(1)][cmd_type(1)][uuid(16)][token(32)]

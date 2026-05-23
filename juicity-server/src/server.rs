@@ -598,8 +598,16 @@ async fn handle_auth(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("unknown user: {}", uuid))?;
 
-    // Verify token using TLS ExportKeyingMaterial (RFC 5705) - same as upstream
-    let expected_token = protocol::gen_token_via_connection(conn, &uuid, &password)?;
+    // Verify token using TLS ExportKeyingMaterial (RFC 5705) - same as upstream.
+    // export_keying_material is CPU-bound (HKDF); run it in spawn_blocking to
+    // avoid occupying the async event loop during connection bursts.
+    let conn_for_token = conn.clone();
+    let uuid_for_token = uuid;
+    let password_for_token = password.clone();
+    let expected_token = tokio::task::spawn_blocking(move || {
+        protocol::gen_token_via_connection(&conn_for_token, &uuid_for_token, &password_for_token)
+    })
+    .await??;
 
     if expected_token == received_token {
         tracing::debug!("User {} authenticated successfully", uuid);
