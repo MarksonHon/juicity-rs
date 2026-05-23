@@ -11,6 +11,10 @@ impl BuildInfo {
     /// Short Git commit hash (set by `build.rs`), falls back to `"unknown"`
     pub const GIT_HASH: &'static str = env!("JUICITY_GIT_HASH");
 
+    /// Git tag at build time (set by `build.rs`).
+    /// Exact tag name if built on a tagged commit, otherwise `"unstable (<describe>)"`.
+    pub const GIT_TAG: &'static str = env!("JUICITY_GIT_TAG");
+
     /// Formatted version string suitable for `--version` output.
     /// Clap prefixes the binary name automatically, so we start with just the version number.
     pub const fn version_string() -> &'static str {
@@ -22,6 +26,8 @@ impl BuildInfo {
             env!("JUICITY_BUILD_TIMESTAMP"),
             "\ncommit: ",
             env!("JUICITY_GIT_HASH"),
+            "\ntag: ",
+            env!("JUICITY_GIT_TAG"),
         )
     }
 }
