@@ -68,8 +68,8 @@ jobs:
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
-          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
 
       - name: Package zip
         run: |
@@ -140,8 +140,8 @@ jobs:
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
-          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
 
       - name: Package zip
         if: steps.check_build.outputs.build_ok == 'true'
@@ -200,8 +200,8 @@ jobs:
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client.exe" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server.exe" "dist/${PKG_NAME}/"
-          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
 
       - name: Package zip
         shell: pwsh
@@ -249,8 +249,8 @@ jobs:
           mkdir -p "dist/${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
           cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
-          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
 
       - name: Package zip
         run: |
@@ -293,8 +293,8 @@ jobs:
           mkdir -p "dist/${PKG_NAME}"
           cp "target/x86_64-unknown-freebsd/release/juicity-client" "dist/${PKG_NAME}/" || true
           cp "target/x86_64-unknown-freebsd/release/juicity-server" "dist/${PKG_NAME}/" || true
-          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp juicity-server/examples/config.json "dist/${PKG_NAME}/server-config.json"
+          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
 
       - name: Package zip
         run: |
