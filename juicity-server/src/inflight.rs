@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use juicity_common::consts;
 use juicity_common::protocol::UnderlayAuth;
 use tokio::sync::Notify;
 
@@ -48,9 +49,27 @@ impl InFlightUnderlayKey {
         }
     }
 
-    /// Store an authentication for later retrieval
+    /// Store an authentication for later retrieval.
+    ///
+    /// If the number of in-flight entries already equals `MAX_IN_FLIGHT_UNDERLAY_ENTRIES`,
+    /// expired entries are evicted first.  If the map is still full after eviction,
+    /// the new entry is silently dropped to prevent unbounded memory growth during a
+    /// burst of forged or unanswered underlay auth packets.
     pub fn store(&self, key: InFlightKey, auth: UnderlayAuth) {
         let mut inner = self.inner.lock().unwrap();
+        if inner.entries.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
+            // Eagerly evict expired entries before considering whether to drop.
+            let now = Instant::now();
+            let ttl = self.ttl;
+            inner.entries.retain(|_, e| now.duration_since(e.inserted_at) <= ttl);
+            if inner.entries.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
+                tracing::warn!(
+                    "in-flight underlay auth table is full ({} entries); dropping new entry",
+                    inner.entries.len()
+                );
+                return;
+            }
+        }
         inner.entries.insert(key, InFlightEntry { auth, inserted_at: Instant::now() });
         // Notify any waiting evict() call that a new key is available
         self.notify.notify_waiters();
