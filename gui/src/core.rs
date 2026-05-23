@@ -80,10 +80,17 @@ impl CoreManager {
         if let Some(mut running) = self.running.take() {
             tracing::info!("stopping {:?} core", running.protocol);
             let _ = running.child.kill();
-            let _ = running.child.wait();
-            if let Some(path) = running.temp_config {
-                let _ = std::fs::remove_file(&path);
+            // Delete the temp config file immediately (cheap I/O, avoids a race
+            // with the next write_temp_config call which reuses the same path).
+            if let Some(ref path) = running.temp_config {
+                let _ = std::fs::remove_file(path);
             }
+            // Move the blocking wait() off the GTK main thread: if the child does
+            // not exit immediately after kill(), the synchronous wait() would freeze
+            // the UI until the process is fully reaped.
+            std::thread::spawn(move || {
+                let _ = running.child.wait();
+            });
         }
         Ok(())
     }
