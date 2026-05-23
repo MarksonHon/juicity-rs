@@ -72,6 +72,7 @@ start_proxy = "Start Proxy"
 stop_proxy = "Stop Proxy"
 status_running = "▶ Running — %{name}"
 status_stopped = "■ Stopped"
+startup_settings = "Startup Settings..."
 
 [proxy]
 disable = "Disable"
@@ -96,6 +97,21 @@ pac_url_label = "PAC URL"
 group_online = "Online PAC"
 online_desc = "When set, system proxy (PAC mode) will point directly to this URL instead of the local server."
 online_pac_url = "Online PAC URL"
+save = "Save"
+
+[startup_dialog]
+title = "Startup Settings"
+group_hide_window = "Hide Window on Startup"
+hide_window_desc = "Hide the main window to tray when the application starts"
+group_connection = "Connection State on Startup"
+connection_desc = "Choose the proxy connection state when the application starts"
+connection_off = "Off"
+connection_on = "On"
+connection_last = "Last State"
+group_autostart = "Auto-Start on Boot"
+autostart_desc = "Automatically run this program when the system starts"
+yes = "Yes"
+no = "No"
 save = "Save"
 
 [protocol]

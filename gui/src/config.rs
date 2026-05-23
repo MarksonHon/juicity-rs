@@ -290,12 +290,57 @@ pub struct ProfileStore {
     pub profiles: Vec<ProxyProfile>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupConnectionState {
+    /// Start with connection off.
+    #[default]
+    Off,
+    /// Start with connection on.
+    On,
+    /// Restore the connection state from the last session.
+    LastState,
+}
+
+impl StartupConnectionState {
+    pub fn label(self) -> String {
+        match self {
+            StartupConnectionState::Off => t!("startup_dialog.connection_off").to_string(),
+            StartupConnectionState::On => t!("startup_dialog.connection_on").to_string(),
+            StartupConnectionState::LastState => t!("startup_dialog.connection_last").to_string(),
+        }
+    }
+
+    pub fn from_index(idx: u32) -> Self {
+        match idx {
+            1 => StartupConnectionState::On,
+            2 => StartupConnectionState::LastState,
+            _ => StartupConnectionState::Off,
+        }
+    }
+
+    pub fn index(self) -> u32 {
+        match self {
+            StartupConnectionState::Off => 0,
+            StartupConnectionState::On => 1,
+            StartupConnectionState::LastState => 2,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RuntimeState {
     pub auto_start: bool,
     pub selected_profile: usize,
     pub close_to_tray: bool,
+    /// Don't show the main window when the application starts.
+    pub hide_window_on_startup: bool,
+    /// Connection state to use on startup.
+    pub startup_connection_state: StartupConnectionState,
+    /// Whether the proxy was running when the application last exited.
+    /// Used with StartupConnectionState::LastState to restore the connection.
+    pub was_running: bool,
 }
 
 #[derive(Debug, Clone)]

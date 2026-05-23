@@ -6,6 +6,7 @@ mod icon;
 mod link;
 mod pac;
 mod pac_dialog;
+mod startup_dialog;
 mod system_proxy;
 mod tray;
 

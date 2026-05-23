@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 pub enum TrayEvent {
     ShowEditServers,
     ShowPacSettings,
+    ShowStartupSettings,
     SetSystemProxy(SystemProxyMode),
     SetPacRuleMode(PacRuleMode),
     UpdatePacRules,
@@ -316,6 +317,15 @@ impl ksni::Tray for LinuxTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
+                label: t!("tray.startup_settings").to_string(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.event_tx.send(TrayEvent::ShowStartupSettings);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
                 label: t!("tray.quit").to_string(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.event_tx.send(TrayEvent::QuitApp);
@@ -520,6 +530,10 @@ fn build_native_menu(
     let servers_sub =
         Submenu::with_items(&servers_label, true, &srv_refs).expect("servers submenu");
 
+    // ── Startup Settings ──────────────────────────────────────────────────
+    let startup_settings = MenuItem::new(&t!("tray.startup_settings").to_string(), true, None);
+    ids.insert(startup_settings.id().clone(), TrayEvent::ShowStartupSettings);
+
     // ── Quit ─────────────────────────────────────────────────────────────
     let quit = MenuItem::new(&t!("tray.quit").to_string(), true, None);
     ids.insert(quit.id().clone(), TrayEvent::QuitApp);
@@ -533,6 +547,8 @@ fn build_native_menu(
         &proxy_sub,
         &pac_sub,
         &servers_sub,
+        &PredefinedMenuItem::separator(),
+        &startup_settings,
         &PredefinedMenuItem::separator(),
         &quit,
     ])

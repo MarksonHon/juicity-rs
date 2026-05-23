@@ -134,12 +134,20 @@ jobs:
 
       # ── Download shadowsocks-rust ─────────────────────────────────────────
 
+      - name: Get shadowsocks-rust latest tag
+        shell: bash
+        run: |
+          SS_TAG=$(curl -sSf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
+            | grep '"tag_name"' | head -1 | sed 's/.*"\(v[^"]*\)".*/\1/')
+          echo "Resolved shadowsocks-rust tag: ${SS_TAG}"
+          echo "SS_TAG=${SS_TAG}" >> "$GITHUB_ENV"
+
       - name: Download shadowsocks-rust (Linux/macOS)
         if: matrix.os != 'windows'
         shell: bash
         run: |
-          SS_TAG=$(curl -sSf "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
-            | grep '"tag_name"' | head -1 | sed 's/.*"\(v[^"]*\)".*/\1/')
           echo "Downloading shadowsocks-rust ${SS_TAG}"
           curl -sSfL \
             "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_TAG}/shadowsocks-${SS_TAG}.${{ matrix.ss_suffix }}" \
@@ -152,17 +160,16 @@ jobs:
         if: matrix.os == 'windows'
         shell: pwsh
         run: |
-          $tag = (Invoke-RestMethod "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest").tag_name
-          Write-Host "Downloading shadowsocks-rust $tag"
-          $url = "https://github.com/shadowsocks/shadowsocks-rust/releases/download/$tag/shadowsocks-$tag.${{ matrix.ss_suffix }}"
+          Write-Host "Downloading shadowsocks-rust $env:SS_TAG"
+          $url = "https://github.com/shadowsocks/shadowsocks-rust/releases/download/$env:SS_TAG/shadowsocks-$env:SS_TAG.${{ matrix.ss_suffix }}"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ss.zip"
           Expand-Archive -Path "$env:TEMP\ss.zip" -DestinationPath "$env:TEMP\ss" -Force
           Add-Content $env:GITHUB_ENV "SS_DIR=$env:TEMP\ss"
 
       # ── Prepare package ───────────────────────────────────────────────────
 
-      - name: Prepare package (Linux/macOS)
-        if: matrix.os != 'windows'
+      - name: Prepare package (Linux)
+        if: matrix.os == 'linux'
         shell: bash
         run: |
           PKG_NAME="juicity-gui-${{ matrix.name }}"
@@ -171,7 +178,27 @@ jobs:
           cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
           cp "${SS_DIR}/sslocal" "dist/${PKG_NAME}/"
           cp "${SS_DIR}/ssurl"   "dist/${PKG_NAME}/"
-          cp juicity-client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
+
+      - name: Prepare .app bundle (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          # Derive version from tag (strip leading 'v') or use '0.0.0' for CI
+          VERSION="${GITHUB_REF_NAME#v}"
+          # If the version looks like a branch name (not semver), use latest tag or fallback
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            VERSION="0.1.0"
+          fi
+          # Generate the .app bundle with all dependencies bundled inside
+          bash gui/macos/bundle.sh \
+            --target-dir "target/${{ matrix.target }}/release" \
+            --app-name "Juicity" \
+            --version "${VERSION}" \
+            --build-number "${{ github.run_number }}"
+          # The bundle.sh creates dist/Juicity.app
+          # Rename to include target name for artifact naming
+          mv dist/Juicity.app "dist/juicity-gui-${{ matrix.name }}.app"
 
       - name: Prepare package + collect DLLs (Windows)
         if: matrix.os == 'windows'
@@ -190,7 +217,7 @@ jobs:
           cp "${SS_UNIX}/sslocal.exe" "${PKG_DIR}/"
           cp "${SS_UNIX}/ssurl.exe"   "${PKG_DIR}/"
 
-          cp juicity-client/examples/config.json "${PKG_DIR}/client-config.json"
+          cp client/examples/config.json "${PKG_DIR}/client-config.json"
 
           # Collect DLL dependencies recursively for all EXEs
           declare -A seen
@@ -242,11 +269,18 @@ jobs:
 
       # ── Package zip ───────────────────────────────────────────────────────
 
-      - name: Package zip (Linux/macOS)
-        if: matrix.os != 'windows'
+      - name: Package zip (Linux)
+        if: matrix.os == 'linux'
         run: |
           cd dist
           zip -r "../juicity-gui-${{ matrix.name }}.zip" "juicity-gui-${{ matrix.name }}/"
+
+      - name: Package .app bundle to zip (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          cd dist
+          # Preserve symlinks and macOS metadata when zipping .app bundles
+          zip -ry "../juicity-gui-${{ matrix.name }}.zip" "juicity-gui-${{ matrix.name }}.app/"
 
       - name: Package zip (Windows)
         if: matrix.os == 'windows'

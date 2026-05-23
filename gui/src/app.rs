@@ -1,5 +1,5 @@
 use crate::config::{
-    ProfileStore, ProxyProfile, ProxyProtocol, RuntimeState, Storage,
+    ProfileStore, ProxyProfile, ProxyProtocol, RuntimeState, StartupConnectionState, Storage,
     SS_METHODS, method_to_index,
 };
 use crate::core::CoreManager;
@@ -729,6 +729,8 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                         proto = profile.protocol.label(),
                         name = profile.display_name()
                     ));
+                    s.runtime.was_running = true;
+                    let _ = s.flush();
                     if let Ok(mut ts) = tray_shared.lock() {
                         ts.is_running = true;
                         ts.active_server_name = profile.display_name();
@@ -749,6 +751,8 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
             match s.core_manager.stop() {
                 Ok(()) => {
                     status_label.set_text(&*t!("status.stopped"));
+                    s.runtime.was_running = false;
+                    let _ = s.flush();
                     if let Ok(mut ts) = tray_shared.lock() {
                         ts.is_running = false;
                         ts.active_server_name = String::new();
@@ -1048,6 +1052,25 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                         };
                         crate::pac_dialog::open(&window, cfg_snapshot, on_save, on_update_now);
                     }
+                    Ok(TrayEvent::ShowStartupSettings) => {
+                        let runtime_snapshot = state.borrow().runtime.clone();
+                        let state_s = state.clone();
+                        let sl_s = status_label.clone();
+                        let on_save = move |new_state: RuntimeState| {
+                            let mut s = state_s.borrow_mut();
+                            s.runtime = new_state;
+                            if let Err(err) = s.flush() {
+                                sl_s.set_text(&t!("status.save_failed", err = err.to_string()));
+                                return;
+                            }
+                            // Apply auto-start (开机启动) setting.
+                            if let Err(err) = apply_autostart(&s.runtime) {
+                                tracing::warn!("failed to apply auto-start setting: {err}");
+                            }
+                            sl_s.set_text(&*t!("status.saved"));
+                        };
+                        crate::startup_dialog::open(&window, runtime_snapshot, on_save);
+                    }
                     Ok(TrayEvent::SetSystemProxy(mode)) => {
                         let mut s = state.borrow_mut();
                         s.config.system_proxy_mode = mode;
@@ -1110,6 +1133,8 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                             match s.core_manager.stop() {
                                 Ok(()) => {
                                     status_label.set_text(&*t!("status.stopped"));
+                                    s.runtime.was_running = false;
+                                    let _ = s.flush();
                                     if let Ok(mut ts) = tray_shared.lock() {
                                         ts.is_running = false;
                                         ts.active_server_name = String::new();
@@ -1132,6 +1157,8 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                                         proto = profile.protocol.label(),
                                         name = profile.display_name()
                                     ));
+                                    s.runtime.was_running = true;
+                                    let _ = s.flush();
                                     if let Ok(mut ts) = tray_shared.lock() {
                                         ts.is_running = true;
                                         ts.active_server_name = profile.display_name();
@@ -1215,7 +1242,114 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
 
     populate_list();
     load_fields();
-    window.present();
+
+    // ── Apply startup settings ──────────────────────────────────────────
+    let start_connection = {
+        let s = state.borrow();
+        let should_start = match s.runtime.startup_connection_state {
+            StartupConnectionState::On => true,
+            StartupConnectionState::LastState => s.runtime.was_running,
+            StartupConnectionState::Off => false,
+        };
+        // Clone values needed for auto-start outside the borrow.
+        let config = s.config.clone();
+        let profile = s.selected_profile().cloned();
+        let profile_name = profile.as_ref().map(|p| p.display_name()).unwrap_or_default();
+        let profile_protocol = profile.as_ref().map(|p| p.protocol).unwrap_or(ProxyProtocol::Juicity);
+        (should_start, config, profile, profile_name, profile_protocol)
+    };
+
+    // Hide window if configured.
+    if state.borrow().runtime.hide_window_on_startup {
+        window.set_visible(false);
+    } else {
+        window.present();
+    }
+
+    // Auto-start proxy if configured.
+    if start_connection.0 {
+        if let Some(profile) = start_connection.2 {
+            let mut s = state.borrow_mut();
+            let config = start_connection.1;
+            match s.core_manager.start_profile(&config, &profile) {
+                Ok(()) => {
+                    status_label.set_text(&t!(
+                        "status.running",
+                        proto = start_connection.4.label(),
+                        name = start_connection.3
+                    ));
+                    s.runtime.was_running = true;
+                    let _ = s.flush();
+                    if let Ok(mut ts) = tray_shared.lock() {
+                        ts.is_running = true;
+                        ts.active_server_name = start_connection.3;
+                    }
+                }
+                Err(err) => {
+                    status_label.set_text(&t!("status.start_failed", err = err.to_string()));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply or remove system auto-start (开机启动) for the application.
+///
+/// On Linux, this creates or removes a `.desktop` file in `~/.config/autostart/`.
+/// On Windows, this would modify the registry Run key.
+/// On macOS, this would use LSSharedFileList.
+#[allow(unused_variables)]
+fn apply_autostart(state: &RuntimeState) -> anyhow::Result<()> {
+    fn autostart_dir() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        std::path::PathBuf::from(&home).join(".config/autostart")
+    }
+
+    if !state.auto_start {
+        // Remove existing autostart entry.
+        #[cfg(target_os = "linux")]
+        {
+            let desktop_file = autostart_dir().join("io.juicity.gui.desktop");
+            if desktop_file.exists() {
+                let _ = std::fs::remove_file(&desktop_file);
+            }
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = autostart_dir();
+        std::fs::create_dir_all(&dir)?;
+
+        // Determine the executable path.  Fall back to argv[0] when /proc/self/exe
+        // is unavailable (e.g. some containers).
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|_| std::path::PathBuf::from("juicity-gui"));
+
+        let desktop_content = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Juicity GUI\n\
+             Comment=Juicity GUI Client\n\
+             Exec={}\n\
+             Icon=io.juicity.gui\n\
+             Terminal=false\n\
+             Categories=Network;\n\
+             X-GNOME-Autostart-enabled=true\n",
+            exe.display()
+        );
+
+        let desktop_file = dir.join("io.juicity.gui.desktop");
+        std::fs::write(&desktop_file, desktop_content.as_bytes())?;
+        tracing::info!("autostart desktop file created at {}", desktop_file.display());
+    }
+
+    // TODO: Windows registry support via winreg crate.
+    // TODO: macOS launchd plist support.
+
     Ok(())
 }
 
