@@ -65,22 +65,17 @@ jobs:
         shell: bash
         run: |
           PKG_NAME="juicity-${{ matrix.target }}"
-          mkdir -p "dist/${PKG_NAME}"
-          cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
-          cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
-          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
-
-      - name: Package zip
-        run: |
-          cd dist
-          zip -r "../juicity-${{ matrix.target }}.zip" "juicity-${{ matrix.target }}/"
+          mkdir -p "${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client" "${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server" "${PKG_NAME}/"
+          cp client/examples/config.json "${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-${{ matrix.target }}
-          path: juicity-${{ matrix.target }}.zip
+          path: juicity-${{ matrix.target }}
           if-no-files-found: error
 
   # --------------------------------------------------
@@ -137,24 +132,18 @@ jobs:
         shell: bash
         run: |
           PKG_NAME="juicity-${{ matrix.target }}"
-          mkdir -p "dist/${PKG_NAME}"
-          cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
-          cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
-          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
-
-      - name: Package zip
-        if: steps.check_build.outputs.build_ok == 'true'
-        run: |
-          cd dist
-          zip -r "../juicity-${{ matrix.target }}.zip" "juicity-${{ matrix.target }}/"
+          mkdir -p "${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client" "${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server" "${PKG_NAME}/"
+          cp client/examples/config.json "${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
         if: steps.check_build.outputs.build_ok == 'true'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-${{ matrix.target }}
-          path: juicity-${{ matrix.target }}.zip
+          path: juicity-${{ matrix.target }}
           if-no-files-found: warn
 
   # --------------------------------------------------
@@ -197,23 +186,17 @@ jobs:
         shell: msys2 {0}
         run: |
           PKG_NAME="juicity-${{ matrix.target }}"
-          mkdir -p "dist/${PKG_NAME}"
-          cp "target/${{ matrix.target }}/release/juicity-client.exe" "dist/${PKG_NAME}/"
-          cp "target/${{ matrix.target }}/release/juicity-server.exe" "dist/${PKG_NAME}/"
-          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
-
-      - name: Package zip
-        shell: pwsh
-        run: |
-          Set-Location -Path dist
-          Compress-Archive -Path "juicity-${{ matrix.target }}/" -DestinationPath "../juicity-${{ matrix.target }}.zip" -Force
+          mkdir -p "${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client.exe" "${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server.exe" "${PKG_NAME}/"
+          cp client/examples/config.json "${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-${{ matrix.target }}
-          path: juicity-${{ matrix.target }}.zip
+          path: juicity-${{ matrix.target }}
           if-no-files-found: error
 
   # --------------------------------------------------
@@ -246,22 +229,17 @@ jobs:
         shell: bash
         run: |
           PKG_NAME="juicity-${{ matrix.target }}"
-          mkdir -p "dist/${PKG_NAME}"
-          cp "target/${{ matrix.target }}/release/juicity-client" "dist/${PKG_NAME}/"
-          cp "target/${{ matrix.target }}/release/juicity-server" "dist/${PKG_NAME}/"
-          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
-
-      - name: Package zip
-        run: |
-          cd dist
-          zip -r "../juicity-${{ matrix.target }}.zip" "juicity-${{ matrix.target }}/"
+          mkdir -p "${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client" "${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server" "${PKG_NAME}/"
+          cp client/examples/config.json "${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-${{ matrix.target }}
-          path: juicity-${{ matrix.target }}.zip
+          path: juicity-${{ matrix.target }}
           if-no-files-found: error
 
   # --------------------------------------------------
@@ -290,22 +268,17 @@ jobs:
         shell: bash
         run: |
           PKG_NAME="juicity-x86_64-unknown-freebsd"
-          mkdir -p "dist/${PKG_NAME}"
-          cp "target/x86_64-unknown-freebsd/release/juicity-client" "dist/${PKG_NAME}/" || true
-          cp "target/x86_64-unknown-freebsd/release/juicity-server" "dist/${PKG_NAME}/" || true
-          cp client/examples/config.json "dist/${PKG_NAME}/client-config.json"
-          cp server/examples/config.json "dist/${PKG_NAME}/server-config.json"
-
-      - name: Package zip
-        run: |
-          cd dist
-          zip -r "../juicity-x86_64-unknown-freebsd.zip" "juicity-x86_64-unknown-freebsd/"
+          mkdir -p "${PKG_NAME}"
+          cp "target/x86_64-unknown-freebsd/release/juicity-client" "${PKG_NAME}/" || true
+          cp "target/x86_64-unknown-freebsd/release/juicity-server" "${PKG_NAME}/" || true
+          cp client/examples/config.json "${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-x86_64-unknown-freebsd
-          path: juicity-x86_64-unknown-freebsd.zip
+          path: juicity-x86_64-unknown-freebsd
           if-no-files-found: warn
 
   # --------------------------------------------------
@@ -329,6 +302,17 @@ jobs:
         with:
           path: artifacts
 
+      - name: Compress artifacts into zip files
+        shell: bash
+        run: |
+          shopt -s globstar
+          for dir in artifacts/*/; do
+            target_name=$(basename "$dir")
+            zipfile="artifacts/${target_name}.zip"
+            echo "Creating zip: $zipfile from $dir"
+            (cd "$dir" && zip -r "../../${zipfile}" .)
+          done
+          
       - name: Upload to Release
         env:
           GH_TOKEN: ${{ github.token }}
