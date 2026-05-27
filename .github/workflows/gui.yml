@@ -285,31 +285,10 @@ jobs:
             done < <(ldd "${PKG_DIR}/dbus-daemon.exe" 2>/dev/null | awk '/=> \//' | awk '{print $3}' | grep -v '/c/[Ww]indows')
           fi
 
-      # ── Package zip ───────────────────────────────────────────────────────
-
-      # - name: Package zip (Linux)
-      #   if: matrix.os == 'linux'
-      #   run: |
-      #     cd dist
-      #     zip -r "../juicity-gui-${{ matrix.name }}.zip" "juicity-gui-${{ matrix.name }}/"
-
-      # - name: Package .app bundle to zip (macOS)
-      #   if: matrix.os == 'macos'
-      #   run: |
-      #     cd dist
-      #     # Preserve symlinks and macOS metadata when zipping .app bundles
-      #     zip -ry "../juicity-gui-${{ matrix.name }}.zip" "juicity-gui-${{ matrix.name }}.app/"
-
-      # - name: Package zip (Windows)
-      #   if: matrix.os == 'windows'
-      #   shell: pwsh
-      #   run: |
-      #     Set-Location dist
-      #     Compress-Archive -Path "juicity-gui-${{ matrix.name }}/" -DestinationPath "../juicity-gui-${{ matrix.name }}.zip" -Force
-
       # ── Upload artifact ───────────────────────────────────────────────────
 
-      - name: Upload artifact
+      - name: Upload artifact (Linux/Windows)
+        if: matrix.os != 'macos'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-gui-${{ matrix.name }}
@@ -317,6 +296,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (macOS .app bundle)
+        if: matrix.os == 'macos'
         uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-gui-${{ matrix.name }}.app
@@ -340,14 +320,18 @@ jobs:
           pattern: juicity-gui-*
           path: artifacts
 
-      - name: Upload to Release
+      - name: Zip and upload GUI artifacts to Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
-          shopt -s globstar
-          for zipfile in artifacts/**/*.zip; do
-            echo "Uploading: $zipfile"
-            gh release upload "${{ github.event.release.tag_name }}" "$zipfile" --clobber -R "$GH_REPO"
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            zipfile="${name}.zip"
+            echo "Zipping ${name} -> ${zipfile}"
+            # -y preserves symlinks (needed for .app bundles), -r recurses
+            zip -ry "${zipfile}" "${dir}"
+            echo "Uploading: ${zipfile}"
+            gh release upload "${{ github.event.release.tag_name }}" "${zipfile}" --clobber -R "$GH_REPO"
           done
