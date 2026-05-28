@@ -409,6 +409,7 @@ async fn handle_non_quic_underlay_packet(
         let relay_back = server_socket.clone();
         let session_cipher = session.cipher.clone();
         let sessions_for_task = sessions.clone();
+        let udp_pool_for_task = udp_pool.clone();
         let relay_handle = tokio::spawn(async move {
             // Pre-allocate full-capacity output buffer to avoid repeated Vec resizing.
             // Max payload: ETHERNET_MTU * 4, plus 32-byte salt prefix + 16-byte AEAD tag.
@@ -438,8 +439,12 @@ async fn handle_non_quic_underlay_packet(
                 }
             }
 
-            let mut guard = sessions_for_task.lock().unwrap();
-            guard.remove(&source);
+            // Drop the MutexGuard before the await to satisfy Send.
+            {
+                let mut guard = sessions_for_task.lock().unwrap();
+                guard.remove(&source);
+            }
+            udp_pool_for_task.remove(&source).await;
         });
         // Store the abort handle so periodic cleanup can cancel this task.
         // Use Entry API to avoid the race where relay_handle exits before we store the abort handle.
@@ -662,6 +667,11 @@ async fn handle_tcp_relay(
             if let Err(e) = r { tracing::debug!("TCP relay quic->remote: {:?}", e); }
         }
     }
+
+    // Gracefully finish the send direction so quinn can clean up the stream
+    // state immediately instead of holding it until a timeout or stream reset.
+    let _ = quic_tx.finish();
+
     Ok(())
 }
 

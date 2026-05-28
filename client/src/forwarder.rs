@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -201,6 +202,10 @@ async fn forward_tcp_connection(
         }
     }
 
+    // Gracefully finish the send direction so quinn can clean up the stream
+    // state immediately instead of holding it until a timeout or stream reset.
+    let _ = quic_send.finish();
+
     Ok(())
 }
 
@@ -222,6 +227,12 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
     // Each unique source address gets its own QUIC bidirectional stream.
     let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    // Monotonically increasing session ID counter. Each new session gets a unique
+    // ID so that supervisor tasks can verify they are removing their own session
+    // entry, preventing races where an old supervisor removes a newly created
+    // session for the same source address.
+    let session_seq = Arc::new(AtomicU64::new(1));
 
     // Periodic cleanup: remove sessions whose writer channel has been closed.
     // AbortOnDrop ensures this task is cancelled when start_udp_forward returns
@@ -261,11 +272,12 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
         let client = client.clone();
         let host = Arc::clone(&host);
         let sessions = Arc::clone(&sessions);
+        let session_seq = Arc::clone(&session_seq);
         let cancel = cancel.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_udp_datagram(
-                socket, sessions, src_addr, data, host, port, &client, cancel,
+                socket, sessions, session_seq, src_addr, data, host, port, &client, cancel,
             )
             .await
             {
@@ -278,6 +290,9 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
 
 /// A UDP session that holds the QUIC stream for a given source address.
 struct UdpSession {
+    /// Unique session ID, used by the supervisor to verify it is removing the
+    /// correct entry from the sessions map (prevents races with session replacement).
+    id: u64,
     /// Sender channel to push outbound datagrams to the QUIC writer task
     tx: tokio::sync::mpsc::Sender<Bytes>,
 }
@@ -286,6 +301,7 @@ struct UdpSession {
 async fn handle_udp_datagram(
     socket: Arc<UdpSocket>,
     sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>>,
+    session_seq: Arc<AtomicU64>,
     src_addr: SocketAddr,
     data: Bytes,
     host: Arc<str>,
@@ -294,19 +310,28 @@ async fn handle_udp_datagram(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     // Check if we already have a session for this source
-    let existing_tx = {
+    let existing = {
         let guard = sessions.lock().await;
-        guard.get(&src_addr).map(|s| s.tx.clone())
+        guard.get(&src_addr).map(|s| (s.id, s.tx.clone()))
     };
 
-    if let Some(tx) = existing_tx {
+    if let Some((session_id, tx)) = existing {
         // Session exists, send datagram through it.
         // Bytes is Arc-based, so clone is cheap (refcount increment).
         if tx.send(data.clone()).await.is_ok() {
             return Ok(());
         }
-        // Session is dead, remove it
-        sessions.lock().await.remove(&src_addr);
+        // Session is dead — remove it only if the entry hasn't been replaced
+        // by a concurrent session creation. Using session_id prevents this remove
+        // from deleting a newly created session for the same src_addr.
+        {
+            let mut guard = sessions.lock().await;
+            if let Some(s) = guard.get(&src_addr) {
+                if s.id == session_id {
+                    guard.remove(&src_addr);
+                }
+            }
+        }
 
         // Re-create session below with a new QUIC stream
     }
@@ -315,13 +340,14 @@ async fn handle_udp_datagram(
     let (mut send, mut recv) = client.open_udp_stream(&host, port, &data[..]).await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    let session_id = session_seq.fetch_add(1, Ordering::Relaxed);
 
     // Insert session
     {
         let mut guard = sessions.lock().await;
         guard.insert(
             src_addr,
-            UdpSession { tx: tx.clone() },
+            UdpSession { id: session_id, tx: tx.clone() },
         );
     }
 
@@ -365,6 +391,9 @@ async fn handle_udp_datagram(
     // immediately if the parent forwarder has been cancelled (start_udp_forward exited).
     // Using select! instead of join! ensures the reader's NAT timeout does not block
     // cleanup when the writer exits early.
+    //
+    // Uses session_id to verify the entry matches before removing, preventing a race
+    // where an old supervisor removes a new session created for the same src_addr.
     tokio::spawn(async move {
         let mut writer = writer_handle;
         let mut reader = reader_handle;
@@ -382,7 +411,12 @@ async fn handle_udp_datagram(
                 reader.abort();
             }
         }
-        sessions_clone.lock().await.remove(&src_addr);
+        let mut guard = sessions_clone.lock().await;
+        if let Some(s) = guard.get(&src_addr) {
+            if s.id == session_id {
+                guard.remove(&src_addr);
+            }
+        }
     });
 
     Ok(())
