@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -32,10 +32,35 @@ pub struct InFlightUnderlayKey {
 struct InFlightEntry {
     auth: UnderlayAuth,
     inserted_at: Instant,
+    owner: u64,
 }
 
 struct InFlightInner {
     entries: HashMap<InFlightKey, InFlightEntry>,
+    order: VecDeque<InFlightKey>,
+    owners: HashMap<u64, HashSet<InFlightKey>>,
+}
+
+impl InFlightInner {
+    fn remove_key(&mut self, key: &InFlightKey) -> Option<InFlightEntry> {
+        let entry = self.entries.remove(key)?;
+        if let Some(keys) = self.owners.get_mut(&entry.owner) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.owners.remove(&entry.owner);
+            }
+        }
+        Some(entry)
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        while let Some(oldest_key) = self.order.pop_front() {
+            if self.remove_key(&oldest_key).is_some() {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl InFlightUnderlayKey {
@@ -44,33 +69,66 @@ impl InFlightUnderlayKey {
             ttl,
             inner: Mutex::new(InFlightInner {
                 entries: HashMap::new(),
+                order: VecDeque::new(),
+                owners: HashMap::new(),
             }),
             notify: Notify::new(),
         }
     }
 
+    #[inline]
+    pub fn store(&self, key: InFlightKey, auth: UnderlayAuth) {
+        self.store_for_owner(0, key, auth);
+    }
+
     /// Store an authentication for later retrieval.
     ///
     /// If the number of in-flight entries already equals `MAX_IN_FLIGHT_UNDERLAY_ENTRIES`,
-    /// expired entries are evicted first.  If the map is still full after eviction,
-    /// the new entry is silently dropped to prevent unbounded memory growth during a
-    /// burst of forged or unanswered underlay auth packets.
-    pub fn store(&self, key: InFlightKey, auth: UnderlayAuth) {
+    /// expired entries are evicted first. If the map is still full after eviction,
+    /// evict the oldest entry and insert the new one. This favors fresher auth data
+    /// and promptly releases stale connection metadata.
+    pub fn store_for_owner(&self, owner: u64, key: InFlightKey, auth: UnderlayAuth) {
         let mut inner = self.inner.lock().unwrap();
         if inner.entries.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
             // Eagerly evict expired entries before considering whether to drop.
             let now = Instant::now();
             let ttl = self.ttl;
-            inner.entries.retain(|_, e| now.duration_since(e.inserted_at) <= ttl);
+            let expired_keys: Vec<InFlightKey> = inner
+                .entries
+                .iter()
+                .filter_map(|(k, e)| {
+                    if now.duration_since(e.inserted_at) > ttl {
+                        Some(*k)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for k in expired_keys {
+                inner.remove_key(&k);
+            }
             if inner.entries.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
-                tracing::warn!(
-                    "in-flight underlay auth table is full ({} entries); dropping new entry",
-                    inner.entries.len()
-                );
-                return;
+                if inner.evict_oldest() {
+                    tracing::debug!(
+                        "in-flight underlay auth table full ({} entries); evicted oldest entry",
+                        inner.entries.len() + 1
+                    );
+                }
             }
         }
-        inner.entries.insert(key, InFlightEntry { auth, inserted_at: Instant::now() });
+
+        // Replace semantics: remove old owner index if the key already exists.
+        inner.remove_key(&key);
+        inner.entries.insert(
+            key,
+            InFlightEntry {
+                auth,
+                inserted_at: Instant::now(),
+                owner,
+            },
+        );
+        inner.owners.entry(owner).or_default().insert(key);
+        inner.order.push_back(key);
         // Notify any waiting evict() call that a new key is available
         self.notify.notify_waiters();
     }
@@ -81,7 +139,7 @@ impl InFlightUnderlayKey {
         // First attempt without waiting
         {
             let mut inner = self.inner.lock().unwrap();
-            if let Some(entry) = inner.entries.remove(key) {
+            if let Some(entry) = inner.remove_key(key) {
                 return Some(entry.auth);
             }
         }
@@ -97,7 +155,7 @@ impl InFlightUnderlayKey {
                 _ = wait => {
                     // Woken up - check if our key arrived
                     let mut guard = self.inner.lock().unwrap();
-                    if let Some(entry) = guard.entries.remove(key) {
+                    if let Some(entry) = guard.remove_key(key) {
                         return Some(entry.auth);
                     }
                     // Not our key, loop back to wait again (if within deadline)
@@ -108,8 +166,18 @@ impl InFlightUnderlayKey {
                 _ = tokio::time::sleep_until(deadline.into()) => {
                     // Timeout - try one last time
                     let mut guard = self.inner.lock().unwrap();
-                    return guard.entries.remove(key).map(|e| e.auth);
+                    return guard.remove_key(key).map(|e| e.auth);
                 }
+            }
+        }
+    }
+
+    /// Remove all in-flight auth entries associated with one connection owner.
+    pub fn remove_owner(&self, owner: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(keys) = inner.owners.remove(&owner) {
+            for key in keys {
+                inner.entries.remove(&key);
             }
         }
     }
@@ -119,6 +187,19 @@ impl InFlightUnderlayKey {
         let mut inner = self.inner.lock().unwrap();
         let now = Instant::now();
         let ttl = self.ttl;
-        inner.entries.retain(|_, e| now.duration_since(e.inserted_at) <= ttl);
+        let expired_keys: Vec<InFlightKey> = inner
+            .entries
+            .iter()
+            .filter_map(|(k, e)| {
+                if now.duration_since(e.inserted_at) > ttl {
+                    Some(*k)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for k in expired_keys {
+            inner.remove_key(&k);
+        }
     }
 }

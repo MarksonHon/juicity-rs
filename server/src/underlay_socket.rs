@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use juicity_common::consts;
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 
@@ -33,26 +34,57 @@ impl DemuxUdpSocket {
     }
 
     #[inline]
+    fn is_probably_quic_long_header(packet: &[u8]) -> bool {
+        // Invariants packet:
+        // - Header form bit set (0x80)
+        // - Fixed bit set (0x40)
+        // - 4-byte version present
+        if packet.len() < 7 {
+            return false;
+        }
+        let first = packet[0];
+        if (first & 0x80) == 0 || (first & 0x40) == 0 {
+            return false;
+        }
+
+        let version = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
+        // Accept QUIC v1/v2 and Version Negotiation packet version (0).
+        if version != 0 && version != 1 && version != 2 {
+            return false;
+        }
+
+        let dcid_len = packet[5] as usize;
+        if packet.len() < 6 + dcid_len + 1 {
+            return false;
+        }
+        let scid_len_index = 6 + dcid_len;
+        let scid_len = packet[scid_len_index] as usize;
+        packet.len() >= scid_len_index + 1 + scid_len
+    }
+
+    #[inline]
+    fn is_probably_quic_short_header(packet: &[u8]) -> bool {
+        // Invariants packet:
+        // - Header form bit clear (0x80 == 0)
+        // - Fixed bit set (0x40)
+        // We also require a minimal practical payload length to filter random noise.
+        if packet.len() < 9 {
+            return false;
+        }
+        let first = packet[0];
+        (first & 0x80) == 0 && (first & 0x40) == 0x40
+    }
+
+    #[inline]
     fn is_probably_quic_packet(packet: &[u8]) -> bool {
         if packet.is_empty() {
             return false;
         }
-        let first = packet[0];
-        // QUIC v1 long header: first two bits are 11 (0xC0)
-        // QUIC v1 short header: first bit is 0 (0x00-0x7F range, but specifically bit 0x40 is set for short header)
-        // More strict check:
-        // - Long header (QUIC v1): first byte has bits 0xC0 set (both high bits)
-        // - Short header (QUIC v1): first byte has bit 0x40 set, bit 0x80 clear
-        //
-        // Actually, QUIC always has the second most significant bit set (0x40).
-        // The original check `(packet[0] & 0x40) == 0x40` is correct for QUIC v1.
-        // However, we should also verify it's not a known non-QUIC protocol.
-        //
-        // For Juicity underlay, non-QUIC packets are encrypted and their first byte
-        // will have different characteristics. The original check is sufficient but
-        // we add an additional sanity check: the fixed bit (0x40) must be set,
-        // and for long headers (0xC0), the version should be valid.
-        (first & 0x40) == 0x40
+        if (packet[0] & 0x80) != 0 {
+            Self::is_probably_quic_long_header(packet)
+        } else {
+            Self::is_probably_quic_short_header(packet)
+        }
     }
 }
 
@@ -95,6 +127,11 @@ impl AsyncUdpSocket for DemuxUdpSocket {
                 let stride = meta[i].stride.max(1);
                 while offset < meta[i].len {
                     let end = (offset + stride).min(meta[i].len);
+                    if end - offset < consts::UNDERLAY_SALT_LEN {
+                        // Drop malformed underlay datagrams early at demux layer.
+                        offset = end;
+                        continue;
+                    }
                     // Use Bytes::copy_from_slice to create a reference-counted
                     // copy of the payload, avoiding per-packet Vec allocation overhead.
                     // Allocate a Vec<u8> directly — avoids the extra to_vec() copy

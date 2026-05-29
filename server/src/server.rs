@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,9 @@ use juicity_common::protocol;
 use juicity_common::Config;
 use quinn::{Endpoint, EndpointConfig, RecvStream, SendStream, VarInt};
 use uuid::Uuid;
+
+const APP_ERROR_GENERIC_PROTOCOL: u32 = 0xfffffff0;
+static NEXT_UNDERLAY_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct UnderlaySession {
@@ -214,7 +218,7 @@ impl JuicityServer {
                     handle_connection(incoming, users, in_flight, udp_pool, dialer, disable_443)
                         .await
                 {
-                    tracing::warn!("Connection handler error: {:?}", e);
+                    tracing::warn!("Connection handler terminated: {}", e);
                 }
             });
         }
@@ -485,6 +489,7 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
     let remote_addr = connection.remote_address();
+    let underlay_owner = NEXT_UNDERLAY_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     tracing::debug!("New QUIC connection from {}", remote_addr);
 
     // === Authenticate ===
@@ -501,14 +506,15 @@ async fn handle_connection(
             tracing::debug!("User {} authenticated from {}", uuid, remote_addr);
             (uuid, stream)
         }
-        Ok(Err(e)) => {
-            tracing::warn!("Authentication failed from {}: {:?}", remote_addr, e);
-            connection.close(VarInt::from_u32(0xfffffff1), b"authentication failed");
-            return Err(e);
+        Ok(Err(_)) => {
+            tracing::warn!("Authentication failed from {}", remote_addr);
+            connection.close(VarInt::from_u32(APP_ERROR_GENERIC_PROTOCOL), b"");
+            return Err(anyhow::anyhow!("authentication rejected"));
         }
         Err(_) => {
-            connection.close(VarInt::from_u32(0xfffffff2), b"authentication timeout");
-            return Err(anyhow::anyhow!("auth timeout"));
+            tracing::warn!("Authentication timeout from {}", remote_addr);
+            connection.close(VarInt::from_u32(APP_ERROR_GENERIC_PROTOCOL), b"");
+            return Err(anyhow::anyhow!("authentication rejected"));
         }
     };
 
@@ -520,7 +526,7 @@ async fn handle_connection(
         loop {
             match protocol::read_underlay_auth_async(&mut auth_uni_stream).await {
                 Ok(auth) => {
-                    in_flight_for_auth.store(auth.iv, auth);
+                    in_flight_for_auth.store_for_owner(underlay_owner, auth.iv, auth);
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -548,6 +554,7 @@ async fn handle_connection(
                 let s_dialer = dialer.clone();
                 let s_user_uuid = user_uuid;
                 let s_disable_443 = disable_udp_443;
+                let s_connection = connection.clone();
 
                 stream_tasks.spawn(async move {
                     if let Err(e) = handle_stream(
@@ -559,7 +566,8 @@ async fn handle_connection(
                     )
                     .await
                     {
-                        tracing::debug!("Stream handler error: {:?}", e);
+                        tracing::debug!("Stream rejected: {}", e);
+                        s_connection.close(VarInt::from_u32(APP_ERROR_GENERIC_PROTOCOL), b"");
                     }
                 });
             }
@@ -576,6 +584,10 @@ async fn handle_connection(
     // Abort the underlay auth reader task and all stream tasks so their Arc
     // references (in_flight, dialer, etc.) are released promptly.
     auth_task_handle.abort();
+    let _ = auth_task_handle.await;
+    // Connection scoped cleanup: release any residual in-flight auth created
+    // by this connection so old proxy metadata does not linger.
+    in_flight.remove_owner(underlay_owner);
     // JoinSet drop aborts all remaining stream tasks automatically.
     Ok(())
 }
