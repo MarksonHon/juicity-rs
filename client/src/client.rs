@@ -5,6 +5,7 @@ use juicity_common::consts;
 use juicity_common::protocol;
 use juicity_common::Config;
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 /// A Juicity client that connects to a remote Juicity server
@@ -177,14 +178,22 @@ impl JuicityClient {
         tracing::info!("Connecting to Juicity server at {}", self.server_addr);
 
         let addr = SocketAddr::new(self.server_addr.ip(), self.server_addr.port());
-        let quinn_conn = self
-            .endpoint
-            .connect_with((*self.quic_config).clone(), addr, &self.sni)?
-            .await?;
+        let quinn_conn = timeout(
+            consts::DEFAULT_DIAL_TIMEOUT,
+            self.endpoint
+                .connect_with((*self.quic_config).clone(), addr, &self.sni)?,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("QUIC connect timeout"))??;
 
         // === Authenticate (compatible with upstream) ===
         // Format: [version=0][cmd_type=Authenticate(0x00)][uuid(16)][token(32)]
-        let mut uni = quinn_conn.open_uni().await?;
+        let mut uni = timeout(
+            consts::AUTHENTICATE_TIMEOUT,
+            quinn_conn.open_uni(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("open_uni timeout"))??;
 
         // Token using TLS ExportKeyingMaterial(uuid, password, 32) per RFC 5705.
         // export_keying_material is CPU-bound (HKDF); run it in spawn_blocking to
@@ -203,7 +212,12 @@ impl JuicityClient {
         auth_buf.extend_from_slice(&[protocol::PROTOCOL_VERSION, protocol::AUTHENTICATE_TYPE]);
         auth_buf.extend_from_slice(self.uuid.as_bytes());
         auth_buf.extend_from_slice(&token);
-        uni.write_all(&auth_buf).await?;
+        timeout(
+            consts::AUTHENTICATE_TIMEOUT,
+            uni.write_all(&auth_buf),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("auth write timeout"))??;
 
         tracing::info!("Authenticated as user {}", self.uuid);
 

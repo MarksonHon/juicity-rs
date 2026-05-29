@@ -12,26 +12,38 @@ use anyhow::Context;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Shared PAC content that the HTTP server thread reads on every request.
 pub type PacContent = Arc<Mutex<String>>;
 
-/// Handle for the background PAC HTTP server.  Dropping this struct does **not**
-/// stop the server thread (the thread holds its own Arc clone), but the OS will
-/// reclaim everything on process exit.
+/// Handle for the background PAC HTTP server.  Dropping this struct sends a
+/// stop signal to the server thread and waits for it to finish.
 pub struct PacServer {
     /// Live PAC content – write here to update what the server serves.
     pub content: PacContent,
-    // Keep the JoinHandle so the thread is at least not orphaned silently.
-    _thread: std::thread::JoinHandle<()>,
+    /// Stop signal shared with the server thread.
+    stopped: Arc<AtomicBool>,
+    /// Server thread handle — joined on drop.
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for PacServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PacServer").finish_non_exhaustive()
+    }
+}
+
+impl Drop for PacServer {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -51,38 +63,55 @@ impl PacServer {
 pub fn start(listen_addr: &str, initial_content: String) -> anyhow::Result<PacServer> {
     let listener =
         TcpListener::bind(listen_addr).with_context(|| format!("PAC server: bind {listen_addr}"))?;
+    listener
+        .set_nonblocking(true)
+        .context("PAC server: set non-blocking")?;
 
     let content: PacContent = Arc::new(Mutex::new(initial_content));
     let content_thread = Arc::clone(&content);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stopped_thread = Arc::clone(&stopped);
 
     let thread = std::thread::Builder::new()
         .name("pac-server".into())
         .spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let pac = content_thread
-                    .lock()
-                    .map(|c| c.clone())
-                    .unwrap_or_default();
-                // Minimal HTTP/1.0 response – no keep-alive needed.
-                let response = format!(
-                    "HTTP/1.0 200 OK\r\n\
-                     Content-Type: application/x-ns-proxy-autoconfig\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\
-                     \r\n\
-                     {}",
-                    pac.len(),
-                    pac
-                );
-                let _ = stream.write_all(response.as_bytes());
+            loop {
+                if stopped_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let pac = content_thread
+                            .lock()
+                            .map(|c| c.clone())
+                            .unwrap_or_default();
+                        // Minimal HTTP/1.0 response – no keep-alive needed.
+                        let response = format!(
+                            "HTTP/1.0 200 OK\r\n\
+                             Content-Type: application/x-ns-proxy-autoconfig\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            pac.len(),
+                            pac
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    Err(_) => break,
+                }
             }
         })
         .context("failed to spawn pac-server thread")?;
 
     Ok(PacServer {
         content,
-        _thread: thread,
+        stopped,
+        thread: Some(thread),
     })
 }
 

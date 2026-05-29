@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use juicity_common::consts;
@@ -286,7 +287,12 @@ async fn handle_socks5(mut stream: TcpStream, local_addr: SocketAddr, client: Ju
             // Keep the TCP control connection alive until the client disconnects.
             // When the client disconnects, send cancellation signal to clean up sessions.
             let mut dummy = [0u8; 1];
-            let _ = stream.read(&mut dummy).await;
+            tokio::time::timeout(
+                consts::DEFAULT_NAT_TIMEOUT * 2,
+                stream.read(&mut dummy),
+            )
+            .await
+            .ok();
             let _ = cancel_tx.send(());
         }
         _ => {
@@ -542,7 +548,12 @@ async fn handle_http_proxy(mut stream: TcpStream, client: JuicityClient) -> anyh
 
             loop {
                 let mut line = String::new();
-                buf_reader.read_line(&mut line).await?;
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    buf_reader.read_line(&mut line),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("HTTP header read timeout"))??;
                 if line.trim().is_empty() {
                     break;
                 }

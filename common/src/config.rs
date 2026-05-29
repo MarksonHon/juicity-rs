@@ -64,9 +64,31 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Read config from a JSON file
+    /// Read config from a JSON file.
+    ///
+    /// # ⚠ Blocking I/O
+    ///
+    /// This function performs **synchronous blocking file I/O** via
+    /// [`std::fs::read_to_string`]. If called from an async context (e.g. within a
+    /// `#[tokio::main]` runtime), it will block the current Tokio worker thread,
+    /// potentially starving other tasks.
+    ///
+    /// Use [`from_file_async`](Self::from_file_async) instead when inside an async
+    /// context. If you must use this function in async code, wrap it with
+    /// [`tokio::task::spawn_blocking`].
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
+        let config: Config = serde_json::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Read config from a JSON file asynchronously.
+    ///
+    /// This is the async counterpart of [`from_file`](Self::from_file), using
+    /// [`tokio::fs::read_to_string`] under the hood so it does **not** block the
+    /// Tokio worker thread.
+    pub async fn from_file_async(path: &str) -> anyhow::Result<Self> {
+        let content = tokio::fs::read_to_string(path).await?;
         let config: Config = serde_json::from_str(&content)?;
         Ok(config)
     }

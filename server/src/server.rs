@@ -14,11 +14,21 @@ impl Drop for AbortOnDrop {
         self.0.abort();
     }
 }
+/// RAII guard: cancels the CancellationToken when this guard is dropped.
+/// Ensures spawned sub-tasks are signalled to stop when the parent exits,
+/// preventing orphaned tasks that hold Arc references (sockets, streams, etc.).
+struct CancelOnDrop(CancellationToken);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 use juicity_common::crypto::juicity_underlay;
 use juicity_common::crypto::UnderlayCipher;
 use juicity_common::protocol;
 use juicity_common::Config;
 use quinn::{Endpoint, EndpointConfig, RecvStream, SendStream, VarInt};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const APP_ERROR_GENERIC_PROTOCOL: u32 = 0xfffffff0;
@@ -382,10 +392,6 @@ async fn handle_non_quic_underlay_packet(
             relay_abort: None,
         };
 
-        {
-            let mut guard = sessions.lock().unwrap();
-            guard.insert(source, session.clone());
-        }
         tracing::debug!("new underlay session {} -> {}", source, session.target);
         (session, pt_len)
     };
@@ -401,13 +407,39 @@ async fn handle_non_quic_underlay_packet(
         .await?;
 
     // Convert both sockets BEFORE any spawn so that a conversion failure
-    // (e.g. kernel fd exhaustion) cannot produce an orphaned relay-back task.
+    // (e.g. kernel fd exhaustion) cannot produce an orphaned relay-back task
+    // or leave a stale session entry with relay_abort=None.
     let recv_socket_for_relay = if is_new {
-        Some(tokio::net::UdpSocket::from_std(udp_socket.try_clone()?)?)
+        match tokio::net::UdpSocket::from_std(udp_socket.try_clone()?) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                // get_or_create inserted a fresh pool entry; remove it
+                // to prevent leaking the UDP endpoint.
+                udp_pool.remove(&source).await;
+                return Err(e.into());
+            }
+        }
     } else {
         None
     };
-    let send_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
+    let send_socket = match tokio::net::UdpSocket::from_std(udp_socket) {
+        Ok(s) => s,
+        Err(e) => {
+            // If a fresh pool entry was created, remove it to prevent
+            // leaking the UDP endpoint.
+            if is_new {
+                udp_pool.remove(&source).await;
+            }
+            return Err(e.into());
+        }
+    };
+
+    // All fallible operations succeeded; now insert the session so the
+    // entry is never left dangling with relay_abort=None.
+    {
+        let mut guard = sessions.lock().unwrap();
+        guard.insert(source, session.clone());
+    }
 
     if let Some(recv_socket) = recv_socket_for_relay {
         let relay_back = server_socket.clone();
@@ -726,42 +758,55 @@ async fn handle_udp_relay(
     recv_stream.read_exact(&mut data).await?;
     remote.send_to(&data, first_target_addr).await?;
 
+    // CancellationToken + guard: when handle_udp_relay exits (normally or via
+    // task cancellation), the guard cancels the token, signalling spawned
+    // sub-tasks to exit promptly instead of becoming orphans that hold
+    // Arc<UdpSocket>, QUIC streams and other resources indefinitely.
+    let cancel = CancellationToken::new();
+    let _cancel_guard = CancelOnDrop(cancel.clone());
+
     // Bidirectional relay
     let mut quic_to_remote = {
         let remote = remote.clone();
         let mut domain_ip_map = domain_ip_map;
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             // Reuse a single buffer across all datagrams to avoid per-packet allocation.
             let mut payload = Vec::with_capacity(consts::ETHERNET_MTU);
             loop {
-                // Each subsequent datagram: [trojanc_addr][len(2)][payload]
-                let (t_addr, t_port) =
-                    match protocol::read_trojanc_addr_async(&mut recv_stream).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = async {
+                        // Each subsequent datagram: [trojanc_addr][len(2)][payload]
+                        let (t_addr, t_port) =
+                            match protocol::read_trojanc_addr_async(&mut recv_stream).await {
+                                Ok(v) => v,
+                                Err(_) => return,
+                            };
 
-                let mut len_bytes = [0u8; 2];
-                if recv_stream.read_exact(&mut len_bytes).await.is_err() {
-                    break;
-                }
-                let pkt_len = u16::from_be_bytes(len_bytes) as usize;
-                payload.resize(pkt_len, 0);
-                if recv_stream.read_exact(&mut payload).await.is_err() {
-                    break;
-                }
-
-                let target =
-                    match resolve_udp_target(&t_addr, t_port, &mut domain_ip_map).await {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            tracing::debug!("UDP target resolve error: {:?}", e);
-                            break;
+                        let mut len_bytes = [0u8; 2];
+                        if recv_stream.read_exact(&mut len_bytes).await.is_err() {
+                            return;
                         }
-                    };
-                if let Err(e) = remote.send_to(&payload, target).await {
-                    tracing::debug!("UDP relay write error: {:?}", e);
-                    break;
+                        let pkt_len = u16::from_be_bytes(len_bytes) as usize;
+                        payload.resize(pkt_len, 0);
+                        if recv_stream.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+
+                        let target =
+                            match resolve_udp_target(&t_addr, t_port, &mut domain_ip_map).await {
+                                Ok(addr) => addr,
+                                Err(e) => {
+                                    tracing::debug!("UDP target resolve error: {:?}", e);
+                                    return;
+                                }
+                            };
+                        if let Err(e) = remote.send_to(&payload, target).await {
+                            tracing::debug!("UDP relay write error: {:?}", e);
+                        }
+                    } => {}
                 }
             }
         })
@@ -769,32 +814,39 @@ async fn handle_udp_relay(
 
     let mut remote_to_quic = {
         let remote = remote.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; consts::ETHERNET_MTU];
             // Pre-allocate frame buffer for reuse across all response datagrams.
             // Max: trojanc_addr header (up to ~261 bytes) + 2-byte length + payload.
             let mut frame = Vec::with_capacity(264 + consts::ETHERNET_MTU);
             loop {
-                match remote.recv_from(&mut buf).await {
-                    Ok((n, addr)) => {
-                        // Response: [trojanc_addr][len(2)][payload] (no network byte)
-                        let addr_str = addr.ip().to_string();
-                        let addr_port = addr.port();
-                        let hdr = match protocol::build_trojanc_addr(&addr_str, addr_port) {
-                            Ok(h) => h,
-                            Err(_) => break,
-                        };
-                        // Reuse frame buffer: clear then fill to avoid per-packet allocation.
-                        let pkt_len = (n as u16).to_be_bytes();
-                        frame.clear();
-                        frame.extend_from_slice(&hdr);
-                        frame.extend_from_slice(&pkt_len);
-                        frame.extend_from_slice(&buf[..n]);
-                        if send_stream.write_all(&frame).await.is_err() {
-                            break;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = async {
+                        match remote.recv_from(&mut buf).await {
+                            Ok((n, addr)) => {
+                                // Response: [trojanc_addr][len(2)][payload] (no network byte)
+                                let addr_str = addr.ip().to_string();
+                                let addr_port = addr.port();
+                                let hdr = match protocol::build_trojanc_addr(&addr_str, addr_port) {
+                                    Ok(h) => h,
+                                    Err(_) => return,
+                                };
+                                // Reuse frame buffer: clear then fill to avoid per-packet allocation.
+                                let pkt_len = (n as u16).to_be_bytes();
+                                frame.clear();
+                                frame.extend_from_slice(&hdr);
+                                frame.extend_from_slice(&pkt_len);
+                                frame.extend_from_slice(&buf[..n]);
+                                if send_stream.write_all(&frame).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Err(_) => return,
                         }
-                    }
-                    Err(_) => break,
+                    } => {}
                 }
             }
         })

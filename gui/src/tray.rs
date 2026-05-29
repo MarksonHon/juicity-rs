@@ -1,7 +1,9 @@
 use crate::config::{PacRuleMode, SystemProxyMode};
 use rust_i18n::t;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Events sent from the tray menu to the GTK main loop.
 #[derive(Debug, Clone, Copy)]
@@ -32,18 +34,36 @@ pub struct TraySharedState {
 
 #[derive(Debug)]
 pub struct TrayService {
-    /// Linux: keeps background ksni thread alive.
+    /// Linux: background ksni thread handle.
     #[cfg(target_os = "linux")]
-    _join: Option<std::thread::JoinHandle<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    /// Linux: stop signal for the background thread.
+    #[cfg(target_os = "linux")]
+    stopped: Arc<AtomicBool>,
     /// Windows/macOS: keeps TrayIcon alive on the main thread.
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     _tray: Option<Box<dyn std::any::Any>>,
+}
+
+impl Drop for TrayService {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.stopped.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.join.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 /// Start the system tray in a background thread.
 pub fn start(event_tx: Sender<TrayEvent>, shared: Arc<Mutex<TraySharedState>>) -> TrayService {
     #[cfg(target_os = "linux")]
     {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_thread = Arc::clone(&stopped);
+
         let join = std::thread::spawn(move || {
             use ksni::TrayMethods;
 
@@ -61,12 +81,20 @@ pub fn start(event_tx: Sender<TrayEvent>, shared: Arc<Mutex<TraySharedState>>) -
             rt.block_on(async move {
                 let tray = LinuxTray { event_tx, shared };
                 match tray.spawn().await {
-                    Ok(_handle) => std::future::pending::<()>().await,
+                    Ok(_handle) => {
+                        // Periodically check the stop flag instead of pending forever.
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            if stopped_thread.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
+                    }
                     Err(err) => tracing::warn!("tray spawn failed: {err}"),
                 }
             });
         });
-        return TrayService { _join: Some(join) };
+        return TrayService { join: Some(join), stopped };
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
