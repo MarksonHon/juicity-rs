@@ -42,6 +42,23 @@ struct InFlightInner {
 }
 
 impl InFlightInner {
+    fn compact_order_if_needed(&mut self) {
+        // order may contain stale duplicates due to replace/remove operations.
+        // Compact when it grows significantly larger than the live entry set.
+        let live = self.entries.len();
+        if self.order.len() <= live.saturating_mul(4).max(64) {
+            return;
+        }
+
+        let mut seen = HashSet::with_capacity(live);
+        self.order.retain(|k| {
+            if !self.entries.contains_key(k) {
+                return false;
+            }
+            seen.insert(*k)
+        });
+    }
+
     fn remove_key(&mut self, key: &InFlightKey) -> Option<InFlightEntry> {
         let entry = self.entries.remove(key)?;
         if let Some(keys) = self.owners.get_mut(&entry.owner) {
@@ -129,6 +146,7 @@ impl InFlightUnderlayKey {
         );
         inner.owners.entry(owner).or_default().insert(key);
         inner.order.push_back(key);
+        inner.compact_order_if_needed();
         // Notify any waiting evict() call that a new key is available
         self.notify.notify_waiters();
     }
@@ -175,11 +193,12 @@ impl InFlightUnderlayKey {
     /// Remove all in-flight auth entries associated with one connection owner.
     pub fn remove_owner(&self, owner: u64) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(keys) = inner.owners.remove(&owner) {
+        if let Some(keys) = inner.owners.get(&owner).cloned() {
             for key in keys {
-                inner.entries.remove(&key);
+                inner.remove_key(&key);
             }
         }
+        inner.compact_order_if_needed();
     }
 
     /// Clean up expired keys.
@@ -201,5 +220,6 @@ impl InFlightUnderlayKey {
         for k in expired_keys {
             inner.remove_key(&k);
         }
+        inner.compact_order_if_needed();
     }
 }

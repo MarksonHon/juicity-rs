@@ -546,38 +546,44 @@ async fn handle_connection(
     // resources promptly instead of waiting for remote-side idle timeouts.
     let mut stream_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        // Drain completed tasks each iteration to free their resources without blocking.
-        while stream_tasks.try_join_next().is_some() {}
+        tokio::select! {
+            incoming = connection.accept_bi() => {
+                match incoming {
+                    Ok((send_stream, recv_stream)) => {
+                        let s_dialer = dialer.clone();
+                        let s_user_uuid = user_uuid;
+                        let s_disable_443 = disable_udp_443;
+                        let s_connection = connection.clone();
 
-        match connection.accept_bi().await {
-            Ok((send_stream, recv_stream)) => {
-                let s_dialer = dialer.clone();
-                let s_user_uuid = user_uuid;
-                let s_disable_443 = disable_udp_443;
-                let s_connection = connection.clone();
-
-                stream_tasks.spawn(async move {
-                    if let Err(e) = handle_stream(
-                        send_stream,
-                        recv_stream,
-                        s_dialer,
-                        s_user_uuid,
-                        s_disable_443,
-                    )
-                    .await
-                    {
-                        tracing::debug!("Stream rejected: {}", e);
-                        s_connection.close(VarInt::from_u32(APP_ERROR_GENERIC_PROTOCOL), b"");
+                        stream_tasks.spawn(async move {
+                            if let Err(e) = handle_stream(
+                                send_stream,
+                                recv_stream,
+                                s_dialer,
+                                s_user_uuid,
+                                s_disable_443,
+                            )
+                            .await
+                            {
+                                tracing::debug!("Stream rejected: {}", e);
+                                s_connection.close(VarInt::from_u32(APP_ERROR_GENERIC_PROTOCOL), b"");
+                            }
+                        });
                     }
-                });
+                    Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                        tracing::debug!("Connection closed by peer: {}", remote_addr);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Accept stream error: {:?}", e);
+                        break;
+                    }
+                }
             }
-            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                tracing::debug!("Connection closed by peer: {}", remote_addr);
-                break;
-            }
-            Err(e) => {
-                tracing::debug!("Accept stream error: {:?}", e);
-                break;
+            task = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                if let Some(Err(e)) = task {
+                    tracing::debug!("Stream task join error: {:?}", e);
+                }
             }
         }
     }
