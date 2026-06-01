@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use juicity_common::consts;
 use tokio::sync::Mutex;
 
 /// Options for creating a UDP endpoint
@@ -92,6 +93,18 @@ impl UdpEndpointPool {
                 // immediately, preventing port exhaustion under high concurrency.
                 drop(endpoint);
                 return Ok(((socket, dial_target), false));
+            }
+        }
+
+        // Keep the pool bounded under high source-address cardinality.
+        // Evict the least recently used endpoint before inserting a new one.
+        if inner.len() >= consts::MAX_UDP_ENDPOINTS {
+            if let Some(oldest_addr) = inner
+                .iter()
+                .min_by_key(|(_, endpoint)| endpoint.created_at)
+                .map(|(addr, _)| *addr)
+            {
+                inner.remove(&oldest_addr);
             }
         }
         let dial_target = endpoint.dial_target.clone();

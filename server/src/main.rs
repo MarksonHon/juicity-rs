@@ -4,6 +4,9 @@ use juicity_common::link;
 use juicity_common::BuildInfo;
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "juicity-server",

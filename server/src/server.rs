@@ -78,6 +78,13 @@ impl JuicityServer {
             consts::MAX_OPEN_INCOMING_STREAMS as u32,
         ));
         transport_config.keep_alive_interval(Some(consts::KEEP_ALIVE_PERIOD));
+        transport_config.stream_receive_window(VarInt::from_u32(
+            consts::QUIC_STREAM_RECEIVE_WINDOW,
+        ));
+        transport_config.receive_window(VarInt::from_u32(
+            consts::QUIC_CONNECTION_RECEIVE_WINDOW,
+        ));
+        transport_config.send_window(consts::QUIC_SEND_WINDOW);
         // Enable BBR congestion control (compatible with Go version)
         transport_config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         server_config.transport_config(Arc::new(transport_config));
@@ -260,15 +267,13 @@ async fn run_underlay_packet_loop(
     // accumulation under high traffic. Each handler may wait up to 100ms in
     // evict() for in-flight underlay auth, and without a cap, thousands of
     // tasks could pile up during a burst, consuming significant memory.
-    // The limit is set to 2x the channel capacity so the channel backpressure
-    // (drop at 1024 queued) and the semaphore work together as a two-layer throttle.
+    // Use a fixed cap to keep memory predictable under burst traffic.
     let concurrency_limit = Arc::new(tokio::sync::Semaphore::new(
-        crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY * 2,
+        consts::MAX_UNDERLAY_HANDLER_CONCURRENCY,
     ));
 
     while let Some(packet) = rx.recv().await {
-        // Acquire a permit before spawning. If all permits are taken (i.e. there
-        // are already 2048 in-flight handler tasks), this await will back-pressure
+        // Acquire a permit before spawning. If all permits are taken, this await will back-pressure
         // the channel receiver, causing the DemuxUdpSocket's try_send to fail and
         // drop excess packets — a controlled degradation instead of unbounded growth.
         let permit = concurrency_limit.clone().acquire_owned().await;
@@ -378,9 +383,27 @@ async fn handle_non_quic_underlay_packet(
             relay_abort: None,
         };
 
+        let mut evicted_session: Option<(SocketAddr, Option<tokio::task::AbortHandle>)> = None;
         {
             let mut guard = sessions.lock().unwrap();
+            if guard.len() >= consts::MAX_UNDERLAY_SESSIONS {
+                if let Some(oldest_addr) = guard
+                    .iter()
+                    .min_by_key(|(_, s)| s.last_used)
+                    .map(|(addr, _)| *addr)
+                {
+                    if let Some(old) = guard.remove(&oldest_addr) {
+                        evicted_session = Some((oldest_addr, old.relay_abort));
+                    }
+                }
+            }
             guard.insert(source, session.clone());
+        }
+        if let Some((oldest_addr, relay_abort)) = evicted_session {
+            if let Some(h) = relay_abort {
+                h.abort()
+            }
+            udp_pool.remove(&oldest_addr).await;
         }
         tracing::debug!("new underlay session {} -> {}", source, session.target);
         (session, pt_len)
@@ -390,7 +413,7 @@ async fn handle_non_quic_underlay_packet(
         .get_or_create(
             source,
             crate::udp::UdpEndpointOptions {
-                nat_timeout: Duration::from_secs(180),
+                nat_timeout: consts::DEFAULT_NAT_TIMEOUT,
                 dial_target: session.target.clone(),
             },
         )

@@ -25,3 +25,4 @@ hex.workspace = true
 rand.workspace = true
 socket2.workspace = true
 async-trait.workspace = true
+mimalloc = "0.1"

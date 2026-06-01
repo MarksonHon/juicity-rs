@@ -19,6 +19,16 @@ pub const MAX_OPEN_INCOMING_STREAMS: u64 = 100;
 /// Keep-alive period for QUIC
 pub const KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
 
+/// QUIC per-stream receive window (bytes).
+/// Lowering this bounds worst-case memory per stream in high-throughput scenarios.
+pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = 512 * 1024;
+/// QUIC per-connection receive window (bytes).
+/// Must be >= stream window; limits aggregate receive buffering per connection.
+pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+/// QUIC send window (bytes).
+/// Caps unacknowledged outbound data retained in memory per connection.
+pub const QUIC_SEND_WINDOW: u64 = 8 * 1024 * 1024;
+
 /// Default NAT timeout in seconds (Go-compatible: 3 minutes)
 pub const DEFAULT_NAT_TIMEOUT_SECS: u64 = 180;
 /// DNS query timeout in seconds (Go-compatible: 17 seconds, RFC 5452)
@@ -42,3 +52,15 @@ pub const MAX_CONCURRENT_TCP_CONNECTIONS: usize = 256;
 /// Guards against a burst of forged/unanswered underlay auth packets filling memory
 /// during the 5-second cleanup window.
 pub const MAX_IN_FLIGHT_UNDERLAY_ENTRIES: usize = 10_000;
+
+/// Soft capacity for the UDP endpoint pool.
+/// When reached, the least-recently-used endpoint is evicted.
+pub const MAX_UDP_ENDPOINTS: usize = 5_000;
+
+/// Soft capacity for non-QUIC underlay sessions.
+/// When reached, the least-recently-used session is evicted.
+pub const MAX_UNDERLAY_SESSIONS: usize = 5_000;
+
+/// Maximum concurrent non-QUIC underlay handler tasks.
+/// Bounds memory used by in-flight packet handler futures during bursts.
+pub const MAX_UNDERLAY_HANDLER_CONCURRENCY: usize = 1_024;
