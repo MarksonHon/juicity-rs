@@ -71,8 +71,9 @@ impl InFlightUnderlayKey {
             }
         }
         inner.entries.insert(key, InFlightEntry { auth, inserted_at: Instant::now() });
-        // Notify any waiting evict() call that a new key is available
-        self.notify.notify_waiters();
+        // notify_one() wakes exactly one waiter, preventing the thundering-herd
+        // problem that notify_waiters() would cause under concurrent evict() callers.
+        self.notify.notify_one();
     }
 
     /// Evict and retrieve an authentication using Notify for zero-latency wakeup.
@@ -88,8 +89,9 @@ impl InFlightUnderlayKey {
 
         // If not found yet, wait for notification with a short timeout
         // to handle the case where the key never arrives.
-        // We use a loop to re-check after notification, since notify_waiters()
-        // wakes ALL waiters and our key might not be the one that arrived.
+        // We use a loop to re-check after notification, since notify_one()
+        // may wake a waiter whose key has not yet arrived (another waiter
+        // may have already consumed the newly inserted key before us).
         let deadline = Instant::now() + Duration::from_millis(100);
         loop {
             let wait = self.notify.notified();

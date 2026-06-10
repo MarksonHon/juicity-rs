@@ -13,11 +13,13 @@ pub struct JuicityClient {
     endpoint: Arc<Endpoint>,
     server_addr: SocketAddr,
     uuid: Uuid,
-    password: String,
+    password: zeroize::Zeroizing<String>,
     sni: String,
     quic_config: Arc<ClientConfig>,
     conn: Arc<tokio::sync::RwLock<Option<Connection>>>,
     auth_uni_stream: Arc<tokio::sync::Mutex<Option<SendStream>>>,
+    /// Serialises reconnection: only one task may execute the slow reconnect path at a time.
+    reconnect_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl JuicityClient {
@@ -66,7 +68,11 @@ impl JuicityClient {
         allow_insecure: bool,
         pinned_hash: &[u8],
         provider: &rustls::crypto::CryptoProvider,
+        congestion_control: &str,
     ) -> anyhow::Result<ClientConfig> {
+        if allow_insecure {
+            tracing::warn!("TLS certificate verification is DISABLED (allow_insecure=true). This is insecure and should only be used for testing.");
+        }
         let tls_config = Self::build_tls_config(allow_insecure, pinned_hash, provider)?;
 
         let mut quic_config = ClientConfig::new(Arc::new(
@@ -75,6 +81,17 @@ impl JuicityClient {
 
         let mut transport_config = quinn::TransportConfig::default();
         transport_config.keep_alive_interval(Some(consts::KEEP_ALIVE_PERIOD));
+        match congestion_control.to_lowercase().as_str() {
+            "cubic" => transport_config.congestion_controller_factory(
+                Arc::new(quinn::congestion::CubicConfig::default()),
+            ),
+            "newreno" | "new_reno" => transport_config.congestion_controller_factory(
+                Arc::new(quinn::congestion::NewRenoConfig::default()),
+            ),
+            _ => transport_config.congestion_controller_factory(
+                Arc::new(quinn::congestion::BbrConfig::default()),
+            ),
+        };
         quic_config.transport_config(Arc::new(transport_config));
 
         Ok(quic_config)
@@ -125,9 +142,10 @@ impl JuicityClient {
         // Run it in spawn_blocking to avoid blocking the async runtime.
         let allow_insecure = config.allow_insecure;
         let pinned_hash_for_config = pinned_hash.clone();
+        let cc = config.congestion_control.clone();
         let quic_config = tokio::task::spawn_blocking(move || {
             let provider = rustls::crypto::aws_lc_rs::default_provider();
-            Self::build_quic_config(allow_insecure, &pinned_hash_for_config, &provider)
+            Self::build_quic_config(allow_insecure, &pinned_hash_for_config, &provider, &cc)
         })
         .await??;
         let quic_config = Arc::new(quic_config);
@@ -136,11 +154,12 @@ impl JuicityClient {
             endpoint,
             server_addr,
             uuid,
-            password: config.password.clone(),
+            password: zeroize::Zeroizing::new(config.password.clone()),
             sni,
             quic_config,
             conn: Arc::new(tokio::sync::RwLock::new(None)),
             auth_uni_stream: Arc::new(tokio::sync::Mutex::new(None)),
+            reconnect_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -157,16 +176,24 @@ impl JuicityClient {
             }
         }
 
-        // Slow path: write lock for reconnection.
-        // Re-check after acquiring the write lock to avoid duplicate reconnections
-        // when multiple tasks race to this point simultaneously.
+        // Slow path: serialize reconnection so only one task reconnects at a time.
+        // Without this lock, multiple tasks that all fail the fast-path check would
+        // all race to reconnect simultaneously, leaking connections and corrupting
+        // auth_uni_stream state.
+        let _reconnect_guard = self.reconnect_lock.lock().await;
+
+        // Double-check: another task may have already reconnected while we waited.
         {
-            let mut guard = self.conn.write().await;
+            let guard = self.conn.read().await;
             if let Some(conn) = guard.as_ref() {
                 if conn.close_reason().is_none() {
                     return Ok(conn.clone());
                 }
             }
+        }
+
+        {
+            let mut guard = self.conn.write().await;
             *guard = None;
         }
         {
@@ -191,7 +218,7 @@ impl JuicityClient {
         // avoid occupying the async event loop on every connection attempt.
         let conn_for_token = quinn_conn.clone();
         let uuid_for_token = self.uuid;
-        let password_for_token = self.password.clone();
+        let password_for_token = (*self.password).clone();
         let token = tokio::task::spawn_blocking(move || {
             protocol::gen_token_via_connection(&conn_for_token, &uuid_for_token, &password_for_token)
         })

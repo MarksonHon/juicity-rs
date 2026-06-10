@@ -29,13 +29,6 @@ pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 /// Caps unacknowledged outbound data retained in memory per connection.
 pub const QUIC_SEND_WINDOW: u64 = 8 * 1024 * 1024;
 
-/// Default NAT timeout in seconds (Go-compatible: 3 minutes)
-pub const DEFAULT_NAT_TIMEOUT_SECS: u64 = 180;
-/// DNS query timeout in seconds (Go-compatible: 17 seconds, RFC 5452)
-pub const DNS_QUERY_TIMEOUT_SECS: u64 = 17;
-/// Ethernet MTU (Go-compatible)
-pub const ETHERNET_MTU_VAL: usize = 1500;
-
 /// JUICIY protocol version 0
 pub const JUICIY_VERSION_0: u8 = 0;
 /// Underlay salt length

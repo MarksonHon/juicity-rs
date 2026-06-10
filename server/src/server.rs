@@ -85,8 +85,17 @@ impl JuicityServer {
             consts::QUIC_CONNECTION_RECEIVE_WINDOW,
         ));
         transport_config.send_window(consts::QUIC_SEND_WINDOW);
-        // Enable BBR congestion control (compatible with Go version)
-        transport_config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        match config.congestion_control.to_lowercase().as_str() {
+            "cubic" => transport_config.congestion_controller_factory(
+                Arc::new(quinn::congestion::CubicConfig::default()),
+            ),
+            "newreno" | "new_reno" => transport_config.congestion_controller_factory(
+                Arc::new(quinn::congestion::NewRenoConfig::default()),
+            ),
+            _ => transport_config.congestion_controller_factory(
+                Arc::new(quinn::congestion::BbrConfig::default()),
+            ),
+        };
         server_config.transport_config(Arc::new(transport_config));
 
         let dialer: Arc<dyn crate::dialer::Dialer> = if !config.send_through.is_empty() {
@@ -248,16 +257,26 @@ async fn run_underlay_packet_loop(
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
                 interval.tick().await;
-                sessions_cleanup.lock().unwrap().retain(|_, s| {
-                    if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
-                        if let Some(h) = &s.relay_abort {
-                            h.abort();
+                // Collect abort handles while holding the lock, then abort them
+                // after releasing it, so abort() is not called under the mutex.
+                let to_abort: Vec<tokio::task::AbortHandle> = {
+                    let mut guard = sessions_cleanup.lock().unwrap();
+                    let mut handles = Vec::new();
+                    guard.retain(|_, s| {
+                        if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
+                            if let Some(h) = s.relay_abort.take() {
+                                handles.push(h);
+                            }
+                            false
+                        } else {
+                            true
                         }
-                        false
-                    } else {
-                        true
-                    }
-                });
+                    });
+                    handles
+                };
+                for h in to_abort {
+                    h.abort();
+                }
             }
         })
         .abort_handle(),

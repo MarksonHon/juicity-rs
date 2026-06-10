@@ -43,3 +43,4 @@ tokio-util = { version = "0.7" }
 qrcode = "0.14"
 image = "0.25"
 url = "2"
+zeroize = "1"

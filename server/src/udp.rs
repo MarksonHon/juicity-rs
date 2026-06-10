@@ -15,7 +15,7 @@ pub struct UdpEndpointOptions {
 pub struct UdpEndpoint {
     pub socket: std::net::UdpSocket,
     pub dial_target: String,
-    created_at: Instant,
+    last_used: Instant,
     nat_timeout: Duration,
 }
 
@@ -30,17 +30,17 @@ impl UdpEndpoint {
         Ok(Self {
             socket,
             dial_target: options.dial_target,
-            created_at: Instant::now(),
+            last_used: Instant::now(),
             nat_timeout: options.nat_timeout,
         })
     }
 
     pub fn is_expired(&self) -> bool {
-        Instant::now().duration_since(self.created_at) > self.nat_timeout
+        Instant::now().duration_since(self.last_used) > self.nat_timeout
     }
 
     pub fn touch(&mut self) {
-        self.created_at = Instant::now();
+        self.last_used = Instant::now();
     }
 }
 
@@ -101,7 +101,7 @@ impl UdpEndpointPool {
         if inner.len() >= consts::MAX_UDP_ENDPOINTS {
             if let Some(oldest_addr) = inner
                 .iter()
-                .min_by_key(|(_, endpoint)| endpoint.created_at)
+                .min_by_key(|(_, endpoint)| endpoint.last_used)
                 .map(|(addr, _)| *addr)
             {
                 inner.remove(&oldest_addr);
@@ -124,13 +124,5 @@ impl UdpEndpointPool {
     pub async fn cleanup_async(&self) {
         let mut inner = self.inner.lock().await;
         inner.retain(|_, endpoint| !endpoint.is_expired());
-    }
-
-    /// Sync cleanup with try_lock (kept for backward compatibility).
-    /// Prefer cleanup_async() in async contexts.
-    pub fn cleanup(&self) {
-        if let Ok(mut inner) = self.inner.try_lock() {
-            inner.retain(|_, endpoint| !endpoint.is_expired());
-        }
     }
 }
