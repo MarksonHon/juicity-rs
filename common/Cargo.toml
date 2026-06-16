@@ -27,3 +27,5 @@ quinn.workspace = true
 qrcode.workspace = true
 image.workspace = true
 url.workspace = true
+rustls-pemfile.workspace = true
+x509-parser = "0.16"

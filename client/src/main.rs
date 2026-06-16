@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::from_file(&config)?;
 
             if do_link || qrcode || qrcode_png.is_some() {
-                let share_link = link::generate_share_link(&config)
+                let share_link = link::generate_share_link(&config, None, None)
                     .map_err(|e| anyhow::anyhow!("Failed to generate share link: {}", e))?;
 
                 if do_link {

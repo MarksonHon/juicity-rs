@@ -178,17 +178,7 @@ fn build_shadowsocks_command(config: &AppConfig, profile: &ProxyProfile) -> anyh
     let (config_path, temp) = if let Some(path) = &profile.config_path {
         (path.clone(), None)
     } else {
-        let local_port: u16 = config
-            .socks_listen
-            .rsplitn(2, ':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(1080);
-        let local_addr = config
-            .socks_listen
-            .rsplitn(2, ':')
-            .nth(1)
-            .unwrap_or("127.0.0.1");
+        let (local_addr, local_port) = crate::util::split_host_port(&config.socks_listen);
 
         let mut json = serde_json::json!({
             "server": profile.server,

@@ -36,24 +36,43 @@ pub fn apply_system_proxy(config: &AppConfig) -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn apply_linux(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_listen: &str) -> anyhow::Result<()> {
-    let mut gnome_ok = false;
-    let mut kde_ok = false;
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let desktop_lower = desktop.to_lowercase();
 
-    match apply_linux_gnome(mode, pac_url, http_listen, socks_listen) {
-        Ok(ok) => gnome_ok = ok,
-        Err(err) => tracing::warn!("GNOME proxy apply failed: {err}"),
-    }
-
-    // Per requirement: on KDE we still try to append GNOME settings as much as possible.
-    match apply_linux_kde(mode, pac_url, http_listen, socks_listen) {
-        Ok(ok) => kde_ok = ok,
-        Err(err) => tracing::warn!("KDE proxy apply failed: {err}"),
-    }
-
-    if gnome_ok || kde_ok {
-        Ok(())
+    if desktop_lower.contains("gnome") {
+        // Detected GNOME desktop environment; only apply GNOME settings.
+        match apply_linux_gnome(mode, pac_url, http_listen, socks_listen) {
+            Ok(true) => Ok(()),
+            Ok(false) => bail!("GNOME proxy apply failed (gsettings not found)"),
+            Err(err) => bail!("GNOME proxy apply failed: {err}"),
+        }
+    } else if desktop_lower.contains("kde") {
+        // Detected KDE desktop environment; only apply KDE settings.
+        match apply_linux_kde(mode, pac_url, http_listen, socks_listen) {
+            Ok(true) => Ok(()),
+            Ok(false) => bail!("KDE proxy apply failed (kwriteconfig5 not found)"),
+            Err(err) => bail!("KDE proxy apply failed: {err}"),
+        }
     } else {
-        bail!("no Linux system proxy backend available (need gsettings and/or kwriteconfig5)")
+        // Unknown or unset XDG_CURRENT_DESKTOP; try both backends for backward compatibility.
+        let mut gnome_ok = false;
+        let mut kde_ok = false;
+
+        match apply_linux_gnome(mode, pac_url, http_listen, socks_listen) {
+            Ok(ok) => gnome_ok = ok,
+            Err(err) => tracing::warn!("GNOME proxy apply failed: {err}"),
+        }
+
+        match apply_linux_kde(mode, pac_url, http_listen, socks_listen) {
+            Ok(ok) => kde_ok = ok,
+            Err(err) => tracing::warn!("KDE proxy apply failed: {err}"),
+        }
+
+        if gnome_ok || kde_ok {
+            Ok(())
+        } else {
+            bail!("no Linux system proxy backend available (need gsettings and/or kwriteconfig5)")
+        }
     }
 }
 
@@ -62,26 +81,24 @@ fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, so
     let mut ok = false;
     match mode {
         SystemProxyMode::Disable => {
-            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "'none'"])?;
+            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "none"])?;
         }
         SystemProxyMode::Pac => {
-            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "'auto'"])?;
+            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "auto"])?;
             ok |= run_if_available(
                 "gsettings",
-                &["set", "org.gnome.system.proxy", "autoconfig-url", &format!("'{}'", pac_url)],
+                &["set", "org.gnome.system.proxy", "autoconfig-url", pac_url],
             )?;
         }
         SystemProxyMode::Global => {
-            let (http_host, http_port) = split_host_port(http_listen)
-                .ok_or_else(|| anyhow::anyhow!("invalid http listen address: {}", http_listen))?;
-            let (socks_host, socks_port) = split_host_port(socks_listen)
-                .ok_or_else(|| anyhow::anyhow!("invalid socks listen address: {}", socks_listen))?;
+            let (http_host, http_port) = crate::util::split_host_port(http_listen);
+            let (socks_host, socks_port) = crate::util::split_host_port(socks_listen);
 
-            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "'manual'"])?;
+            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "manual"])?;
             ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "use-same-proxy", "true"])?;
             ok |= run_if_available(
                 "gsettings",
-                &["set", "org.gnome.system.proxy.http", "host", &format!("'{}'", http_host)],
+                &["set", "org.gnome.system.proxy.http", "host", http_host],
             )?;
             ok |= run_if_available(
                 "gsettings",
@@ -89,7 +106,7 @@ fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, so
             )?;
             ok |= run_if_available(
                 "gsettings",
-                &["set", "org.gnome.system.proxy.https", "host", &format!("'{}'", http_host)],
+                &["set", "org.gnome.system.proxy.https", "host", http_host],
             )?;
             ok |= run_if_available(
                 "gsettings",
@@ -97,7 +114,7 @@ fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, so
             )?;
             ok |= run_if_available(
                 "gsettings",
-                &["set", "org.gnome.system.proxy.socks", "host", &format!("'{}'", socks_host)],
+                &["set", "org.gnome.system.proxy.socks", "host", socks_host],
             )?;
             ok |= run_if_available(
                 "gsettings",
@@ -139,10 +156,8 @@ fn apply_linux_kde(mode: SystemProxyMode, pac_url: &str, http_listen: &str, sock
             )?;
         }
         SystemProxyMode::Global => {
-            let (http_host, http_port) = split_host_port(http_listen)
-                .ok_or_else(|| anyhow::anyhow!("invalid http listen address: {}", http_listen))?;
-            let (socks_host, socks_port) = split_host_port(socks_listen)
-                .ok_or_else(|| anyhow::anyhow!("invalid socks listen address: {}", socks_listen))?;
+            let (http_host, http_port) = crate::util::split_host_port(http_listen);
+            let (socks_host, socks_port) = crate::util::split_host_port(socks_listen);
 
             ok |= run_if_available(
                 "kwriteconfig5",
@@ -221,10 +236,8 @@ fn apply_macos(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_li
             }
             SystemProxyMode::Global => {
                 // Only parse host/port in the branch that actually needs them.
-                let (http_host, http_port) = split_host_port(http_listen)
-                    .ok_or_else(|| anyhow::anyhow!("invalid http listen address: {}", http_listen))?;
-                let (socks_host, socks_port) = split_host_port(socks_listen)
-                    .ok_or_else(|| anyhow::anyhow!("invalid socks listen address: {}", socks_listen))?;
+                let (http_host, http_port) = crate::util::split_host_port(http_listen);
+                let (socks_host, socks_port) = crate::util::split_host_port(socks_listen);
 
                 run_required(
                     "networksetup",
@@ -374,21 +387,6 @@ fn apply_windows(mode: SystemProxyMode, pac_url: &str, http_listen: &str, _socks
     }
 
     Ok(())
-}
-
-fn split_host_port(v: &str) -> Option<(String, u16)> {
-    if v.starts_with('[') {
-        let close = v.find(']')?;
-        let host = v[1..close].to_string();
-        let rest = v.get(close + 1..)?;
-        let port = rest.strip_prefix(':')?.parse::<u16>().ok()?;
-        return Some((host, port));
-    }
-
-    let idx = v.rfind(':')?;
-    let host = v[..idx].to_string();
-    let port = v[idx + 1..].parse::<u16>().ok()?;
-    Some((host, port))
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

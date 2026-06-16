@@ -77,6 +77,56 @@ impl GuiState {
     }
 }
 
+/// Holds references to all editor widgets so that `load_fields` / `save_fields`
+/// can be written as plain functions instead of giant closures.
+#[derive(Clone)]
+struct FieldWidgets {
+    protocol_dropdown: gtk::DropDown,
+    server_entry: gtk::Entry,
+    port_entry: gtk::Entry,
+    password_entry: gtk::Entry,
+    uuid_entry: gtk::Entry,
+    sni_entry: gtk::Entry,
+    allow_insecure_check: gtk::CheckButton,
+    method_dropdown: gtk::DropDown,
+    plugin_entry: gtk::Entry,
+    plugin_opts_entry: gtk::Entry,
+    need_plugin_arg: gtk::CheckButton,
+    plugin_args_entry: gtk::Entry,
+    plugin_args_row: gtk::Box,
+    remarks_entry: gtk::Entry,
+    timeout_entry: gtk::Entry,
+    group_entry: gtk::Entry,
+    proxy_port_entry: gtk::Entry,
+    close_to_tray_check: gtk::CheckButton,
+    juicity_box: gtk::Box,
+    ss_box: gtk::Box,
+    status_label: gtk::Label,
+}
+
+/// Restart or update the PAC server with fresh rules from disk.
+///
+/// If `force_restart` is `true` (e.g. the listen address changed), a new
+/// server is started even if one already exists.  Otherwise the existing
+/// server is updated in-place, or a new one is started if none exists.
+fn restart_pac_server(state: &mut GuiState, force_restart: bool) -> anyhow::Result<()> {
+    let (direct, proxy) = pac::load_rules(&state.storage.paths().config_dir);
+    let content = pac::generate_pac(
+        state.config.pac_rule_mode,
+        &state.config.socks_listen,
+        &direct,
+        &proxy,
+    );
+    if force_restart || state.pac_server.is_none() {
+        // Start fresh — needed when the listen address changed or on first launch.
+        state.pac_server = Some(pac::start(&state.config.pac_listen, content)?);
+    } else if let Some(srv) = &state.pac_server {
+        // Update existing server in-place.
+        srv.update(content);
+    }
+    Ok(())
+}
+
 pub fn run() -> anyhow::Result<()> {
     let app = adw::Application::builder()
         .application_id("io.juicity.gui")
@@ -104,16 +154,8 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
     // ── PAC server: start once at launch, keep alive for the app lifetime ─
     {
         let mut s = state.borrow_mut();
-        let (direct, proxy) = pac::load_rules(&s.storage.paths().config_dir);
-        let initial_pac = pac::generate_pac(
-            s.config.pac_rule_mode,
-            &s.config.socks_listen,
-            &direct,
-            &proxy,
-        );
-        match pac::start(&s.config.pac_listen, initial_pac) {
-            Ok(srv) => s.pac_server = Some(srv),
-            Err(err) => tracing::warn!("PAC server failed to start: {err}"),
+        if let Err(err) = restart_pac_server(&mut s, true) {
+            tracing::warn!("PAC server failed to start: {err}");
         }
     }
     // ── Window ────────────────────────────────────────────────────────────
@@ -401,6 +443,290 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
     // ── Suspend flag: blocks list row-selected signal during repopulation ─
     let suspend_list = Rc::new(Cell::new(false));
 
+    // ── FieldWidgets: collect all editor-widget references ─────────────────
+    let field_widgets = FieldWidgets {
+        protocol_dropdown: protocol_dropdown.clone(),
+        server_entry: server_entry.clone(),
+        port_entry: port_entry.clone(),
+        password_entry: password_entry.clone(),
+        uuid_entry: uuid_entry.clone(),
+        sni_entry: sni_entry.clone(),
+        allow_insecure_check: allow_insecure_check.clone(),
+        method_dropdown: method_dropdown.clone(),
+        plugin_entry: plugin_entry.clone(),
+        plugin_opts_entry: plugin_opts_entry.clone(),
+        need_plugin_arg: need_plugin_arg.clone(),
+        plugin_args_entry: plugin_args_entry.clone(),
+        plugin_args_row: plugin_args_row.clone(),
+        remarks_entry: remarks_entry.clone(),
+        timeout_entry: timeout_entry.clone(),
+        group_entry: group_entry.clone(),
+        proxy_port_entry: proxy_port_entry.clone(),
+        close_to_tray_check: close_to_tray_check.clone(),
+        juicity_box: juicity_box.clone(),
+        ss_box: ss_box.clone(),
+        status_label: status_label.clone(),
+    };
+
+    // ── Helper: common save → modify → repopulate pattern ────────────────
+    fn modify_profile_and_reload(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        populate: &dyn Fn(),
+        load: &dyn Fn(),
+        modify: impl FnOnce(&mut GuiState),
+    ) {
+        save();
+        modify(&mut state.borrow_mut());
+        populate();
+        load();
+    }
+
+    // ── Button callback helpers (named functions) ─────────────────────────
+    fn on_add_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        populate: &dyn Fn(),
+        load: &dyn Fn(),
+    ) {
+        let n = state.borrow().profiles.profiles.len() + 1;
+        let mut p = ProxyProfile::default();
+        p.name = t!("misc.new_server", n = n).to_string();
+        modify_profile_and_reload(state, save, populate, load, |s| {
+            s.profiles.profiles.push(p);
+            s.runtime.selected_profile = s.profiles.profiles.len() - 1;
+        });
+    }
+
+    fn on_del_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        populate: &dyn Fn(),
+        load: &dyn Fn(),
+    ) {
+        modify_profile_and_reload(state, save, populate, load, |s| {
+            let idx = s.runtime.selected_profile;
+            if s.profiles.profiles.len() > 1 {
+                s.profiles.profiles.remove(idx);
+                if idx >= s.profiles.profiles.len() {
+                    s.runtime.selected_profile = s.profiles.profiles.len() - 1;
+                }
+            }
+            s.normalize_selected_index();
+        });
+    }
+
+    fn on_dup_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        populate: &dyn Fn(),
+        load: &dyn Fn(),
+    ) {
+        modify_profile_and_reload(state, save, populate, load, |s| {
+            let idx = s.runtime.selected_profile;
+            if let Some(p) = s.profiles.profiles.get(idx).cloned() {
+                s.profiles.profiles.insert(idx + 1, p);
+                s.runtime.selected_profile = idx + 1;
+            }
+        });
+    }
+
+    fn on_up_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        populate: &dyn Fn(),
+        load: &dyn Fn(),
+    ) {
+        modify_profile_and_reload(state, save, populate, load, |s| {
+            let idx = s.runtime.selected_profile;
+            if idx > 0 {
+                s.profiles.profiles.swap(idx, idx - 1);
+                s.runtime.selected_profile = idx - 1;
+            }
+        });
+    }
+
+    fn on_dn_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        populate: &dyn Fn(),
+        load: &dyn Fn(),
+    ) {
+        modify_profile_and_reload(state, save, populate, load, |s| {
+            let idx = s.runtime.selected_profile;
+            if idx + 1 < s.profiles.profiles.len() {
+                s.profiles.profiles.swap(idx, idx + 1);
+                s.runtime.selected_profile = idx + 1;
+            }
+        });
+    }
+
+    fn on_start_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        refresh: &dyn Fn(),
+        status: &gtk::Label,
+        tray: &Arc<Mutex<TraySharedState>>,
+    ) {
+        save();
+        refresh();
+        let mut s = state.borrow_mut();
+        if let Err(err) = s.flush() {
+            status.set_text(&t!("status.save_failed", err = err.to_string()));
+            return;
+        }
+        let profile = match s.selected_profile().cloned() {
+            Some(p) => p,
+            None => { status.set_text(&*t!("status.no_server")); return; }
+        };
+        let config_snap = s.config.clone();
+        match s.core_manager.start_profile(&config_snap, &profile) {
+            Ok(()) => {
+                status.set_text(&t!(
+                    "status.running",
+                    proto = profile.protocol.label(),
+                    name = profile.display_name()
+                ));
+                s.runtime.was_running = true;
+                let _ = s.flush();
+                if let Ok(mut ts) = tray.lock() {
+                    ts.is_running = true;
+                    ts.active_server_name = profile.display_name();
+                }
+            }
+            Err(err) => status.set_text(&t!("status.start_failed", err = err.to_string())),
+        }
+    }
+
+    fn on_stop_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        status: &gtk::Label,
+        tray: &Arc<Mutex<TraySharedState>>,
+    ) {
+        let mut s = state.borrow_mut();
+        match s.core_manager.stop() {
+            Ok(()) => {
+                status.set_text(&*t!("status.stopped"));
+                s.runtime.was_running = false;
+                let _ = s.flush();
+                if let Ok(mut ts) = tray.lock() {
+                    ts.is_running = false;
+                    ts.active_server_name = String::new();
+                }
+            }
+            Err(err) => status.set_text(&t!("status.stop_failed", err = err.to_string())),
+        }
+    }
+
+    fn on_import_clicked<S, P, L, R>(
+        state: &Rc<RefCell<GuiState>>,
+        save: S,
+        populate: P,
+        load: L,
+        refresh: R,
+        status_label: gtk::Label,
+    ) where
+        S: Fn() + Clone + 'static,
+        P: Fn() + Clone + 'static,
+        L: Fn() + Clone + 'static,
+        R: Fn() + Clone + 'static,
+    {
+        if let Some(display) = gtk::gdk::Display::default() {
+            let state2 = state.clone();
+            let pl2 = populate.clone();
+            let lf2 = load.clone();
+            let rsl2 = refresh.clone();
+            let sl2 = status_label.clone();
+            let sf2 = save.clone();
+            display.clipboard().read_text_async(
+                None::<&gtk::gio::Cancellable>,
+                move |res| {
+                    let text = match res { Ok(Some(t)) => t.to_string(), _ => return };
+                    let trimmed = text.trim();
+                    match link::import_share_link(trimmed) {
+                        Ok(imported) => {
+                            sf2();
+                            let mut s = state2.borrow_mut();
+                            let idx = s.runtime.selected_profile;
+                            if let Some(p) = s.profiles.profiles.get_mut(idx) {
+                                imported.apply_to(p);
+                            }
+                            drop(s);
+                            pl2();
+                            lf2();
+                            rsl2();
+                            sl2.set_text(&*t!("status.imported"));
+                        }
+                        Err(err) => sl2.set_text(&t!("status.import_failed", err = err.to_string())),
+                    }
+                },
+            );
+        }
+    }
+
+    fn on_export_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        status: &gtk::Label,
+    ) {
+        save();
+        let s = state.borrow();
+        let Some(profile) = s.selected_profile() else {
+            status.set_text(&*t!("status.no_server_selected"));
+            return;
+        };
+        match link::export_share_link(profile) {
+            Ok(url) => {
+                if let Some(disp) = gtk::gdk::Display::default() {
+                    disp.clipboard().set_text(&url);
+                    status.set_text(&*t!("status.url_copied"));
+                }
+            }
+            Err(err) => status.set_text(&t!("status.export_failed", err = err.to_string())),
+        }
+    }
+
+    fn on_ok_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        refresh: &dyn Fn(),
+        status: &gtk::Label,
+        window: &gtk::ApplicationWindow,
+    ) {
+        save();
+        refresh();
+        match state.borrow().flush() {
+            Ok(()) => { window.set_visible(false); }
+            Err(err) => status.set_text(&t!("status.save_failed", err = err.to_string())),
+        }
+    }
+
+    fn on_cancel_clicked(
+        load: &dyn Fn(),
+        window: &gtk::ApplicationWindow,
+    ) {
+        load();
+        window.set_visible(false);
+    }
+
+    fn on_apply_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        save: &dyn Fn(),
+        refresh: &dyn Fn(),
+        status: &gtk::Label,
+    ) {
+        save();
+        refresh();
+        let s = state.borrow();
+        match s.flush() {
+            Ok(()) => {
+                let _ = system_proxy::apply_system_proxy(&s.config);
+                status.set_text(&*t!("status.saved"));
+            }
+            Err(err) => status.set_text(&t!("status.save_failed", err = err.to_string())),
+        }
+    }
+
     // ── populate_list: rebuild ListBox from state ─────────────────────────
     let populate_list = {
         let state = state.clone();
@@ -454,108 +780,95 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
     };
 
     // ── load_fields: set all widget values from selected profile ───────────
+    fn load_fields_impl(state: &Rc<RefCell<GuiState>>, w: &FieldWidgets) {
+        let s = state.borrow();
+        if let Some(p) = s.selected_profile() {
+            w.protocol_dropdown.set_selected(p.protocol.index());
+            w.server_entry.set_text(&p.server);
+            w.port_entry.set_text(&p.server_port.to_string());
+            w.password_entry.set_text(&p.password);
+            w.uuid_entry.set_text(&p.uuid);
+            w.sni_entry.set_text(p.sni.as_deref().unwrap_or(""));
+            w.allow_insecure_check.set_active(p.allow_insecure);
+            w.method_dropdown.set_selected(method_to_index(&p.method));
+            w.plugin_entry.set_text(p.plugin.as_deref().unwrap_or(""));
+            w.plugin_opts_entry.set_text(p.plugin_opts.as_deref().unwrap_or(""));
+            let has_args = p.plugin_args.is_some();
+            w.need_plugin_arg.set_active(has_args);
+            w.plugin_args_row.set_visible(has_args);
+            w.plugin_args_entry.set_text(p.plugin_args.as_deref().unwrap_or(""));
+            w.remarks_entry.set_text(&p.name);
+            w.timeout_entry.set_text(&p.timeout.to_string());
+            w.group_entry.set_text(p.group.as_deref().unwrap_or(""));
+            let is_juicity = p.protocol == ProxyProtocol::Juicity;
+            w.juicity_box.set_visible(is_juicity);
+            w.ss_box.set_visible(!is_juicity);
+        }
+        w.proxy_port_entry.set_text(&extract_port(&s.config.socks_listen).to_string());
+        w.close_to_tray_check.set_active(s.runtime.close_to_tray);
+    }
+
     let load_fields = {
         let state = state.clone();
-        let protocol_dropdown = protocol_dropdown.clone();
-        let server_entry = server_entry.clone();
-        let port_entry = port_entry.clone();
-        let password_entry = password_entry.clone();
-        let uuid_entry = uuid_entry.clone();
-        let sni_entry = sni_entry.clone();
-        let allow_insecure_check = allow_insecure_check.clone();
-        let method_dropdown = method_dropdown.clone();
-        let plugin_entry = plugin_entry.clone();
-        let plugin_opts_entry = plugin_opts_entry.clone();
-        let need_plugin_arg = need_plugin_arg.clone();
-        let plugin_args_entry = plugin_args_entry.clone();
-        let plugin_args_row = plugin_args_row.clone();
-        let remarks_entry = remarks_entry.clone();
-        let timeout_entry = timeout_entry.clone();
-        let group_entry = group_entry.clone();
-        let proxy_port_entry = proxy_port_entry.clone();
-        let close_to_tray_check = close_to_tray_check.clone();
-        let juicity_box = juicity_box.clone();
-        let ss_box = ss_box.clone();
-        move || {
-            let s = state.borrow();
-            if let Some(p) = s.selected_profile() {
-                protocol_dropdown.set_selected(p.protocol.index());
-                server_entry.set_text(&p.server);
-                port_entry.set_text(&p.server_port.to_string());
-                password_entry.set_text(&p.password);
-                uuid_entry.set_text(&p.uuid);
-                sni_entry.set_text(p.sni.as_deref().unwrap_or(""));
-                allow_insecure_check.set_active(p.allow_insecure);
-                method_dropdown.set_selected(method_to_index(&p.method));
-                plugin_entry.set_text(p.plugin.as_deref().unwrap_or(""));
-                plugin_opts_entry.set_text(p.plugin_opts.as_deref().unwrap_or(""));
-                let has_args = p.plugin_args.is_some();
-                need_plugin_arg.set_active(has_args);
-                plugin_args_row.set_visible(has_args);
-                plugin_args_entry.set_text(p.plugin_args.as_deref().unwrap_or(""));
-                remarks_entry.set_text(&p.name);
-                timeout_entry.set_text(&p.timeout.to_string());
-                group_entry.set_text(p.group.as_deref().unwrap_or(""));
-                let is_juicity = p.protocol == ProxyProtocol::Juicity;
-                juicity_box.set_visible(is_juicity);
-                ss_box.set_visible(!is_juicity);
-            }
-            proxy_port_entry.set_text(&extract_port(&s.config.socks_listen).to_string());
-            close_to_tray_check.set_active(s.runtime.close_to_tray);
-        }
+        let w = field_widgets.clone();
+        move || load_fields_impl(&state, &w)
     };
 
     // ── save_fields: read widgets into selected profile ────────────────────
+    fn save_fields_impl(state: &Rc<RefCell<GuiState>>, w: &FieldWidgets) {
+        let mut s = state.borrow_mut();
+        s.normalize_selected_index();
+        if let Some(p) = s.selected_profile_mut() {
+            p.protocol = ProxyProtocol::from_index(w.protocol_dropdown.selected());
+            p.server = w.server_entry.text().trim().to_string();
+            p.server_port = match w.port_entry.text().parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    w.status_label.set_text("Status: Invalid server port");
+                    443
+                }
+            };
+            p.password = w.password_entry.text().to_string();
+            p.uuid = w.uuid_entry.text().trim().to_string();
+            p.sni = non_empty_text(w.sni_entry.text().as_str());
+            p.allow_insecure = w.allow_insecure_check.is_active();
+            let midx = w.method_dropdown.selected() as usize;
+            p.method = SS_METHODS.get(midx).copied()
+                .unwrap_or("chacha20-ietf-poly1305").to_string();
+            p.plugin = non_empty_text(w.plugin_entry.text().as_str());
+            p.plugin_opts = non_empty_text(w.plugin_opts_entry.text().as_str());
+            p.plugin_args = if w.need_plugin_arg.is_active() {
+                non_empty_text(w.plugin_args_entry.text().as_str())
+            } else {
+                None
+            };
+            let remarks = w.remarks_entry.text().trim().to_string();
+            p.name = if remarks.is_empty() { "New Server".to_string() } else { remarks };
+            p.timeout = match w.timeout_entry.text().parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    w.status_label.set_text("Status: Invalid timeout value");
+                    5
+                }
+            };
+            p.group = non_empty_text(w.group_entry.text().as_str());
+        }
+        let port: u16 = match w.proxy_port_entry.text().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                w.status_label.set_text("Status: Invalid proxy port");
+                1080
+            }
+        };
+        let (addr, _) = crate::util::split_host_port(&s.config.socks_listen);
+        s.config.socks_listen = format!("{}:{}", addr, port);
+        s.runtime.close_to_tray = w.close_to_tray_check.is_active();
+    }
+
     let save_fields = {
         let state = state.clone();
-        let protocol_dropdown = protocol_dropdown.clone();
-        let server_entry = server_entry.clone();
-        let port_entry = port_entry.clone();
-        let password_entry = password_entry.clone();
-        let uuid_entry = uuid_entry.clone();
-        let sni_entry = sni_entry.clone();
-        let allow_insecure_check = allow_insecure_check.clone();
-        let method_dropdown = method_dropdown.clone();
-        let plugin_entry = plugin_entry.clone();
-        let plugin_opts_entry = plugin_opts_entry.clone();
-        let need_plugin_arg = need_plugin_arg.clone();
-        let plugin_args_entry = plugin_args_entry.clone();
-        let remarks_entry = remarks_entry.clone();
-        let timeout_entry = timeout_entry.clone();
-        let group_entry = group_entry.clone();
-        let proxy_port_entry = proxy_port_entry.clone();
-        let close_to_tray_check = close_to_tray_check.clone();
-        move || {
-            let mut s = state.borrow_mut();
-            s.normalize_selected_index();
-            if let Some(p) = s.selected_profile_mut() {
-                p.protocol = ProxyProtocol::from_index(protocol_dropdown.selected());
-                p.server = server_entry.text().trim().to_string();
-                p.server_port = port_entry.text().parse().unwrap_or(443);
-                p.password = password_entry.text().to_string();
-                p.uuid = uuid_entry.text().trim().to_string();
-                p.sni = non_empty_text(sni_entry.text().as_str());
-                p.allow_insecure = allow_insecure_check.is_active();
-                let midx = method_dropdown.selected() as usize;
-                p.method = SS_METHODS.get(midx).copied()
-                    .unwrap_or("chacha20-ietf-poly1305").to_string();
-                p.plugin = non_empty_text(plugin_entry.text().as_str());
-                p.plugin_opts = non_empty_text(plugin_opts_entry.text().as_str());
-                p.plugin_args = if need_plugin_arg.is_active() {
-                    non_empty_text(plugin_args_entry.text().as_str())
-                } else {
-                    None
-                };
-                let remarks = remarks_entry.text().trim().to_string();
-                p.name = if remarks.is_empty() { "New Server".to_string() } else { remarks };
-                p.timeout = timeout_entry.text().parse().unwrap_or(5);
-                p.group = non_empty_text(group_entry.text().as_str());
-            }
-            let port: u16 = proxy_port_entry.text().parse().unwrap_or(1080);
-            let addr = s.config.socks_listen.rsplitn(2, ':').nth(1).unwrap_or("127.0.0.1");
-            s.config.socks_listen = format!("{}:{}", addr, port);
-            s.runtime.close_to_tray = close_to_tray_check.is_active();
-        }
+        let w = field_widgets.clone();
+        move || save_fields_impl(&state, &w)
     };
 
     // ── List row-selected ─────────────────────────────────────────────────
@@ -606,16 +919,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let load_fields = load_fields.clone();
         let state = state.clone();
         add_btn.connect_clicked(move |_| {
-            save_fields();
-            let mut s = state.borrow_mut();
-            let mut p = ProxyProfile::default();
-            let n = s.profiles.profiles.len() + 1;
-            p.name = t!("misc.new_server", n = n).to_string();
-            s.profiles.profiles.push(p);
-            s.runtime.selected_profile = s.profiles.profiles.len() - 1;
-            drop(s);
-            populate_list();
-            load_fields();
+            on_add_clicked(&state, &save_fields, &populate_list, &load_fields);
         });
     }
 
@@ -626,19 +930,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let load_fields = load_fields.clone();
         let state = state.clone();
         del_btn.connect_clicked(move |_| {
-            save_fields();
-            let mut s = state.borrow_mut();
-            let idx = s.runtime.selected_profile;
-            if s.profiles.profiles.len() > 1 {
-                s.profiles.profiles.remove(idx);
-                if idx >= s.profiles.profiles.len() {
-                    s.runtime.selected_profile = s.profiles.profiles.len() - 1;
-                }
-            }
-            s.normalize_selected_index();
-            drop(s);
-            populate_list();
-            load_fields();
+            on_del_clicked(&state, &save_fields, &populate_list, &load_fields);
         });
     }
 
@@ -649,16 +941,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let load_fields = load_fields.clone();
         let state = state.clone();
         dup_btn.connect_clicked(move |_| {
-            save_fields();
-            let mut s = state.borrow_mut();
-            let idx = s.runtime.selected_profile;
-            if let Some(p) = s.profiles.profiles.get(idx).cloned() {
-                s.profiles.profiles.insert(idx + 1, p);
-                s.runtime.selected_profile = idx + 1;
-            }
-            drop(s);
-            populate_list();
-            load_fields();
+            on_dup_clicked(&state, &save_fields, &populate_list, &load_fields);
         });
     }
 
@@ -669,16 +952,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let load_fields = load_fields.clone();
         let state = state.clone();
         up_btn.connect_clicked(move |_| {
-            save_fields();
-            let mut s = state.borrow_mut();
-            let idx = s.runtime.selected_profile;
-            if idx > 0 {
-                s.profiles.profiles.swap(idx, idx - 1);
-                s.runtime.selected_profile = idx - 1;
-            }
-            drop(s);
-            populate_list();
-            load_fields();
+            on_up_clicked(&state, &save_fields, &populate_list, &load_fields);
         });
     }
 
@@ -689,16 +963,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let load_fields = load_fields.clone();
         let state = state.clone();
         dn_btn.connect_clicked(move |_| {
-            save_fields();
-            let mut s = state.borrow_mut();
-            let idx = s.runtime.selected_profile;
-            if idx + 1 < s.profiles.profiles.len() {
-                s.profiles.profiles.swap(idx, idx + 1);
-                s.runtime.selected_profile = idx + 1;
-            }
-            drop(s);
-            populate_list();
-            load_fields();
+            on_dn_clicked(&state, &save_fields, &populate_list, &load_fields);
         });
     }
 
@@ -710,34 +975,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let state = state.clone();
         let tray_shared = Arc::clone(&tray_shared);
         start_btn.connect_clicked(move |_| {
-            save_fields();
-            refresh_selected_label();
-            let mut s = state.borrow_mut();
-            if let Err(err) = s.flush() {
-                status_label.set_text(&t!("status.save_failed", err = err.to_string()));
-                return;
-            }
-            let profile = match s.selected_profile().cloned() {
-                Some(p) => p,
-                None => { status_label.set_text(&*t!("status.no_server")); return; }
-            };
-            let config_snap = s.config.clone();
-            match s.core_manager.start_profile(&config_snap, &profile) {
-                Ok(()) => {
-                    status_label.set_text(&t!(
-                        "status.running",
-                        proto = profile.protocol.label(),
-                        name = profile.display_name()
-                    ));
-                    s.runtime.was_running = true;
-                    let _ = s.flush();
-                    if let Ok(mut ts) = tray_shared.lock() {
-                        ts.is_running = true;
-                        ts.active_server_name = profile.display_name();
-                    }
-                }
-                Err(err) => status_label.set_text(&t!("status.start_failed", err = err.to_string())),
-            }
+            on_start_clicked(&state, &save_fields, &refresh_selected_label, &status_label, &tray_shared);
         });
     }
 
@@ -747,19 +985,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let state = state.clone();
         let tray_shared = Arc::clone(&tray_shared);
         stop_btn.connect_clicked(move |_| {
-            let mut s = state.borrow_mut();
-            match s.core_manager.stop() {
-                Ok(()) => {
-                    status_label.set_text(&*t!("status.stopped"));
-                    s.runtime.was_running = false;
-                    let _ = s.flush();
-                    if let Ok(mut ts) = tray_shared.lock() {
-                        ts.is_running = false;
-                        ts.active_server_name = String::new();
-                    }
-                }
-                Err(err) => status_label.set_text(&t!("status.stop_failed", err = err.to_string())),
-            }
+            on_stop_clicked(&state, &status_label, &tray_shared);
         });
     }
 
@@ -772,37 +998,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let status_label = status_label.clone();
         let state = state.clone();
         import_btn.connect_clicked(move |_| {
-            if let Some(display) = gtk::gdk::Display::default() {
-                let state2 = state.clone();
-                let pl2 = populate_list.clone();
-                let lf2 = load_fields.clone();
-                let rsl2 = refresh_selected_label.clone();
-                let sl2 = status_label.clone();
-                let sf2 = save_fields.clone();
-                display.clipboard().read_text_async(
-                    None::<&gtk::gio::Cancellable>,
-                    move |res| {
-                        let text = match res { Ok(Some(t)) => t.to_string(), _ => return };
-                        let trimmed = text.trim();
-                        match link::import_share_link(trimmed) {
-                            Ok(imported) => {
-                                sf2();
-                                let mut s = state2.borrow_mut();
-                                let idx = s.runtime.selected_profile;
-                                if let Some(p) = s.profiles.profiles.get_mut(idx) {
-                                    imported.apply_to(p);
-                                }
-                                drop(s);
-                                pl2();
-                                lf2();
-                                rsl2();
-                                sl2.set_text(&*t!("status.imported"));
-                            }
-                            Err(err) => sl2.set_text(&t!("status.import_failed", err = err.to_string())),
-                        }
-                    },
-                );
-            }
+            on_import_clicked(&state, save_fields.clone(), populate_list.clone(), load_fields.clone(), refresh_selected_label.clone(), status_label.clone());
         });
     }
 
@@ -812,21 +1008,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let status_label = status_label.clone();
         let state = state.clone();
         export_btn.connect_clicked(move |_| {
-            save_fields();
-            let s = state.borrow();
-            let Some(profile) = s.selected_profile() else {
-                status_label.set_text(&*t!("status.no_server_selected"));
-                return;
-            };
-            match link::export_share_link(profile) {
-                Ok(url) => {
-                    if let Some(disp) = gtk::gdk::Display::default() {
-                        disp.clipboard().set_text(&url);
-                        status_label.set_text(&*t!("status.url_copied"));
-                    }
-                }
-                Err(err) => status_label.set_text(&t!("status.export_failed", err = err.to_string())),
-            }
+            on_export_clicked(&state, &save_fields, &status_label);
         });
     }
 
@@ -838,12 +1020,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let state = state.clone();
         let window = window.clone();
         ok_btn.connect_clicked(move |_| {
-            save_fields();
-            refresh_selected_label();
-            match state.borrow().flush() {
-                Ok(()) => { window.set_visible(false); }
-                Err(err) => status_label.set_text(&t!("status.save_failed", err = err.to_string())),
-            }
+            on_ok_clicked(&state, &save_fields, &refresh_selected_label, &status_label, &window);
         });
     }
 
@@ -852,8 +1029,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let load_fields = load_fields.clone();
         let window = window.clone();
         cancel_btn.connect_clicked(move |_| {
-            load_fields();
-            window.set_visible(false);
+            on_cancel_clicked(&load_fields, &window);
         });
     }
 
@@ -864,17 +1040,63 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let status_label = status_label.clone();
         let state = state.clone();
         apply_btn.connect_clicked(move |_| {
-            save_fields();
-            refresh_selected_label();
-            let s = state.borrow();
-            match s.flush() {
-                Ok(()) => {
-                    let _ = system_proxy::apply_system_proxy(&s.config);
-                    status_label.set_text(&*t!("status.saved"));
-                }
-                Err(err) => status_label.set_text(&t!("status.save_failed", err = err.to_string())),
-            }
+            on_apply_clicked(&state, &save_fields, &refresh_selected_label, &status_label);
         });
+    }
+
+    fn on_pac_settings_clicked(
+        state: &Rc<RefCell<GuiState>>,
+        status_label: &gtk::Label,
+        window: &gtk::ApplicationWindow,
+    ) {
+        let cfg_snapshot = state.borrow().config.clone();
+
+        // on_save: update config, persist, restart PAC server if listen addr changed.
+        let state_save = state.clone();
+        let sl_save = status_label.clone();
+        let on_save = move |new_cfg: crate::config::AppConfig| {
+            let mut s = state_save.borrow_mut();
+            let pac_listen_changed = s.config.pac_listen != new_cfg.pac_listen;
+            s.config = new_cfg;
+            if let Err(err) = s.flush() {
+                sl_save.set_text(&t!("status.save_failed", err = err.to_string()));
+                return;
+            }
+            if pac_listen_changed || s.pac_server.is_none() {
+                if let Err(e) = restart_pac_server(&mut s, pac_listen_changed) {
+                    tracing::warn!("PAC server restart failed: {e}");
+                }
+            }
+            sl_save.set_text(&*t!("status.saved"));
+        };
+
+        // on_update_now: spawn background download thread.
+        let state_upd = state.clone();
+        let sl_upd = status_label.clone();
+        let on_update_now = move || {
+            let (data_dir, direct_url, proxy_url, tx) = {
+                let mut s = state_upd.borrow_mut();
+                if s.pac_update_rx.is_some() {
+                    return;
+                }
+                let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+                s.pac_update_rx = Some(rx);
+                (
+                    s.storage.paths().config_dir.clone(),
+                    s.config.pac_direct_url.clone(),
+                    s.config.pac_proxy_url.clone(),
+                    tx,
+                )
+            };
+            std::thread::spawn(move || {
+                let _ = tx.send(
+                    pac::download_rules(&data_dir, &direct_url, &proxy_url).map(|_| ()),
+                );
+            });
+            sl_upd.set_text(&*t!("status.pac_downloading"));
+        };
+
+        crate::pac_dialog::open(window, cfg_snapshot, on_save, on_update_now);
     }
 
     // ── PAC Settings button ───────────────────────────────────────────────
@@ -883,61 +1105,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
         let status_label = status_label.clone();
         let window = window.clone();
         pac_settings_btn.connect_clicked(move |_| {
-            let cfg_snapshot = state.borrow().config.clone();
-
-            // on_save: update config, persist, restart PAC server if listen addr changed.
-            let state_save = state.clone();
-            let sl_save = status_label.clone();
-            let on_save = move |new_cfg: crate::config::AppConfig| {
-                let mut s = state_save.borrow_mut();
-                let pac_listen_changed = s.config.pac_listen != new_cfg.pac_listen;
-                s.config = new_cfg;
-                if let Err(err) = s.flush() {
-                    sl_save.set_text(&t!("status.save_failed", err = err.to_string()));
-                    return;
-                }
-                if pac_listen_changed || s.pac_server.is_none() {
-                    let (direct, proxy) = pac::load_rules(&s.storage.paths().config_dir);
-                    let content = pac::generate_pac(
-                        s.config.pac_rule_mode,
-                        &s.config.socks_listen,
-                        &direct,
-                        &proxy,
-                    );
-                    match pac::start(&s.config.pac_listen, content) {
-                        Ok(srv) => s.pac_server = Some(srv),
-                        Err(e) => tracing::warn!("PAC server restart failed: {e}"),
-                    }
-                }
-                sl_save.set_text(&*t!("status.saved"));
-            };
-
-            // on_update_now: spawn background download thread.
-            let state_upd = state.clone();
-            let sl_upd = status_label.clone();
-            let on_update_now = move || {
-                let (data_dir, direct_url, proxy_url) = {
-                    let s = state_upd.borrow();
-                    if s.pac_update_rx.is_some() {
-                        return;
-                    }
-                    (
-                        s.storage.paths().config_dir.clone(),
-                        s.config.pac_direct_url.clone(),
-                        s.config.pac_proxy_url.clone(),
-                    )
-                };
-                let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
-                std::thread::spawn(move || {
-                    let _ = tx.send(
-                        pac::download_rules(&data_dir, &direct_url, &proxy_url).map(|_| ()),
-                    );
-                });
-                state_upd.borrow_mut().pac_update_rx = Some(rx);
-                sl_upd.set_text(&*t!("status.pac_downloading"));
-            };
-
-            crate::pac_dialog::open(&window, cfg_snapshot, on_save, on_update_now);
+            on_pac_settings_clicked(&state, &status_label, &window);
         });
     }
 
@@ -967,7 +1135,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
     {
         let mut s = state.borrow_mut();
         {
-            let mut ts = tray_shared.lock().unwrap();
+            let mut ts = tray_shared.lock().unwrap_or_else(|e| e.into_inner());
             ts.system_proxy_mode = s.config.system_proxy_mode;
             ts.pac_rule_mode = s.config.pac_rule_mode;
             ts.server_names = s.profiles.profiles.iter().map(|p| p.display_name()).collect();
@@ -1015,16 +1183,8 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                                 return;
                             }
                             if pac_listen_changed || s.pac_server.is_none() {
-                                let (direct, proxy) = pac::load_rules(&s.storage.paths().config_dir);
-                                let content = pac::generate_pac(
-                                    s.config.pac_rule_mode,
-                                    &s.config.socks_listen,
-                                    &direct,
-                                    &proxy,
-                                );
-                                match pac::start(&s.config.pac_listen, content) {
-                                    Ok(srv) => s.pac_server = Some(srv),
-                                    Err(e) => tracing::warn!("PAC server restart failed: {e}"),
+                                if let Err(e) = restart_pac_server(&mut s, pac_listen_changed) {
+                                    tracing::warn!("PAC server restart failed: {e}");
                                 }
                             }
                             sl_s.set_text(&*t!("status.saved"));
@@ -1032,22 +1192,23 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                         let state_u = state.clone();
                         let sl_u = status_label.clone();
                         let on_update_now = move || {
-                            let (data_dir, direct_url, proxy_url) = {
-                                let s = state_u.borrow();
+                            let (data_dir, direct_url, proxy_url, tx) = {
+                                let mut s = state_u.borrow_mut();
                                 if s.pac_update_rx.is_some() { return; }
+                                let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
+                                s.pac_update_rx = Some(rx);
                                 (
                                     s.storage.paths().config_dir.clone(),
                                     s.config.pac_direct_url.clone(),
                                     s.config.pac_proxy_url.clone(),
+                                    tx,
                                 )
                             };
-                            let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
                             std::thread::spawn(move || {
                                 let _ = tx.send(
                                     pac::download_rules(&data_dir, &direct_url, &proxy_url).map(|_| ()),
                                 );
                             });
-                            state_u.borrow_mut().pac_update_rx = Some(rx);
                             sl_u.set_text(&*t!("status.pac_downloading"));
                         };
                         crate::pac_dialog::open(&window, cfg_snapshot, on_save, on_update_now);
@@ -1088,35 +1249,33 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                         s.config.pac_rule_mode = pac_mode;
                         let _ = s.flush();
                         // Regenerate PAC with the new rule set.
-                        let (direct, proxy) = pac::load_rules(&s.storage.paths().config_dir);
-                        let new_pac = pac::generate_pac(pac_mode, &s.config.socks_listen, &direct, &proxy);
-                        if let Some(srv) = &s.pac_server {
-                            srv.update(new_pac);
-                        }
+                        let _ = restart_pac_server(&mut s, false);
                         if let Ok(mut ts) = tray_shared.lock() {
                             ts.pac_rule_mode = pac_mode;
                         }
                         status_label.set_text(&t!("status.pac_rule", mode = pac_mode.label()));
                     }
                     Ok(TrayEvent::UpdatePacRules) => {
-                        let s = state.borrow();
-                        if s.pac_update_rx.is_some() {
-                            // Already downloading.
-                            drop(s);
-                        } else {
-                            let data_dir = s.storage.paths().config_dir.clone();
-                            let direct_url = s.config.pac_direct_url.clone();
-                            let proxy_url = s.config.pac_proxy_url.clone();
-                            drop(s);
+                        let (data_dir, direct_url, proxy_url, tx) = {
+                            let mut s = state.borrow_mut();
+                            if s.pac_update_rx.is_some() {
+                                return glib::ControlFlow::Continue;
+                            }
                             let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<()>>();
-                            std::thread::spawn(move || {
-                                let result = pac::download_rules(&data_dir, &direct_url, &proxy_url)
-                                    .map(|_| ());
-                                let _ = tx.send(result);
-                            });
-                            state.borrow_mut().pac_update_rx = Some(rx);
-                            status_label.set_text(&*t!("status.pac_downloading"));
-                        }
+                            s.pac_update_rx = Some(rx);
+                            (
+                                s.storage.paths().config_dir.clone(),
+                                s.config.pac_direct_url.clone(),
+                                s.config.pac_proxy_url.clone(),
+                                tx,
+                            )
+                        };
+                        std::thread::spawn(move || {
+                            let result = pac::download_rules(&data_dir, &direct_url, &proxy_url)
+                                .map(|_| ());
+                            let _ = tx.send(result);
+                        });
+                        status_label.set_text(&*t!("status.pac_downloading"));
                     }
                     Ok(TrayEvent::SelectServer(idx)) => {
                         {
@@ -1201,12 +1360,7 @@ fn build_ui(app: &adw::Application) -> anyhow::Result<()> {
                 let mut s = state.borrow_mut();
                 s.pac_update_rx = None;
                 if success {
-                    let (direct, proxy) = pac::load_rules(&s.storage.paths().config_dir);
-                    let new_pac =
-                        pac::generate_pac(s.config.pac_rule_mode, &s.config.socks_listen, &direct, &proxy);
-                    if let Some(srv) = &s.pac_server {
-                        srv.update(new_pac);
-                    }
+                    let _ = restart_pac_server(&mut s, false);
                     status_label.set_text(&*t!("status.pac_updated"));
                 }
             }

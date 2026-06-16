@@ -145,23 +145,18 @@ pub fn load_rules(data_dir: &Path) -> (Vec<String>, Vec<String>) {
 // ── Download helper ───────────────────────────────────────────────────────────
 
 fn download_file(url: &str, dest: &Path) -> anyhow::Result<()> {
-    let dest_str = dest.to_str().context("non-UTF8 dest path")?;
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("Failed to download {}: {}", url, e))?;
 
-    // Try curl first, fall back to wget.
-    if let Ok(status) = std::process::Command::new("curl")
-        .args(["-sSfL", url, "-o", dest_str])
-        .status()
+    let mut reader = response.into_reader();
+    // 先下载到临时文件，然后原子重命名
+    let tmp_path = dest.with_extension(".tmp");
     {
-        if status.success() {
-            return Ok(());
-        }
+        let mut file = std::fs::File::create(&tmp_path)?;
+        std::io::copy(&mut reader, &mut file)?;
     }
-
-    let status = std::process::Command::new("wget")
-        .args(["-qO", dest_str, url])
-        .status()
-        .context("wget not available; install curl or wget")?;
-    anyhow::ensure!(status.success(), "wget failed to download {url}");
+    std::fs::rename(&tmp_path, dest)?;
     Ok(())
 }
 

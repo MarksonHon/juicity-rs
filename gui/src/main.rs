@@ -9,6 +9,7 @@ mod pac_dialog;
 mod startup_dialog;
 mod system_proxy;
 mod tray;
+mod util;
 
 // Load translation files from `locales/` at compile time.
 rust_i18n::i18n!("locales", fallback = "en");

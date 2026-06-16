@@ -6,7 +6,18 @@ use url::form_urlencoded::Serializer;
 /// Format: `juicity://uuid:password@host:port?params`
 ///
 /// For server configs, the first user entry is used.
-pub fn generate_share_link(config: &Config) -> Result<String, String> {
+///
+/// # Parameters
+/// - `config`: The configuration to generate a link from.
+/// - `host_override`: If provided, replaces the host portion of the link.
+///   Useful when the server's listen address is not the desired public host.
+/// - `sni_override`: If provided, replaces the SNI query parameter.
+///   Useful when the SNI should differ from the host (e.g., CDN setups).
+pub fn generate_share_link(
+    config: &Config,
+    host_override: Option<&str>,
+    sni_override: Option<&str>,
+) -> Result<String, String> {
     // Determine uuid and password
     let (uuid, password) = if !config.uuid.is_empty() && !config.password.is_empty() {
         (config.uuid.clone(), config.password.clone())
@@ -22,7 +33,10 @@ pub fn generate_share_link(config: &Config) -> Result<String, String> {
     } else {
         &config.listen
     };
-    let (host, port) = parse_host_port(server_addr)?;
+    let (base_host, port) = parse_host_port(server_addr)?;
+
+    // Apply host_override if provided
+    let host = host_override.unwrap_or(&base_host);
 
     // URL-encode uuid and password
     let encoded_uuid = Serializer::new(String::new())
@@ -45,8 +59,16 @@ pub fn generate_share_link(config: &Config) -> Result<String, String> {
     // Build query parameters
     let mut query_parts: Vec<String> = Vec::new();
 
-    // sni (required)
-    let sni = if config.sni.is_empty() { &host } else { &config.sni };
+    // sni (required) — sni_override takes highest priority
+    let sni = sni_override
+        .or_else(|| {
+            if !config.sni.is_empty() {
+                Some(config.sni.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(&host);
     query_parts.push(format!("sni={}", url_encode_param(sni)));
 
     // congestion_control
@@ -165,7 +187,7 @@ mod tests {
         config.congestion_control = "bbr".to_string();
         config.allow_insecure = false;
 
-        let link = generate_share_link(&config).unwrap();
+        let link = generate_share_link(&config, None, None).unwrap();
         assert!(link.starts_with("juicity://"));
         assert!(link.contains("00000000-0000-0000-0000-000000000000"));
         assert!(link.contains("test-password"));
@@ -192,7 +214,7 @@ mod tests {
         );
         config.users = users;
 
-        let link = generate_share_link(&config).unwrap();
+        let link = generate_share_link(&config, None, None).unwrap();
         assert!(link.starts_with("juicity://"));
         assert!(link.contains("11111111-1111-1111-1111-111111111111"));
         assert!(link.contains("server-pw"));
@@ -230,7 +252,7 @@ mod tests {
     #[test]
     fn test_no_credentials_error() {
         let config = Config::default();
-        let result = generate_share_link(&config);
+        let result = generate_share_link(&config, None, None);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

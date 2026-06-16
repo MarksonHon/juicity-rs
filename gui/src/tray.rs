@@ -363,7 +363,7 @@ fn start_native(
     };
 
     // Build initial menu.
-    let init_state = shared.lock().unwrap().clone();
+    let init_state = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (menu, id_map) = build_native_menu(&init_state);
 
     let tray = TrayIconBuilder::new()
@@ -386,7 +386,7 @@ fn start_native(
 
     gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         // Rebuild menu when shared state changes.
-        let current = shared_c.lock().unwrap().clone();
+        let current = shared_c.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if *last_state_c.borrow() != current {
             let (new_menu, new_ids) = build_native_menu(&current);
             if let Some(t) = tray_c.borrow_mut().as_mut() {

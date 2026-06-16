@@ -267,15 +267,14 @@ fn parse_ss_legacy(raw: &str) -> anyhow::Result<ImportedShareLink> {
     let endpoint = &decoded[at_pos + 1..];
 
     let (method, password) = creds.split_once(':').context("legacy ss credentials missing method:password pair")?;
-    let (host, port) = split_host_port(endpoint)
-        .ok_or_else(|| anyhow::anyhow!("legacy ss endpoint must be host:port"))?;
+    let (host, port) = crate::util::split_host_port(endpoint);
 
     let name = remark.unwrap_or_else(|| format!("{}:{}", host, port));
 
     Ok(ImportedShareLink {
         protocol: ProxyProtocol::Shadowsocks,
         name,
-        server: host,
+        server: host.to_string(),
         server_port: port,
         password: password.to_string(),
         uuid: String::new(),
@@ -322,21 +321,6 @@ fn decode_base64_variants(input: &str) -> anyhow::Result<String> {
     }
 
     bail!("unable to decode base64 payload")
-}
-
-fn split_host_port(v: &str) -> Option<(String, u16)> {
-    if v.starts_with('[') {
-        let close = v.find(']')?;
-        let host = v[1..close].to_string();
-        let rest = v.get(close + 1..)?;
-        let port = rest.strip_prefix(':')?.parse::<u16>().ok()?;
-        return Some((host, port));
-    }
-
-    let idx = v.rfind(':')?;
-    let host = v[..idx].to_string();
-    let port = v[idx + 1..].parse::<u16>().ok()?;
-    Some((host, port))
 }
 
 #[cfg(test)]

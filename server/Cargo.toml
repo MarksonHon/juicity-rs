@@ -27,3 +27,5 @@ socket2.workspace = true
 async-trait.workspace = true
 mimalloc = "0.1"
 indexmap = "2"
+pnet = { version = "0.35", default-features = false, features = ["std"] }
+dialoguer = "0.11"
