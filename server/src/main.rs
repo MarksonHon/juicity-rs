@@ -133,6 +133,10 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let config = Config::from_file(&config)?;
 
+            // If no output flag is given, default to interactive share-link mode.
+            let default_mode = !do_link && !qrcode && qrcode_png.is_none() && !json_server && !json_client;
+            let do_link = do_link || default_mode;
+
             if do_link || qrcode || qrcode_png.is_some() {
                 // Step 1: Resolve host (from --interface or interactive selection)
                 let host_override = resolve_export_host(interface.as_deref())?;
