@@ -103,15 +103,54 @@ pub fn generate_share_link(
     Ok(link)
 }
 
-/// Print a QR code to the terminal using ANSI block characters.
+/// Print a QR code to the terminal using Unicode half-block characters.
+///
+/// Each output character represents a 1-wide × 2-tall block of QR modules,
+/// using the mapping:
+///   (light, light) → ' '   (dark, light) → '▀'
+///   (light, dark)  → '▄'   (dark, dark)  → '█'
+///
+/// This halves the row count so the rendered image is roughly square in
+/// a standard monospace terminal (where character cells are ~2× taller
+/// than they are wide).
 pub fn print_qrcode(link: &str) -> Result<(), anyhow::Error> {
+    use qrcode::Color;
+
     let code = qrcode::QrCode::new(link.as_bytes())?;
-    let string = code
-        .render()
-        .light_color(' ')
-        .dark_color('\u{2588}')
-        .build();
-    println!("{}", string);
+    let width = code.width();
+
+    // Quiet zone: 2 modules on each side (spec recommends 4; 2 is sufficient
+    // for most scanners and keeps the output compact).
+    let border = 2usize;
+    let total = width + 2 * border;
+
+    // Returns true if the module at (row, col) in the bordered grid is dark.
+    let is_dark = |row: usize, col: usize| -> bool {
+        if row < border || row >= border + width || col < border || col >= border + width {
+            false // quiet zone is always light
+        } else {
+            code[(row - border, col - border)] == Color::Dark
+        }
+    };
+
+    let mut output = String::new();
+    let mut row = 0usize;
+    while row < total {
+        for col in 0..total {
+            let top = is_dark(row, col);
+            let bot = if row + 1 < total { is_dark(row + 1, col) } else { false };
+            output.push(match (top, bot) {
+                (false, false) => ' ',
+                (true,  false) => '\u{2580}', // ▀
+                (false, true)  => '\u{2584}', // ▄
+                (true,  true)  => '\u{2588}', // █
+            });
+        }
+        output.push('\n');
+        row += 2;
+    }
+
+    print!("{}", output);
     Ok(())
 }
 
