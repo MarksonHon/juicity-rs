@@ -192,45 +192,45 @@ fn resolve_export_host(interface: Option<&str>) -> anyhow::Result<Option<String>
 ///
 /// Prefers IPv4; falls back to IPv6.
 fn get_interface_ip(interface_name: &str) -> anyhow::Result<String> {
-    use pnet::datalink;
-
-    let interfaces = datalink::interfaces();
-    let iface = interfaces
-        .into_iter()
-        .find(|iface| iface.name == interface_name)
-        .ok_or_else(|| anyhow::anyhow!("Interface '{}' not found", interface_name))?;
+    let addrs = if_addrs::get_if_addrs()?;
+    let mut found = false;
 
     // Prefer IPv4
-    for ip in &iface.ips {
-        if ip.is_ipv4() {
-            return Ok(ip.ip().to_string());
+    for addr in addrs.iter().filter(|a| a.name == interface_name) {
+        found = true;
+        if let if_addrs::IfAddr::V4(ref v4) = addr.addr {
+            return Ok(v4.ip.to_string());
         }
     }
     // Fallback to IPv6
-    for ip in &iface.ips {
-        if ip.is_ipv6() {
-            return Ok(ip.ip().to_string());
+    for addr in addrs.iter().filter(|a| a.name == interface_name) {
+        if let if_addrs::IfAddr::V6(ref v6) = addr.addr {
+            return Ok(v6.ip.to_string());
         }
     }
-    anyhow::bail!("Interface '{}' has no IP address", interface_name)
+
+    if found {
+        anyhow::bail!("Interface '{}' has no IP address", interface_name)
+    } else {
+        anyhow::bail!("Interface '{}' not found", interface_name)
+    }
 }
 
 /// Interactively select a network interface by listing all available ones.
 fn interactive_select_interface() -> anyhow::Result<String> {
     use dialoguer::Select;
-    use pnet::datalink;
 
-    let interfaces = datalink::interfaces();
+    let addrs = if_addrs::get_if_addrs()?;
+    let mut seen = std::collections::HashSet::new();
     let mut candidates: Vec<(String, String)> = Vec::new(); // (name, ip)
 
-    for iface in &interfaces {
-        if iface.is_loopback() {
+    for addr in &addrs {
+        if addr.is_loopback() {
             continue;
         }
-        for ip in &iface.ips {
-            if ip.is_ipv4() {
-                candidates.push((iface.name.clone(), ip.ip().to_string()));
-                break;
+        if let if_addrs::IfAddr::V4(ref v4) = addr.addr {
+            if seen.insert(addr.name.clone()) {
+                candidates.push((addr.name.clone(), v4.ip.to_string()));
             }
         }
     }
