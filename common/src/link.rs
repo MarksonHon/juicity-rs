@@ -17,6 +17,7 @@ pub fn generate_share_link(
     config: &Config,
     host_override: Option<&str>,
     sni_override: Option<&str>,
+    cert_sha256_override: Option<&str>,
 ) -> Result<String, String> {
     // Determine uuid and password
     let (uuid, password) = if !config.uuid.is_empty() && !config.password.is_empty() {
@@ -86,10 +87,20 @@ pub fn generate_share_link(
     ));
 
     // pinned_certchain_sha256 (optional)
-    if !config.pinned_certchain_sha256.is_empty() {
+    // cert_sha256_override takes priority over config value
+    let cert_sha256 = cert_sha256_override
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if !config.pinned_certchain_sha256.is_empty() {
+                Some(config.pinned_certchain_sha256.as_str())
+            } else {
+                None
+            }
+        });
+    if let Some(sha256) = cert_sha256 {
         query_parts.push(format!(
             "pinned_certchain_sha256={}",
-            url_encode_param(&config.pinned_certchain_sha256)
+            url_encode_param(sha256)
         ));
     }
 
@@ -226,7 +237,7 @@ mod tests {
         config.congestion_control = "bbr".to_string();
         config.allow_insecure = false;
 
-        let link = generate_share_link(&config, None, None).unwrap();
+        let link = generate_share_link(&config, None, None, None).unwrap();
         assert!(link.starts_with("juicity://"));
         assert!(link.contains("00000000-0000-0000-0000-000000000000"));
         assert!(link.contains("test-password"));
@@ -253,7 +264,7 @@ mod tests {
         );
         config.users = users;
 
-        let link = generate_share_link(&config, None, None).unwrap();
+        let link = generate_share_link(&config, None, None, None).unwrap();
         assert!(link.starts_with("juicity://"));
         assert!(link.contains("11111111-1111-1111-1111-111111111111"));
         assert!(link.contains("server-pw"));
@@ -291,7 +302,7 @@ mod tests {
     #[test]
     fn test_no_credentials_error() {
         let config = Config::default();
-        let result = generate_share_link(&config, None, None);
+        let result = generate_share_link(&config, None, None, None);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

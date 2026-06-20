@@ -4,7 +4,7 @@ use std::sync::Arc;
 use juicity_common::consts;
 use juicity_common::protocol;
 use juicity_common::Config;
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
+use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream};
 use uuid::Uuid;
 
 /// A Juicity client that connects to a remote Juicity server
@@ -131,10 +131,54 @@ impl JuicityClient {
         // operations internally. Run it in spawn_blocking to avoid blocking
         // the async runtime during startup.
         let bind_addr: SocketAddr = "[::]:0".parse()?;
-        let endpoint = tokio::task::spawn_blocking(move || {
-            Endpoint::client(bind_addr)
-        })
-        .await??;
+
+        let endpoint = if let Some(fwmark) = config.fwmark {
+            // When fwmark is set, manually create the socket with socket2 so we
+            // can set SO_MARK before handing it to Quinn.
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                use socket2::{Domain, Protocol, Socket, Type};
+
+                // Create IPv6 dual-stack socket
+                let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+
+                // Enable dual-stack (IPv4-mapped IPv6)
+                sock.set_only_v6(false)?;
+
+                // Set fwmark (SO_MARK, Linux only)
+                #[cfg(target_os = "linux")]
+                sock.set_mark(fwmark)?;
+
+                // Non-Linux platforms: fwmark is not supported, warn the user
+                #[cfg(not(target_os = "linux"))]
+                println!("Warning: fwmark is only supported on Linux, ignoring fwmark={}", fwmark);
+
+                // Bind to address
+                sock.bind(&bind_addr.into())?;
+
+                // Convert to std UdpSocket
+                let std_socket: std::net::UdpSocket = sock.into();
+
+                // Wrap with quinn runtime
+                let runtime = quinn::default_runtime()
+                    .ok_or_else(|| anyhow::anyhow!("No quinn runtime available"))?;
+                let wrapped = runtime.wrap_udp_socket(std_socket)?;
+
+                // Create Endpoint with the wrapped socket
+                let endpoint = Endpoint::new_with_abstract_socket(
+                    EndpointConfig::default(),
+                    None, // client does not need ServerConfig
+                    wrapped,
+                    runtime,
+                )?;
+
+                Ok(endpoint)
+            })
+            .await??
+        } else {
+            // Original logic: use Endpoint::client directly
+            tokio::task::spawn_blocking(move || Endpoint::client(bind_addr))
+                .await??
+        };
         let endpoint = Arc::new(endpoint);
 
         // Build and cache the QUIC client config once.

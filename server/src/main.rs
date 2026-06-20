@@ -3,6 +3,7 @@ use juicity_common::cert;
 use juicity_common::config::Config;
 use juicity_common::link;
 use juicity_common::BuildInfo;
+use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
 
 #[global_allocator]
@@ -76,6 +77,11 @@ enum Commands {
         /// an interactive prompt will be shown.
         #[arg(long = "domain")]
         domain: Option<String>,
+
+        /// Enable to include pinned_certchain_sha256 in the share link,
+        /// computed from the server's certificate file.
+        #[arg(long = "with-cert-sha256", default_value_t = false)]
+        with_cert_sha256: bool,
     },
 }
 
@@ -130,12 +136,31 @@ async fn main() -> anyhow::Result<()> {
             socks_port,
             interface,
             domain,
+            with_cert_sha256,
         } => {
             let config = Config::from_file(&config)?;
 
             // If no output flag is given, default to interactive share-link mode.
             let default_mode = !do_link && !qrcode && qrcode_png.is_none() && !json_server && !json_client;
             let do_link = do_link || default_mode;
+
+            // Compute certificate SHA256 if requested
+            let cert_sha256_override = if with_cert_sha256 {
+                if config.certificate.is_empty() {
+                    eprintln!("Warning: --with-cert-sha256 specified but no certificate path in config");
+                    None
+                } else {
+                    match compute_cert_sha256(&config.certificate) {
+                        Ok(hash) => Some(hash),
+                        Err(e) => {
+                            eprintln!("Warning: failed to compute certificate SHA256: {}", e);
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
 
             if do_link || qrcode || qrcode_png.is_some() {
                 // Step 1: Resolve hosts (from --interface or interactive multi-selection)
@@ -150,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
                         &config,
                         Some(host.as_str()),
                         sni_override.as_deref(),
+                        cert_sha256_override.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!("Failed to generate share link: {}", e))?;
 
@@ -367,4 +393,33 @@ fn interactive_select_domain(domains: &[String]) -> anyhow::Result<String> {
         .interact()?;
 
     Ok(domains[selection].clone())
+}
+
+// ── Certificate SHA256 Computation ──
+
+/// Read a PEM certificate file and compute the SHA256 hash of its DER content.
+///
+/// Returns the hash as a 64-character lowercase hex string suitable for use
+/// as `pinned_certchain_sha256` in a share link.
+fn compute_cert_sha256(cert_path: &str) -> anyhow::Result<String> {
+    use std::fs;
+    use std::io::Read;
+
+    let mut pem_data = Vec::new();
+    fs::File::open(cert_path)?.read_to_end(&mut pem_data)?;
+
+    let mut pem_reader = std::io::BufReader::new(pem_data.as_slice());
+    let item = rustls_pemfile::read_one(&mut pem_reader)?
+        .ok_or_else(|| anyhow::anyhow!("No PEM data found in {}", cert_path))?;
+
+    let cert_der = match item {
+        rustls_pemfile::Item::X509Certificate(der) => der,
+        _ => anyhow::bail!("Expected X509 certificate in {}", cert_path),
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(&cert_der);
+    let hash = hasher.finalize();
+
+    Ok(hex::encode(hash))
 }

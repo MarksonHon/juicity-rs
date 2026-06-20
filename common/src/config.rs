@@ -5,8 +5,8 @@ use std::collections::HashMap;
 ///
 /// # Field grouping
 /// - **Client fields**: server, uuid, password, sni, allow_insecure,
-///   pinned_certchain_sha256, protect_path, forward
-/// - **Server fields**: users, certificate, private_key, fwmark,
+///   pinned_certchain_sha256, protect_path, forward, fwmark
+/// - **Server fields**: users, certificate, private_key,
 ///   send_through, dialer_link, disable_outbound_udp443
 /// - **Common fields**: listen, congestion_control, log_level
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,12 +22,14 @@ pub struct Config {
     /// Path to the protect_path socket (compatible with Go version)
     pub protect_path: String,
     pub forward: HashMap<String, String>,
+    /// fwmark (Linux only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fwmark: Option<u32>,
 
     // ── Server fields ──
     pub users: HashMap<String, String>,
     pub certificate: String,
     pub private_key: String,
-    pub fwmark: String,
     pub send_through: String,
     pub dialer_link: String,
     pub disable_outbound_udp443: bool,
@@ -49,10 +51,10 @@ impl Default for Config {
             pinned_certchain_sha256: String::new(),
             protect_path: String::new(),
             forward: HashMap::new(),
+            fwmark: None,
             users: HashMap::new(),
             certificate: String::new(),
             private_key: String::new(),
-            fwmark: String::new(),
             send_through: String::new(),
             dialer_link: String::new(),
             disable_outbound_udp443: false,
@@ -139,8 +141,8 @@ impl Config {
         map.insert("private_key".into(), serde_json::Value::String(self.private_key.clone()));
         map.insert("congestion_control".into(), serde_json::Value::String(self.congestion_control.clone()));
         map.insert("log_level".into(), serde_json::Value::String(self.log_level.clone()));
-        if !self.fwmark.is_empty() {
-            map.insert("fwmark".into(), serde_json::Value::String(self.fwmark.clone()));
+        if let Some(fwmark) = self.fwmark {
+            map.insert("fwmark".into(), serde_json::Value::Number(fwmark.into()));
         }
         if !self.send_through.is_empty() {
             map.insert("send_through".into(), serde_json::Value::String(self.send_through.clone()));
@@ -177,6 +179,9 @@ impl Config {
         if !self.forward.is_empty() {
             map.insert("forward".into(), serde_json::to_value(&self.forward)?);
         }
+        if let Some(fwmark) = self.fwmark {
+            map.insert("fwmark".into(), serde_json::Value::Number(fwmark.into()));
+        }
         map.insert("log_level".into(), serde_json::Value::String(self.log_level.clone()));
         Ok(serde_json::to_string_pretty(&serde_json::Value::Object(map))?)
     }
@@ -208,6 +213,9 @@ impl Config {
         }
         map.insert("congestion_control".into(), serde_json::Value::String(self.congestion_control.clone()));
         map.insert("listen".into(), serde_json::Value::String(format!("0.0.0.0:{}", socks_port)));
+        if let Some(fwmark) = self.fwmark {
+            map.insert("fwmark".into(), serde_json::Value::Number(fwmark.into()));
+        }
         map.insert("log_level".into(), serde_json::Value::String(self.log_level.clone()));
         Ok(serde_json::to_string_pretty(&serde_json::Value::Object(map))?)
     }

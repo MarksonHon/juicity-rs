@@ -34,6 +34,10 @@ enum Commands {
         /// Log level
         #[arg(long = "log-level", default_value = "info")]
         log_level: String,
+
+        /// Set fwmark on the client socket (Linux only)
+        #[arg(long)]
+        fwmark: Option<u32>,
     },
 
     /// Export share link, QR code, or JSON config
@@ -84,7 +88,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match command {
-        Commands::Run { config, log_level } => {
+        Commands::Run {
+            config,
+            log_level,
+            fwmark,
+        } => {
             tracing_subscriber::fmt()
                 .with_env_filter(
                     EnvFilter::try_from_default_env()
@@ -92,7 +100,10 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .init();
 
-            let config = Config::from_file(&config)?;
+            let mut config = Config::from_file(&config)?;
+            if let Some(fwmark) = fwmark {
+                config.fwmark = Some(fwmark);
+            }
             config.validate_for_client()?;
 
             tracing::info!("Juicity client starting...");
@@ -130,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::from_file(&config)?;
 
             if do_link || qrcode || qrcode_png.is_some() {
-                let share_link = link::generate_share_link(&config, None, None)
+                let share_link = link::generate_share_link(&config, None, None, None)
                     .map_err(|e| anyhow::anyhow!("Failed to generate share link: {}", e))?;
 
                 if do_link {
