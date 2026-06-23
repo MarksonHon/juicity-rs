@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
@@ -14,7 +15,9 @@ pub struct UdpEndpointOptions {
 /// A UDP endpoint representing a full-cone NAT session
 pub struct UdpEndpoint {
     pub socket: std::net::UdpSocket,
-    pub dial_target: String,
+    /// Stored as `Arc<str>` so that cloning on the fast path is just a
+    /// refcount increment — no heap allocation per packet.
+    pub dial_target: Arc<str>,
     last_used: Instant,
     nat_timeout: Duration,
 }
@@ -32,7 +35,7 @@ impl UdpEndpoint {
 
         Ok(Self {
             socket,
-            dial_target: options.dial_target,
+            dial_target: Arc::from(options.dial_target.as_str()),
             last_used: Instant::now(),
             nat_timeout: options.nat_timeout,
         })
@@ -63,11 +66,31 @@ impl UdpEndpointPool {
         }
     }
 
+    /// Fast path: grab the socket of an existing (non-expired) endpoint.
+    /// Returns `None` if no valid entry exists, `Some(())` if it exists.
+    ///
+    /// This avoids any String/Arc<str> cloning — the caller already has the
+    /// target address from the UnderlaySession and can use it for `send_to`.
+    /// Only the socket `try_clone()` syscall is performed.
+    pub async fn get_socket(&self, addr: &SocketAddr) -> Option<std::net::UdpSocket> {
+        let mut inner = self.inner.lock().await;
+        let endpoint = inner.get_mut(addr)?;
+        if endpoint.is_expired() {
+            return None;
+        }
+        endpoint.touch();
+        endpoint.socket.try_clone().ok()
+    }
+
+    /// Get or create a UDP endpoint for the given address.
+    ///
+    /// Returns `(socket, dial_target, is_new)` where `dial_target` is an
+    /// `Arc<str>` (cloning it is just a refcount increment).
     pub async fn get_or_create(
         &self,
         addr: SocketAddr,
         options: UdpEndpointOptions,
-    ) -> anyhow::Result<((std::net::UdpSocket, String), bool)> {
+    ) -> anyhow::Result<((std::net::UdpSocket, Arc<str>), bool)> {
         // Fast path: check if already exists without acquiring the create lock.
         {
             let mut inner = self.inner.lock().await;

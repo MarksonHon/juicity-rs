@@ -90,8 +90,8 @@ pub const NETWORK_UDP: u8 = 3;
 // the actual Go code uses trojanc.MetadataTypeToByte which maps IPv4→1,
 // Domain→3, IPv6→4.  All proxy headers and UDP datagrams use this encoding.
 // ============================================================
-pub const ADDR_TYPE_IPV4: u8 = 1;   // trojanc MetadataTypeIPv4
-pub const ADDR_TYPE_IPV6: u8 = 4;   // trojanc MetadataTypeIPv6
+pub const ADDR_TYPE_IPV4: u8 = 1; // trojanc MetadataTypeIPv4
+pub const ADDR_TYPE_IPV6: u8 = 4; // trojanc MetadataTypeIPv6
 pub const ADDR_TYPE_DOMAIN: u8 = 3; // trojanc MetadataTypeDomain
 pub const ADDR_TYPE_NONE: u8 = 255; // unused in trojanc; kept for internal use
 
@@ -484,23 +484,22 @@ pub fn gen_token_via_connection(
 ///
 /// This is the zero-allocation variant for hot paths (e.g. per-packet UDP relay).
 /// The caller is responsible for clearing the buffer if needed.
-pub fn build_trojanc_addr_cached(
-    buf: &mut Vec<u8>,
-    cached: &CachedAddr,
-) -> anyhow::Result<()> {
+pub fn build_trojanc_addr_cached(buf: &mut Vec<u8>, cached: &CachedAddr) -> anyhow::Result<()> {
     buf.push(cached.addr_type.to_wire_byte());
 
     match cached.addr_type {
         AddrType::V4 => {
-            let ip: std::net::Ipv4Addr = cached.host.parse().map_err(|e| {
-                anyhow::anyhow!("invalid IPv4 address '{}': {}", cached.host, e)
-            })?;
+            let ip: std::net::Ipv4Addr = cached
+                .host
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid IPv4 address '{}': {}", cached.host, e))?;
             buf.extend_from_slice(&ip.octets());
         }
         AddrType::V6 => {
-            let ip: std::net::Ipv6Addr = cached.host.parse().map_err(|e| {
-                anyhow::anyhow!("invalid IPv6 address '{}': {}", cached.host, e)
-            })?;
+            let ip: std::net::Ipv6Addr = cached
+                .host
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid IPv6 address '{}': {}", cached.host, e))?;
             buf.extend_from_slice(&ip.octets());
         }
         AddrType::Domain => {
@@ -566,4 +565,52 @@ pub async fn read_trojanc_addr_async<R: tokio::io::AsyncReadExt + Unpin>(
     let mut port_buf = [0u8; 2];
     reader.read_exact(&mut port_buf).await?;
     Ok((addr, u16::from_be_bytes(port_buf)))
+}
+
+/// Read a trojanc-format address header into a caller-provided `&mut String
+/// buffer, avoiding a per-call heap allocation for the hostname string.
+///
+/// Wire format: [addr_type][addr][port]
+/// Returns the port; the hostname is written into `host` (cleared first).
+pub async fn read_trojanc_addr_into_async<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+    host: &mut String,
+) -> anyhow::Result<u16> {
+    let mut addr_type_buf = [0u8; 1];
+    reader.read_exact(&mut addr_type_buf).await?;
+    let addr_type = addr_type_buf[0];
+
+    match addr_type {
+        ADDR_TYPE_IPV4 => {
+            let mut ip = [0u8; 4];
+            reader.read_exact(&mut ip).await?;
+            host.clear();
+            use std::fmt::Write;
+            write!(host, "{}", std::net::Ipv4Addr::from(ip))
+                .map_err(|_| anyhow::anyhow!("fmt write failed"))?;
+        }
+        ADDR_TYPE_IPV6 => {
+            let mut ip = [0u8; 16];
+            reader.read_exact(&mut ip).await?;
+            host.clear();
+            use std::fmt::Write;
+            write!(host, "{}", std::net::Ipv6Addr::from(ip))
+                .map_err(|_| anyhow::anyhow!("fmt write failed"))?;
+        }
+        ADDR_TYPE_DOMAIN => {
+            let mut len_buf = [0u8; 1];
+            reader.read_exact(&mut len_buf).await?;
+            let len = len_buf[0] as usize;
+            anyhow::ensure!(len > 0, "trojanc domain length is zero");
+            let mut domain = vec![0u8; len];
+            reader.read_exact(&mut domain).await?;
+            host.clear();
+            host.push_str(&String::from_utf8_lossy(&domain));
+        }
+        other => anyhow::bail!("unknown trojanc address type: {}", other),
+    };
+
+    let mut port_buf = [0u8; 2];
+    reader.read_exact(&mut port_buf).await?;
+    Ok(u16::from_be_bytes(port_buf))
 }

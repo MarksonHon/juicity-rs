@@ -97,9 +97,8 @@ impl JuicityServer {
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
             consts::MAX_OPEN_INCOMING_STREAMS as u32,
         ));
-        transport_config.max_concurrent_uni_streams(VarInt::from_u32(
-            consts::MAX_OPEN_INCOMING_STREAMS as u32,
-        ));
+        transport_config
+            .max_concurrent_uni_streams(VarInt::from_u32(consts::MAX_OPEN_INCOMING_STREAMS as u32));
         // Set an explicit idle timeout for defense-in-depth.
         // Even with keep-alive enabled, if the peer stops responding or never opens
         // a stream after authentication, this timeout ensures the connection and its
@@ -108,12 +107,9 @@ impl JuicityServer {
             quinn::IdleTimeout::try_from(consts::MAX_QUIC_IDLE_TIMEOUT)
                 .map_err(|e| anyhow::anyhow!("invalid idle timeout: {:?}", e))?,
         ));
-        transport_config.stream_receive_window(VarInt::from_u32(
-            consts::QUIC_STREAM_RECEIVE_WINDOW,
-        ));
-        transport_config.receive_window(VarInt::from_u32(
-            consts::QUIC_CONNECTION_RECEIVE_WINDOW,
-        ));
+        transport_config
+            .stream_receive_window(VarInt::from_u32(consts::QUIC_STREAM_RECEIVE_WINDOW));
+        transport_config.receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW));
         transport_config.send_window(consts::QUIC_SEND_WINDOW);
 
         // Dynamically adjust window size based on initial_rtt
@@ -123,27 +119,24 @@ impl JuicityServer {
                 transport_config.stream_receive_window(VarInt::from_u32(
                     consts::QUIC_STREAM_RECEIVE_WINDOW / 2,
                 ));
-                transport_config.receive_window(VarInt::from_u32(
-                    consts::QUIC_CONNECTION_RECEIVE_WINDOW / 2,
-                ));
+                transport_config
+                    .receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW / 2));
             } else if rtt_ms > 200 {
                 // High latency: increase window to improve throughput
                 transport_config.stream_receive_window(VarInt::from_u32(
                     consts::QUIC_STREAM_RECEIVE_WINDOW * 2,
                 ));
-                transport_config.receive_window(VarInt::from_u32(
-                    consts::QUIC_CONNECTION_RECEIVE_WINDOW * 2,
-                ));
+                transport_config
+                    .receive_window(VarInt::from_u32(consts::QUIC_CONNECTION_RECEIVE_WINDOW * 2));
             }
         }
 
         match config.congestion_control.to_lowercase().as_str() {
-            "cubic" => transport_config.congestion_controller_factory(
-                Arc::new(quinn::congestion::CubicConfig::default()),
-            ),
-            "newreno" | "new_reno" => transport_config.congestion_controller_factory(
-                Arc::new(quinn::congestion::NewRenoConfig::default()),
-            ),
+            "cubic" => transport_config
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+            "newreno" | "new_reno" => transport_config.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            )),
             _ => {
                 // Tune BBR parameters: set a reasonable initial window to balance latency and throughput
                 let mut bbr_config = quinn::congestion::BbrConfig::default();
@@ -173,7 +166,9 @@ impl JuicityServer {
                     .map(std::time::Duration::from_millis)
                     .unwrap_or(consts::IN_FLIGHT_UNDERLAY_EVICT_TIMEOUT),
             )),
-            udp_endpoint_pool: Arc::new(crate::udp::UdpEndpointPool::new(consts::MAX_UDP_ENDPOINTS)),
+            udp_endpoint_pool: Arc::new(crate::udp::UdpEndpointPool::new(
+                consts::MAX_UDP_ENDPOINTS,
+            )),
             disable_outbound_udp443: config.disable_outbound_udp443,
         })
     }
@@ -214,9 +209,8 @@ impl JuicityServer {
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for quinn"))?;
         let wrapped_socket = runtime.wrap_udp_socket(udp_socket)?;
 
-        let (underlay_tx, underlay_rx) = tokio::sync::mpsc::channel(
-            crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY,
-        );
+        let (underlay_tx, underlay_rx) =
+            tokio::sync::mpsc::channel(crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY);
         let demux_socket = Arc::new(crate::underlay_socket::DemuxUdpSocket::new(
             wrapped_socket,
             underlay_tx,
@@ -436,19 +430,32 @@ async fn handle_non_quic_underlay_packet(
             return Ok(());
         }
 
-        // Get or create the UDP endpoint and forward the decrypted payload.
-        let ((udp_socket, dial_target), _is_new) = udp_pool
-            .get_or_create(
-                source,
-                crate::udp::UdpEndpointOptions {
-                    nat_timeout: consts::DEFAULT_NAT_TIMEOUT,
-                    dial_target: existing.target.clone(),
-                },
-            )
-            .await?;
+        // Fast path: try to get the pool socket without cloning dial_target.
+        // We already have `existing.target`, so we use it directly for send_to
+        // instead of passing it through UdpEndpointOptions (which would clone it)
+        // and getting it back from get_or_create (which would clone it again).
+        let udp_socket = match udp_pool.get_socket(&source).await {
+            Some(socket) => socket,
+            None => {
+                // Pool endpoint expired — create a new one (rare).
+                let ((s, _), _) = udp_pool
+                    .get_or_create(
+                        source,
+                        crate::udp::UdpEndpointOptions {
+                            nat_timeout: consts::DEFAULT_NAT_TIMEOUT,
+                            dial_target: existing.target.clone(),
+                        },
+                    )
+                    .await?;
+                s
+            }
+        };
 
         let send_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
-        if let Err(e) = send_socket.send_to(&payload[juicity_underlay::SALT_LEN..], &dial_target).await {
+        if let Err(e) = send_socket
+            .send_to(&payload[juicity_underlay::SALT_LEN..], &existing.target)
+            .await
+        {
             udp_pool.remove(&source).await;
             // Remove the session; the relay task will be aborted by cleanup.
             let removed = sessions.lock().unwrap().pop(&source);
@@ -457,7 +464,11 @@ async fn handle_non_quic_underlay_packet(
                     h.abort();
                 }
             }
-            return Err(anyhow::anyhow!("underlay send_to {} failed: {:?}", dial_target, e));
+            return Err(anyhow::anyhow!(
+                "underlay send_to {} failed: {:?}",
+                existing.target,
+                e
+            ));
         }
         return Ok(());
     }
@@ -625,9 +636,10 @@ async fn handle_non_quic_underlay_packet(
         // so we can retrieve both the key (for udp_pool.remove()) and the abort handle.
         let evicted = if guard.len() >= consts::MAX_UNDERLAY_SESSIONS {
             // peek_lru() returns the least recently used entry without promoting it
-            guard.peek_lru().map(|(addr, _)| *addr).and_then(|addr| {
-                guard.pop(&addr).map(|s| (addr, s.relay_abort))
-            })
+            guard
+                .peek_lru()
+                .map(|(addr, _)| *addr)
+                .and_then(|addr| guard.pop(&addr).map(|s| (addr, s.relay_abort)))
         } else {
             None
         };
@@ -645,7 +657,10 @@ async fn handle_non_quic_underlay_packet(
 
     // Send first packet immediately — relay task is already running.
     // Plaintext is at &payload[SALT_LEN..] (salt prefix kept in place).
-    if let Err(e) = send_socket.send_to(&payload[juicity_underlay::SALT_LEN..], &dial_target).await {
+    if let Err(e) = send_socket
+        .send_to(&payload[juicity_underlay::SALT_LEN..], &*dial_target)
+        .await
+    {
         udp_pool.remove(&source).await;
         let removed = sessions.lock().unwrap().pop(&source);
         if let Some(s) = removed {
@@ -653,7 +668,11 @@ async fn handle_non_quic_underlay_packet(
                 h.abort();
             }
         }
-        return Err(anyhow::anyhow!("underlay send_to {} failed: {:?}", dial_target, e));
+        return Err(anyhow::anyhow!(
+            "underlay send_to {} failed: {:?}",
+            dial_target,
+            e
+        ));
     }
 
     Ok(())
@@ -708,11 +727,7 @@ async fn handle_connection(
                     in_flight_for_auth.store(auth.iv, auth);
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "Underlay auth stream closed for {}: {:?}",
-                        user_uuid,
-                        e
-                    );
+                    tracing::debug!("Underlay auth stream closed for {}: {:?}", user_uuid, e);
                     break;
                 }
             }
@@ -771,10 +786,7 @@ async fn handle_connection(
                     remote_addr,
                     STREAM_ACCEPT_TIMEOUT.as_secs()
                 );
-                connection.close(
-                    VarInt::from_u32(0xfffffff3),
-                    b"stream accept timeout",
-                );
+                connection.close(VarInt::from_u32(0xfffffff3), b"stream accept timeout");
                 break;
             }
         }
@@ -925,10 +937,15 @@ async fn handle_udp_relay(
         tokio::spawn(async move {
             // Reuse a single buffer across all datagrams to avoid per-packet allocation.
             let mut payload = Vec::with_capacity(consts::ETHERNET_MTU);
+            // Reusable string buffer for per-datagram address — avoids a String
+            // heap allocation on every UDP datagram in the hot loop.
+            let mut t_addr_buf = String::with_capacity(64);
             loop {
                 // Each subsequent datagram: [trojanc_addr][len(2)][payload]
-                let (t_addr, t_port) =
-                    match protocol::read_trojanc_addr_async(&mut recv_stream).await {
+                let t_port =
+                    match protocol::read_trojanc_addr_into_async(&mut recv_stream, &mut t_addr_buf)
+                        .await
+                    {
                         Ok(v) => v,
                         Err(_) => break,
                     };
@@ -943,14 +960,14 @@ async fn handle_udp_relay(
                     break;
                 }
 
-                let target =
-                    match resolve_udp_target(&t_addr, t_port, &mut domain_ip_map).await {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            tracing::debug!("UDP target resolve error: {:?}", e);
-                            break;
-                        }
-                    };
+                let target = match resolve_udp_target(&t_addr_buf, t_port, &mut domain_ip_map).await
+                {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        tracing::debug!("UDP target resolve error: {:?}", e);
+                        break;
+                    }
+                };
                 if let Err(e) = remote.send_to(&payload, target).await {
                     tracing::debug!("UDP relay write error: {:?}", e);
                     break;
@@ -975,9 +992,8 @@ async fn handle_udp_relay(
                         // Cache the address on first packet to avoid re-parsing
                         // the address type (string → IPv4/IPv6/Domain) on every
                         // subsequent datagram in this session.
-                        let cached = cached_addr.get_or_insert_with(|| {
-                            protocol::CachedAddr::from_socket_addr(addr)
-                        });
+                        let cached = cached_addr
+                            .get_or_insert_with(|| protocol::CachedAddr::from_socket_addr(addr));
                         // Build header directly into the reusable frame buffer,
                         // eliminating the intermediate Vec allocation.
                         let pkt_len = (n as u16).to_be_bytes();
@@ -1027,7 +1043,7 @@ async fn resolve_udp_target(
             return Ok(*mapped);
         }
         // TTL expired, remove the stale entry
-        domain_ip_map.shift_remove(&key);
+        domain_ip_map.swap_remove(&key);
     }
 
     let mut addrs = tokio::net::lookup_host((host, port)).await?;
@@ -1039,7 +1055,7 @@ async fn resolve_udp_target(
     // recently-used entries and avoids unnecessary DNS re-resolutions.
     if domain_ip_map.len() >= consts::MAX_UDP_DNS_CACHE {
         if let Some(oldest_key) = domain_ip_map.keys().next().cloned() {
-            domain_ip_map.shift_remove(&oldest_key);
+            domain_ip_map.swap_remove(&oldest_key);
         }
     }
     domain_ip_map.insert(key, (resolved, Instant::now()));
