@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
+use dashmap::DashMap;
 use indexmap::IndexMap;
-use lru::LruCache;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +26,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct UnderlaySession {
-    target: String,
+    target: Arc<str>,
     cipher: Arc<UnderlayCipher>,
     /// Last time a packet was handled for this session (updated under the sessions lock).
     last_used: std::time::Instant,
@@ -36,6 +35,29 @@ struct UnderlaySession {
 }
 
 /// Juicity proxy server
+/// Create a UDP socket with SO_REUSEPORT enabled, optionally in dual-stack mode.
+///
+/// When `dual_stack` is true, an IPv6 socket is created with `IPV6_V6ONLY=false`
+/// so it accepts both IPv4 and IPv6 traffic on the same port.
+fn create_reuseport_socket(
+    addr: &SocketAddr,
+    dual_stack: bool,
+) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if dual_stack || addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_port(true)?;
+    if dual_stack {
+        sock.set_only_v6(false)?;
+    }
+    sock.bind(&(*addr).into())?;
+    Ok(std::net::UdpSocket::from(sock))
+}
+
 pub struct JuicityServer {
     users: Arc<HashMap<Uuid, String>>,
     server_config: quinn::ServerConfig,
@@ -187,43 +209,56 @@ impl JuicityServer {
             (sa, addr.to_string(), false)
         };
 
-        // Build the raw UDP socket.  For dual-stack we use socket2 to clear
-        // IPV6_V6ONLY before bind, which is necessary on Windows (Linux already
-        // defaults to dual-stack but being explicit is safer).
-        let udp_socket: std::net::UdpSocket = if dual_stack {
-            use socket2::{Domain, Protocol, Socket, Type};
-            let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-            sock.set_only_v6(false)?;
-            sock.bind(&socket_addr.into())?;
-            std::net::UdpSocket::from(sock)
-        } else {
-            let tokio_udp = tokio::net::UdpSocket::bind(socket_addr).await?;
-            tokio_udp.into_std()?
-        };
-        udp_socket.set_nonblocking(true)?;
-        let sidecar_socket = udp_socket.try_clone()?;
-        sidecar_socket.set_nonblocking(true)?;
-        let server_underlay_socket = Arc::new(tokio::net::UdpSocket::from_std(sidecar_socket)?);
+        // Determine how many sockets to create: one per CPU core for
+        // kernel-level load distribution via SO_REUSEPORT.
+        let num_sockets = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        // Shared underlay channel — multi-producer (one per socket) single-consumer.
+        let (underlay_tx, underlay_rx) =
+            tokio::sync::mpsc::channel(crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY);
 
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for quinn"))?;
-        let wrapped_socket = runtime.wrap_udp_socket(udp_socket)?;
 
-        let (underlay_tx, underlay_rx) =
-            tokio::sync::mpsc::channel(crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY);
-        let demux_socket = Arc::new(crate::underlay_socket::DemuxUdpSocket::new(
-            wrapped_socket,
-            underlay_tx,
-        ));
+        // Create N sockets, each with its own DemuxUdpSocket/Endpoint.
+        let mut first_sidecar: Option<Arc<tokio::net::UdpSocket>> = None;
+        let mut endpoints: Vec<quinn::Endpoint> = Vec::with_capacity(num_sockets);
 
-        let endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            Some(self.server_config.clone()),
-            demux_socket,
-            runtime,
-        )?;
+        for i in 0..num_sockets {
+            let socket = create_reuseport_socket(&socket_addr, dual_stack)?;
+            socket.set_nonblocking(true)?;
+            let sidecar = socket.try_clone()?;
+            sidecar.set_nonblocking(true)?;
 
-        tracing::info!("Juicity server listening on {}", log_addr);
+            // Keep the first sidecar for the underlay relay-back loop.
+            if i == 0 {
+                first_sidecar = Some(Arc::new(tokio::net::UdpSocket::from_std(sidecar)?));
+            }
+
+            let wrapped = runtime.wrap_udp_socket(socket)?;
+            let demux = Arc::new(crate::underlay_socket::DemuxUdpSocket::new(
+                wrapped,
+                underlay_tx.clone(),
+            ));
+            let endpoint = Endpoint::new_with_abstract_socket(
+                EndpointConfig::default(),
+                Some(self.server_config.clone()),
+                demux,
+                runtime.clone(),
+            )?;
+            endpoints.push(endpoint);
+        }
+
+        let server_underlay_socket =
+            first_sidecar.ok_or_else(|| anyhow::anyhow!("no sockets created"))?;
+
+        tracing::info!(
+            "Juicity server listening on {} ({} reuseport sockets)",
+            log_addr,
+            num_sockets,
+        );
 
         // Spawn periodic cleanup task for in-flight underlay keys.
         // AbortOnDrop ensures the task is cancelled when serve() returns.
@@ -257,7 +292,7 @@ impl JuicityServer {
         let underlay_udp_pool = self.udp_endpoint_pool.clone();
         let underlay_disable_443 = self.disable_outbound_udp443;
         let underlay_socket = server_underlay_socket.clone();
-        // The underlay loop self-terminates when underlay_rx closes (endpoint drop),
+        // The underlay loop self-terminates when underlay_rx closes (all endpoints dropped),
         // but AbortOnDrop ensures it is also cancelled on any early serve() exit.
         let _underlay_guard = AbortOnDrop(
             tokio::spawn(async move {
@@ -273,7 +308,9 @@ impl JuicityServer {
             .abort_handle(),
         );
 
-        while let Some(incoming) = endpoint.accept().await {
+        // Spawn one accept loop per endpoint so the kernel distributes
+        // incoming packets across cores via SO_REUSEPORT.
+        for endpoint in endpoints {
             let users = self.users.clone();
             let in_flight = self.in_flight.clone();
             let udp_pool = self.udp_endpoint_pool.clone();
@@ -281,14 +318,35 @@ impl JuicityServer {
             let disable_443 = self.disable_outbound_udp443;
 
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_connection(incoming, users, in_flight, udp_pool, dialer, disable_443)
+                while let Some(incoming) = endpoint.accept().await {
+                    let users = users.clone();
+                    let in_flight = in_flight.clone();
+                    let udp_pool = udp_pool.clone();
+                    let dialer = dialer.clone();
+                    let disable_443 = disable_443;
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(
+                            incoming,
+                            users,
+                            in_flight,
+                            udp_pool,
+                            dialer,
+                            disable_443,
+                        )
                         .await
-                {
-                    tracing::warn!("Connection handler error: {:?}", e);
+                        {
+                            tracing::warn!("Connection handler error: {:?}", e);
+                        }
+                    });
                 }
             });
         }
+
+        // Block forever — accept loops run as spawned tasks.
+        // The AbortOnDrop guards ensure cleanup when the caller drops this future.
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
         Ok(())
     }
 }
@@ -302,8 +360,8 @@ impl JuicityServer {
 /// [`tokio::sync::Semaphore`], and spawns individual handler tasks via
 /// [`handle_non_quic_underlay_packet`].
 ///
-/// It also manages the underlay session map (an
-/// [`std::sync::Mutex`]-protected LRU cache of [`UnderlaySession`]) and
+/// It also manages the underlay session map (a
+/// [`DashMap`]-backed cache of [`UnderlaySession`]) and
 /// spawns a periodic cleanup subtask that evicts idle sessions.
 ///
 /// # Arguments
@@ -329,22 +387,16 @@ async fn run_underlay_packet_loop(
     server_socket: Arc<tokio::net::UdpSocket>,
     disable_udp_443: bool,
 ) {
-    // ══ std::sync::Mutex usage note ════════════════════════════════════════
-    // We intentionally use std::sync::Mutex (not tokio::sync::Mutex) for the
-    // sessions HashMap.  All critical sections are extremely short (HashMap
-    // insert/remove/get, ~ns level) and no .await point is held while the
-    // lock is acquired.  Using tokio::sync::Mutex would add unnecessary
-    // overhead for these micro-operations.
-    //
-    // The only caveat: on a multi-threaded tokio runtime, if the thread
-    // holding this lock is preempted by the OS scheduler, it may briefly
-    // block other worker threads.  Given the microsecond-scale hold times,
-    // this is negligible in practice.
-    let sessions: Arc<std::sync::Mutex<LruCache<SocketAddr, UnderlaySession>>> =
-        Arc::new(std::sync::Mutex::new(LruCache::new(
-            NonZeroUsize::new(consts::MAX_UNDERLAY_SESSIONS)
-                .expect("MAX_UNDERLAY_SESSIONS must be > 0; verify in common/src/consts.rs"),
-        )));
+    // ══ DashMap usage note ═══════════════════════════════════════════════
+    // DashMap provides shard-level locking: different SocketAddr keys hash to
+    // different shards, so concurrent access to distinct sessions does not
+    // contend.  Under high packet rates, this eliminates the single-Mutex
+    // bottleneck.  LRU eviction is handled manually (DashMap has no built-in
+    // LRU), using a linear scan for the oldest last_used entry when the map
+    // reaches capacity — acceptable because eviction is rare and MAX_UNDERLAY_
+    // SESSIONS is moderate (5 000).
+    let sessions: Arc<DashMap<SocketAddr, UnderlaySession>> =
+        Arc::new(DashMap::with_capacity(consts::MAX_UNDERLAY_SESSIONS));
 
     // Periodic cleanup: remove sessions that have been idle for longer than the NAT
     // timeout and abort their relay-back tasks so they don't run indefinitely.
@@ -358,23 +410,19 @@ async fn run_underlay_packet_loop(
                 // Collect abort handles while holding the lock, then abort them
                 // after releasing it, so abort() is not called under the mutex.
                 let to_abort: Vec<tokio::task::AbortHandle> = {
-                    let mut guard = sessions_cleanup
-                        .lock()
-                        .expect("cleanup: underlay sessions mutex poisoned; this indicates a bug");
                     let mut handles = Vec::new();
-                    // Collect expired keys first (LruCache does not have retain())
-                    let expired: Vec<SocketAddr> = guard
-                        .iter()
-                        .filter(|(_, s)| s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT)
-                        .map(|(addr, _)| *addr)
-                        .collect();
-                    for addr in expired {
-                        if let Some(s) = guard.pop(&addr) {
-                            if let Some(h) = s.relay_abort {
+                    // DashMap::retain locks each shard sequentially and passes
+                    // &mut V to the closure, which is safe to capture &mut handles.
+                    sessions_cleanup.retain(|_, s| {
+                        if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
+                            if let Some(h) = s.relay_abort.take() {
                                 handles.push(h);
                             }
+                            false
+                        } else {
+                            true
                         }
-                    }
+                    });
                     handles
                 };
                 for h in to_abort {
@@ -445,8 +493,7 @@ async fn run_underlay_packet_loop(
 /// * `in_flight` - The shared in-flight auth table used to match salts to
 ///   authenticated underlay sessions.
 /// * `udp_pool` - The shared UDP endpoint pool for full-cone NAT.
-/// * `sessions` - The shared LRU cache of active [`UnderlaySession`]s,
-///   protected by [`std::sync::Mutex`].
+/// * `sessions` - The shared [`DashMap`] of active [`UnderlaySession`]s.
 /// * `server_socket` - The server's main UDP socket, used for relay-back
 ///   traffic.
 /// * `disable_udp_443` - When `true`, outbound UDP to port 443 is blocked.
@@ -467,7 +514,7 @@ async fn handle_non_quic_underlay_packet(
     packet: crate::underlay_socket::UnderlayPacket,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_pool: Arc<crate::udp::UdpEndpointPool>,
-    sessions: Arc<std::sync::Mutex<LruCache<SocketAddr, UnderlaySession>>>,
+    sessions: Arc<DashMap<SocketAddr, UnderlaySession>>,
     server_socket: Arc<tokio::net::UdpSocket>,
     disable_udp_443: bool,
 ) -> anyhow::Result<()> {
@@ -480,30 +527,26 @@ async fn handle_non_quic_underlay_packet(
     let mut payload = packet.payload;
 
     let existing_session = {
-        let mut guard = sessions
-            .lock()
-            .expect("handle_non_quic: sessions mutex poisoned; no .await held under lock");
-        if let Some(s) = guard.get_mut(&source) {
-            // Check per-session expiry: if idle for too long, remove and fall
-            // through to the new-session path instead of using a stale session.
-            if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
-                // Remove the expired session; relay_abort will be handled by
-                // our SessionGuard or the periodic cleanup task.
-                guard.pop(&source);
-                None
-            } else {
-                s.last_used = std::time::Instant::now();
-                // Avoid cloning the full UnderlaySession struct (String target =
-                // heap allocation). Instead, extract only the fields we need:
-                // - cipher: Arc clone is just a refcount increment
-                // - target: String clone -> allocates on the heap
-                // The String clone is acceptable here since it occurs per-packet
-                // only for active sessions; the alternative (Arc<str>) would
-                // add an indirection on every access.
-                Some((s.cipher.clone(), s.target.clone()))
+        match sessions.get_mut(&source) {
+            Some(mut s) => {
+                // Check per-session expiry: if idle for too long, remove and fall
+                // through to the new-session path instead of using a stale session.
+                if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
+                    // Drop the RefMut before calling remove() to avoid deadlock
+                    // (both acquire a write-lock on the same shard).
+                    drop(s);
+                    sessions.remove(&source);
+                    None
+                } else {
+                    s.last_used = std::time::Instant::now();
+                    // Avoid cloning the full UnderlaySession struct. Extract only
+                    // the fields we need:
+                    // - cipher: Arc clone is just a refcount increment
+                    // - target: Arc<str> clone is just a refcount increment
+                    Some((s.cipher.clone(), s.target.clone()))
+                }
             }
-        } else {
-            None
+            None => None,
         }
     };
 
@@ -514,7 +557,7 @@ async fn handle_non_quic_underlay_packet(
             tracing::debug!(
                 "drop invalid underlay packet from {} for target {}: {:?}",
                 source,
-                target,
+                &**target,
                 e
             );
             return Ok(());
@@ -531,7 +574,7 @@ async fn handle_non_quic_underlay_packet(
                         source,
                         crate::udp::UdpEndpointOptions {
                             nat_timeout: consts::DEFAULT_NAT_TIMEOUT,
-                            dial_target: target.clone(),
+                            dial_target: String::from(target.as_ref()),
                         },
                     )
                     .await?;
@@ -541,23 +584,19 @@ async fn handle_non_quic_underlay_packet(
 
         let send_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
         if let Err(e) = send_socket
-            .send_to(&payload[juicity_underlay::SALT_LEN..], target)
+            .send_to(&payload[juicity_underlay::SALT_LEN..], &**target)
             .await
         {
             udp_pool.remove(&source);
             // Remove the session; the relay task will be aborted by cleanup.
-            let removed = sessions
-                .lock()
-                .expect("handle_non_quic: sessions mutex poisoned")
-                .pop(&source);
-            if let Some(s) = removed {
+            if let Some((_, s)) = sessions.remove(&source) {
                 if let Some(h) = s.relay_abort {
                     h.abort();
                 }
             }
             return Err(anyhow::anyhow!(
                 "underlay send_to {} failed: {:?}",
-                target,
+                &**target,
                 e
             ));
         }
@@ -650,15 +689,11 @@ async fn handle_non_quic_underlay_packet(
         // cleanup can also handle stale entries.
         struct SessionGuard {
             source: SocketAddr,
-            sessions: Arc<std::sync::Mutex<LruCache<SocketAddr, UnderlaySession>>>,
+            sessions: Arc<DashMap<SocketAddr, UnderlaySession>>,
         }
         impl Drop for SessionGuard {
             fn drop(&mut self) {
-                let mut guard = self
-                    .sessions
-                    .lock()
-                    .expect("SessionGuard::drop: sessions mutex poisoned");
-                guard.pop(&self.source);
+                self.sessions.remove(&self.source);
             }
         }
 
@@ -712,31 +747,27 @@ async fn handle_non_quic_underlay_packet(
     };
 
     let session = UnderlaySession {
-        target,
+        target: Arc::from(target.as_str()),
         cipher,
         last_used: std::time::Instant::now(),
         relay_abort,
     };
 
-    // Insert session atomically — LruCache auto-evicts the least recently used
-    // entry when at capacity (O(1) amortized). No manual scanning needed.
+    // Insert session — when at capacity, evict the least-recently-used entry.
+    // DashMap has no built-in LRU, so we scan for the oldest last_used.  The
+    // scan is O(n) but only runs on capacity-miss (rare), and MAX_UNDERLAY_
+    // SESSIONS (5 000) is small enough that the linear cost is negligible.
     let evicted_session: Option<(SocketAddr, Option<tokio::task::AbortHandle>)> = {
-        let mut guard = sessions
-            .lock()
-            .expect("handle_non_quic: sessions mutex poisoned");
-        // Check if eviction is needed and pop the LRU entry before inserting,
-        // so we can retrieve both the key (for udp_pool.remove()) and the abort handle.
-        let evicted = if guard.len() >= consts::MAX_UNDERLAY_SESSIONS {
-            // peek_lru() returns the least recently used entry without promoting it
-            guard
-                .peek_lru()
-                .map(|(addr, _)| *addr)
-                .and_then(|addr| guard.pop(&addr).map(|s| (addr, s.relay_abort)))
+        let evicted = if sessions.len() >= consts::MAX_UNDERLAY_SESSIONS {
+            sessions
+                .iter()
+                .min_by_key(|entry| entry.last_used)
+                .map(|entry| *entry.key())
+                .and_then(|addr| sessions.remove(&addr).map(|(_, s)| (addr, s.relay_abort)))
         } else {
             None
         };
-        // put() will not evict since we already made room if needed
-        guard.put(source, session.clone());
+        sessions.insert(source, session.clone());
         evicted
     };
     if let Some((oldest_addr, relay_abort)) = evicted_session {
@@ -745,7 +776,7 @@ async fn handle_non_quic_underlay_packet(
         }
         udp_pool.remove(&oldest_addr);
     }
-    tracing::debug!("new underlay session {} -> {}", source, session.target);
+    tracing::debug!("new underlay session {} -> {}", source, &*session.target);
 
     // Send first packet immediately — relay task is already running.
     // Plaintext is at &payload[SALT_LEN..] (salt prefix kept in place).
@@ -754,11 +785,7 @@ async fn handle_non_quic_underlay_packet(
         .await
     {
         udp_pool.remove(&source);
-        let removed = sessions
-            .lock()
-            .expect("handle_non_quic: sessions mutex poisoned")
-            .pop(&source);
-        if let Some(s) = removed {
+        if let Some((_, s)) = sessions.remove(&source) {
             if let Some(h) = s.relay_abort {
                 h.abort();
             }
@@ -825,6 +852,10 @@ async fn handle_connection(
         }
     };
 
+    // Shared DNS cache across all UDP relay streams within this QUIC connection.
+    let dns_cache: Arc<tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>> =
+        Arc::new(tokio::sync::Mutex::new(IndexMap::new()));
+
     // Keep reading underlay auth entries from the authenticated uni stream.
     // Store the abort handle so the task can be cancelled when the connection drops,
     // preventing the task (and its Arc references) from lingering indefinitely.
@@ -851,10 +882,10 @@ async fn handle_connection(
     // ── Stream acceptance with idle guard ──
     // If a client authenticates but never opens a bidirectional stream, accept_bi()
     // would block forever, leaking the auth task and Arc references.  We wrap it in
-    // a 120-second timeout so that even if the peer keeps the QUIC connection alive
+    // a 30-second timeout so that even if the peer keeps the QUIC connection alive
     // (e.g. via keep-alive PINGs) without opening streams, we eventually tear down
     // the connection and release its resources.
-    const STREAM_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    const STREAM_ACCEPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     loop {
         // Drain completed tasks each iteration to free their resources without blocking.
         while stream_tasks.try_join_next().is_some() {}
@@ -864,6 +895,7 @@ async fn handle_connection(
                 let s_dialer = dialer.clone();
                 let s_user_uuid = user_uuid;
                 let s_disable_443 = disable_udp_443;
+                let s_dns_cache = dns_cache.clone();
 
                 stream_tasks.spawn(async move {
                     if let Err(e) = handle_stream(
@@ -872,6 +904,7 @@ async fn handle_connection(
                         s_dialer,
                         s_user_uuid,
                         s_disable_443,
+                        s_dns_cache,
                     )
                     .await
                     {
@@ -894,10 +927,7 @@ async fn handle_connection(
             Err(_) => {
                 // No stream opened within the timeout window — close the connection
                 // to release auth task, Arc references, and QUIC connection memory.
-                tracing::info!(
-                    event = "stream_timeout",
-                    "Stream accept timeout"
-                );
+                tracing::info!(event = "stream_timeout", "Stream accept timeout");
                 connection.close(VarInt::from_u32(0xfffffff3), b"stream accept timeout");
                 break;
             }
@@ -960,6 +990,7 @@ async fn handle_stream(
     dialer: Arc<dyn crate::dialer::Dialer>,
     user_uuid: Uuid,
     disable_udp_443: bool,
+    dns_cache: Arc<tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>>,
 ) -> anyhow::Result<()> {
     // Read proxy header via async reader
     let (network, hostname, port) = protocol::read_proxy_header_async(&mut recv_stream).await?;
@@ -983,7 +1014,7 @@ async fn handle_stream(
                 event = "relay",
                 "UDP relay"
             );
-            handle_udp_relay(send_stream, recv_stream, dialer, disable_udp_443).await
+            handle_udp_relay(send_stream, recv_stream, dialer, disable_udp_443, dns_cache).await
         }
         _ => anyhow::bail!("unknown network type: {}", network),
     }
@@ -1045,9 +1076,8 @@ async fn handle_udp_relay(
     mut recv_stream: RecvStream,
     dialer: Arc<dyn crate::dialer::Dialer>,
     disable_udp_443: bool,
+    dns_cache: Arc<tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>>,
 ) -> anyhow::Result<()> {
-    let mut domain_ip_map: IndexMap<(String, u16), (SocketAddr, Instant)> = IndexMap::new();
-
     // First datagram: [trojanc_addr][len(2)][payload]
     let (first_host, first_port) = protocol::read_trojanc_addr_async(&mut recv_stream).await?;
 
@@ -1056,24 +1086,28 @@ async fn handle_udp_relay(
         return Ok(());
     }
 
-    let first_target_addr = resolve_udp_target(&first_host, first_port, &mut domain_ip_map).await?;
+    let first_target_addr = resolve_udp_target(&first_host, first_port, &dns_cache).await?;
     let remote = dialer.dial_udp(&first_target_addr.to_string()).await?;
     let remote = Arc::new(remote);
 
     let mut len_buf = [0u8; 2];
     recv_stream.read_exact(&mut len_buf).await?;
     let pkt_len = u16::from_be_bytes(len_buf) as usize;
-    let mut data = vec![0u8; pkt_len];
+    // Allocate once with ETHERNET_MTU capacity; the same buffer is reused
+    // for the first datagram here and then passed into quic_to_remote to
+    // serve as the per-packet buffer — eliminating an extra heap allocation.
+    let mut data = Vec::with_capacity(consts::ETHERNET_MTU);
+    data.resize(pkt_len, 0);
     recv_stream.read_exact(&mut data).await?;
     remote.send_to(&data, first_target_addr).await?;
 
     // Bidirectional relay
     let mut quic_to_remote = {
         let remote = remote.clone();
-        let mut domain_ip_map = domain_ip_map;
+        let dns_cache = dns_cache.clone();
         tokio::spawn(async move {
-            // Reuse a single buffer across all datagrams to avoid per-packet allocation.
-            let mut payload = Vec::with_capacity(consts::ETHERNET_MTU);
+            // Reuse the first-datagram buffer for all subsequent datagrams.
+            let mut payload = data;
             // Reusable string buffer for per-datagram address — avoids a String
             // heap allocation on every UDP datagram in the hot loop.
             let mut t_addr_buf = String::with_capacity(64);
@@ -1097,8 +1131,7 @@ async fn handle_udp_relay(
                     break;
                 }
 
-                let target = match resolve_udp_target(&t_addr_buf, t_port, &mut domain_ip_map).await
-                {
+                let target = match resolve_udp_target(&t_addr_buf, t_port, &dns_cache).await {
                     Ok(addr) => addr,
                     Err(e) => {
                         tracing::debug!("UDP target resolve error: {:?}", e);
@@ -1169,16 +1202,22 @@ async fn handle_udp_relay(
 /// If `host` is already a valid [`IpAddr`], it is returned directly
 /// without DNS resolution.  Otherwise, the function performs an async DNS
 /// lookup via [`tokio::net::lookup_host`] and caches the first result in
-/// the provided `domain_ip_map` to avoid repeated queries for the same
+/// the provided `dns_cache` to avoid repeated queries for the same
 /// host/port pair within the [`consts::UDP_DNS_CACHE_TTL`] window.
+///
+/// The cache is behind a [`tokio::sync::Mutex`] so it can be shared across
+/// multiple UDP relay streams within the same QUIC connection.  The lock is
+/// held only briefly for cache lookups and inserts; the DNS lookup itself
+/// runs outside the critical section to avoid blocking other streams.
 ///
 /// # Arguments
 ///
 /// * `host` - The target hostname or IP address string.
 /// * `port` - The target UDP port.
-/// * `domain_ip_map` - A mutable reference to an [`IndexMap`] serving as a
-///   bounded DNS cache with TTL-based expiry.  When the cache reaches
-///   [`consts::MAX_UDP_DNS_CACHE`] entries, the oldest entry is evicted.
+/// * `dns_cache` - A shared [`tokio::sync::Mutex`] wrapping an [`IndexMap`]
+///   that serves as a bounded DNS cache with TTL-based expiry.  When the
+///   cache reaches [`consts::MAX_UDP_DNS_CACHE`] entries, the oldest entry
+///   is evicted.
 ///
 /// # Returns
 ///
@@ -1191,22 +1230,24 @@ async fn handle_udp_relay(
 async fn resolve_udp_target(
     host: &str,
     port: u16,
-    domain_ip_map: &mut IndexMap<(String, u16), (SocketAddr, Instant)>,
+    dns_cache: &tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>,
 ) -> anyhow::Result<SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
 
-    let key = (host.to_string(), port);
-    // Check cache with TTL expiry
-    if let Some((mapped, timestamp)) = domain_ip_map.get(&key) {
-        if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
-            return Ok(*mapped);
+    let key = (Arc::from(host), port);
+    // Check cache with TTL expiry (brief lock)
+    {
+        let cache = dns_cache.lock().await;
+        if let Some((mapped, timestamp)) = cache.get(&key) {
+            if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
+                return Ok(*mapped);
+            }
         }
-        // TTL expired, remove the stale entry
-        domain_ip_map.swap_remove(&key);
     }
 
+    // Perform DNS lookup (no lock held)
     let mut addrs = tokio::net::lookup_host((host, port)).await?;
     let resolved = addrs
         .next()
@@ -1214,12 +1255,17 @@ async fn resolve_udp_target(
     // When the cache is full, evict the oldest entry (the one that will be
     // iterated first) instead of clearing the entire map. This preserves
     // recently-used entries and avoids unnecessary DNS re-resolutions.
-    if domain_ip_map.len() >= consts::MAX_UDP_DNS_CACHE {
-        if let Some(oldest_key) = domain_ip_map.keys().next().cloned() {
-            domain_ip_map.swap_remove(&oldest_key);
+    // Insert into cache (brief lock)
+    {
+        let mut cache = dns_cache.lock().await;
+        if cache.len() >= consts::MAX_UDP_DNS_CACHE {
+            if let Some(oldest_key) = cache.keys().next().cloned() {
+                cache.swap_remove(&oldest_key);
+            }
         }
+        cache.insert(key, (resolved, Instant::now()));
     }
-    domain_ip_map.insert(key, (resolved, Instant::now()));
+
     Ok(resolved)
 }
 

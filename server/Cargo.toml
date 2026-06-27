@@ -23,7 +23,7 @@ sha2.workspace = true
 bytes.workspace = true
 hex.workspace = true
 rand.workspace = true
-socket2.workspace = true
+socket2 = { workspace = true, features = ["all"] }
 async-trait.workspace = true
 indexmap = "2"
 if-addrs = "0.13"

@@ -75,12 +75,29 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Install the default rustls CryptoProvider (aws-lc-rs)
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install default rustls CryptoProvider");
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_workers)
+        .max_blocking_threads(256)
+        .global_queue_interval(31)
+        .enable_all()
+        .thread_name("juicity-client")
+        .thread_stack_size(3 * 1024 * 1024)
+        .build()?;
+
+    rt.block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 

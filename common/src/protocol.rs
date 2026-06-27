@@ -133,37 +133,76 @@ impl AddrType {
     }
 }
 
-/// Cached target address with pre-parsed address type.
+/// Cached target address with pre-parsed address type and raw octets.
 ///
-/// Avoids re-parsing the address type on every UDP datagram within the same
-/// session. Create once (e.g. at session start) and reuse across packets.
+/// Avoids re-parsing the address type and IP address on every UDP datagram
+/// within the same session.  Raw octets are stored directly: for IPv4 the
+/// first 4 bytes of [`host_bytes`]; for IPv6 all 16 bytes; for Domain the
+/// raw domain bytes (length in [`host_len`]).
+///
+/// Create once (e.g. at session start) and reuse across packets.
 #[derive(Debug, Clone)]
 pub struct CachedAddr {
     pub addr_type: AddrType,
-    pub host: String,
+    /// Raw octets (for IPv4: first 4 bytes; for IPv6: all 16 bytes; for domain: the domain bytes)
+    pub host_bytes: [u8; 16],
+    /// Domain length (only meaningful when addr_type == Domain)
+    pub host_len: u8,
     pub port: u16,
 }
 
 impl CachedAddr {
     /// Parse from a `"host:port"`-style string pair.
+    ///
+    /// Determines the address type and stores the raw octets directly,
+    /// avoiding later re-parsing at build time.
     pub fn from_host_port(host: &str, port: u16) -> Self {
         let addr_type = AddrType::from_host(host);
+        let mut host_bytes = [0u8; 16];
+        let host_len = match addr_type {
+            AddrType::V4 => {
+                let ip: std::net::Ipv4Addr = host.parse().expect("AddrType::V4 implies valid IPv4");
+                host_bytes[..4].copy_from_slice(&ip.octets());
+                4
+            }
+            AddrType::V6 => {
+                let ip: std::net::Ipv6Addr = host.parse().expect("AddrType::V6 implies valid IPv6");
+                host_bytes.copy_from_slice(&ip.octets());
+                16
+            }
+            AddrType::Domain => {
+                let b = host.as_bytes();
+                host_bytes[..b.len()].copy_from_slice(b);
+                b.len() as u8
+            }
+        };
         Self {
             addr_type,
-            host: host.to_string(),
+            host_bytes,
+            host_len,
             port,
         }
     }
 
     /// Create from a [`std::net::SocketAddr`].
+    ///
+    /// Extracts raw octets directly — no formatting or parsing round-trip.
     pub fn from_socket_addr(addr: SocketAddr) -> Self {
-        let addr_type = match addr {
-            SocketAddr::V4(_) => AddrType::V4,
-            SocketAddr::V6(_) => AddrType::V6,
+        let mut host_bytes = [0u8; 16];
+        let (addr_type, host_len) = match addr {
+            SocketAddr::V4(v4) => {
+                host_bytes[..4].copy_from_slice(&v4.ip().octets());
+                (AddrType::V4, 4)
+            }
+            SocketAddr::V6(v6) => {
+                host_bytes.copy_from_slice(&v6.ip().octets());
+                (AddrType::V6, 16)
+            }
         };
         Self {
             addr_type,
-            host: addr.ip().to_string(),
+            host_bytes,
+            host_len,
             port: addr.port(),
         }
     }
@@ -362,9 +401,9 @@ pub async fn read_proxy_header_async<R: tokio::io::AsyncReadExt + Unpin>(
             let mut len_buf = [0u8; 1];
             reader.read_exact(&mut len_buf).await?;
             let len = len_buf[0] as usize;
-            let mut domain = vec![0u8; len];
-            reader.read_exact(&mut domain).await?;
-            String::from_utf8_lossy(&domain).to_string()
+            let mut domain = [0u8; 255];
+            reader.read_exact(&mut domain[..len]).await?;
+            String::from_utf8_lossy(&domain[..len]).to_string()
         }
         ADDR_TYPE_NONE => String::new(),
         _ => anyhow::bail!("unknown address type: {}", addr_type),
@@ -445,9 +484,9 @@ pub fn read_proxy_header<R: std::io::Read>(reader: &mut R) -> anyhow::Result<(u8
             let mut len_buf = [0u8; 1];
             reader.read_exact(&mut len_buf)?;
             let len = len_buf[0] as usize;
-            let mut domain = vec![0u8; len];
-            reader.read_exact(&mut domain)?;
-            String::from_utf8_lossy(&domain).to_string()
+            let mut domain = [0u8; 255];
+            reader.read_exact(&mut domain[..len])?;
+            String::from_utf8_lossy(&domain[..len]).to_string()
         }
         ADDR_TYPE_NONE => String::new(),
         _ => anyhow::bail!("unknown address type: {}", addr_type),
@@ -489,25 +528,14 @@ pub fn build_trojanc_addr_cached(buf: &mut Vec<u8>, cached: &CachedAddr) -> anyh
 
     match cached.addr_type {
         AddrType::V4 => {
-            let ip: std::net::Ipv4Addr = cached
-                .host
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid IPv4 address '{}': {}", cached.host, e))?;
-            buf.extend_from_slice(&ip.octets());
+            buf.extend_from_slice(&cached.host_bytes[..4]);
         }
         AddrType::V6 => {
-            let ip: std::net::Ipv6Addr = cached
-                .host
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid IPv6 address '{}': {}", cached.host, e))?;
-            buf.extend_from_slice(&ip.octets());
+            buf.extend_from_slice(&cached.host_bytes[..16]);
         }
         AddrType::Domain => {
-            let domain_bytes = cached.host.as_bytes();
-            let domain_len = u8::try_from(domain_bytes.len())
-                .map_err(|_| anyhow::anyhow!("domain too long: {}", domain_bytes.len()))?;
-            buf.push(domain_len);
-            buf.extend_from_slice(domain_bytes);
+            buf.push(cached.host_len);
+            buf.extend_from_slice(&cached.host_bytes[..cached.host_len as usize]);
         }
     }
 
@@ -555,9 +583,9 @@ pub async fn read_trojanc_addr_async<R: tokio::io::AsyncReadExt + Unpin>(
             reader.read_exact(&mut len_buf).await?;
             let len = len_buf[0] as usize;
             anyhow::ensure!(len > 0, "trojanc domain length is zero");
-            let mut domain = vec![0u8; len];
-            reader.read_exact(&mut domain).await?;
-            String::from_utf8_lossy(&domain).into_owned()
+            let mut domain = [0u8; 255];
+            reader.read_exact(&mut domain[..len]).await?;
+            String::from_utf8_lossy(&domain[..len]).into_owned()
         }
         other => anyhow::bail!("unknown trojanc address type: {}", other),
     };
@@ -602,10 +630,10 @@ pub async fn read_trojanc_addr_into_async<R: tokio::io::AsyncReadExt + Unpin>(
             reader.read_exact(&mut len_buf).await?;
             let len = len_buf[0] as usize;
             anyhow::ensure!(len > 0, "trojanc domain length is zero");
-            let mut domain = vec![0u8; len];
-            reader.read_exact(&mut domain).await?;
+            let mut domain = [0u8; 255];
+            reader.read_exact(&mut domain[..len]).await?;
             host.clear();
-            host.push_str(&String::from_utf8_lossy(&domain));
+            host.push_str(&String::from_utf8_lossy(&domain[..len]));
         }
         other => anyhow::bail!("unknown trojanc address type: {}", other),
     };

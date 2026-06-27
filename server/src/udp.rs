@@ -296,23 +296,37 @@ impl UdpEndpointPool {
     ///
     /// # Lock behaviour
     ///
-    /// Acquires the inner [`std::sync::Mutex`] for the full duration of
-    /// the sweep.  While this blocks concurrent `get_socket` / `get_or_create`
-    /// / `remove` calls, the sweep is designed to complete quickly
-    /// (O(n) in the number of cached endpoints, typically a few hundred).
+    /// Uses a two-phase approach: first collects expired keys under the
+    /// inner [`std::sync::Mutex`], then releases the lock and removes each
+    /// expired entry with a separate, short lock acquisition.  This gives
+    /// concurrent `get_socket` / `get_or_create` / `remove` calls a chance
+    /// to proceed between individual removals, reducing latency spikes
+    /// under contention.  The initial collection is O(n) in the number of
+    /// cached endpoints (typically a few hundred).
     ///
     /// # Arguments
     ///
     /// * `self` - Shared reference to the pool.
     pub fn cleanup(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            // LruCache does not have retain(), so collect expired keys first.
-            let expired: Vec<SocketAddr> = inner
+        // Phase 1: collect expired keys under lock.
+        let expired: Vec<SocketAddr> = {
+            let inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(_) => return,
+            };
+            inner
                 .iter()
                 .filter(|(_, endpoint)| endpoint.is_expired())
                 .map(|(addr, _)| *addr)
-                .collect();
-            for addr in expired {
+                .collect()
+        }; // lock is released here
+
+        // Phase 2: remove each expired key with separate, short lock acquisitions.
+        // This avoids holding the lock for the entire sweep and gives
+        // concurrent get_socket / get_or_create calls a chance to proceed
+        // between individual removals.
+        for addr in expired {
+            if let Ok(mut inner) = self.inner.lock() {
                 inner.pop(&addr);
             }
         }
