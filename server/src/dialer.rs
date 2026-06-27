@@ -1,3 +1,4 @@
+use juicity_common::consts;
 use tokio::net::{TcpStream, UdpSocket};
 
 /// A trait for dialing outbound TCP/UDP connections
@@ -13,8 +14,23 @@ pub struct DefaultDialer;
 #[async_trait::async_trait]
 impl Dialer for DefaultDialer {
     async fn dial_tcp(&self, addr: &str) -> anyhow::Result<TcpStream> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream =
+            tokio::time::timeout(consts::DEFAULT_DIAL_TIMEOUT, TcpStream::connect(addr)).await??;
         stream.set_nodelay(true)?;
+        // Enable TCP keep-alive probes.
+        let sock_ref = socket2::SockRef::from(&stream);
+        sock_ref.set_keepalive(true)?;
+        // Platform-specific keep-alive parameters:
+        // - Linux: idle 60s, interval 10s, 3 probes (total ~90s to detect dead peer)
+        // - Other Unix: set via raw setsockopt or skip (OS defaults are reasonable)
+        // - Windows: uses SIO_KEEPALIVE_VALS via socket2
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let ka = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(10));
+            sock_ref.set_tcp_keepalive(&ka)?;
+        }
         Ok(stream)
     }
 
@@ -47,8 +63,24 @@ impl Dialer for BindDialer {
             tokio::net::TcpSocket::new_v6()?
         };
         socket.bind(std::net::SocketAddr::new(self.bind_addr, 0))?;
-        let stream = socket.connect(addr.parse()?).await?;
+        let addr: std::net::SocketAddr = addr.parse()?;
+        let stream =
+            tokio::time::timeout(consts::DEFAULT_DIAL_TIMEOUT, socket.connect(addr)).await??;
         stream.set_nodelay(true)?;
+        // Enable TCP keep-alive probes.
+        let sock_ref = socket2::SockRef::from(&stream);
+        sock_ref.set_keepalive(true)?;
+        // Platform-specific keep-alive parameters:
+        // - Linux: idle 60s, interval 10s, 3 probes (total ~90s to detect dead peer)
+        // - Other Unix: set via raw setsockopt or skip (OS defaults are reasonable)
+        // - Windows: uses SIO_KEEPALIVE_VALS via socket2
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let ka = socket2::TcpKeepalive::new()
+                .with_time(std::time::Duration::from_secs(60))
+                .with_interval(std::time::Duration::from_secs(10));
+            sock_ref.set_tcp_keepalive(&ka)?;
+        }
         Ok(stream)
     }
 

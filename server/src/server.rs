@@ -267,8 +267,7 @@ impl JuicityServer {
             socket.set_nonblocking(true)?;
             let sidecar = socket.try_clone()?;
             sidecar.set_nonblocking(true)?;
-            let server_underlay_socket =
-                Arc::new(tokio::net::UdpSocket::from_std(sidecar)?);
+            let server_underlay_socket = Arc::new(tokio::net::UdpSocket::from_std(sidecar)?);
 
             let wrapped = runtime.wrap_udp_socket(socket)?;
             let demux = Arc::new(crate::underlay_socket::DemuxUdpSocket::new(
@@ -291,10 +290,7 @@ impl JuicityServer {
             num_sockets,
         );
         #[cfg(not(unix))]
-        tracing::info!(
-            "Juicity server listening on {} (single socket)",
-            log_addr,
-        );
+        tracing::info!("Juicity server listening on {} (single socket)", log_addr,);
 
         // Spawn periodic cleanup task for in-flight underlay keys.
         // AbortOnDrop ensures the task is cancelled when serve() returns.
@@ -745,8 +741,13 @@ async fn handle_non_quic_underlay_packet(
             let mut buf = vec![0u8; consts::ETHERNET_MTU * 4];
             let mut outbuf = Vec::with_capacity(max_out_len);
             loop {
-                match recv_socket.recv_from(&mut buf).await {
-                    Ok((n, _)) => {
+                match tokio::time::timeout(
+                    consts::DEFAULT_NAT_TIMEOUT,
+                    recv_socket.recv_from(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok((n, _))) => {
                         let salt = juicity_underlay::generate_underlay_salt();
                         // Pre-allocate with SALT_LEN headroom at front — avoids O(n) shift in encrypt_in_place
                         outbuf.clear();
@@ -761,8 +762,11 @@ async fn handle_non_quic_underlay_packet(
                             break;
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::debug!("underlay endpoint recv failed for {}: {:?}", source, e);
+                        break;
+                    }
+                    Err(_) => {
                         break;
                     }
                 }
@@ -1193,8 +1197,10 @@ async fn handle_udp_relay(
             // the same outbound target so we avoid re-parsing every datagram.
             let mut cached_addr: Option<protocol::CachedAddr> = None;
             loop {
-                match remote.recv_from(&mut buf).await {
-                    Ok((n, addr)) => {
+                match tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, remote.recv_from(&mut buf))
+                    .await
+                {
+                    Ok(Ok((n, addr))) => {
                         // Cache the address on first packet to avoid re-parsing
                         // the address type (string → IPv4/IPv6/Domain) on every
                         // subsequent datagram in this session.
@@ -1214,7 +1220,11 @@ async fn handle_udp_relay(
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        tracing::debug!("UDP relay remote->quic idle timeout");
+                        break;
+                    }
                 }
             }
         })
@@ -1284,7 +1294,12 @@ async fn resolve_udp_target(
     }
 
     // Perform DNS lookup (no lock held)
-    let mut addrs = tokio::net::lookup_host((host, port)).await?;
+    let mut addrs = tokio::time::timeout(
+        consts::DNS_QUERY_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("DNS query timeout for {}:{}", host, port))??;
     let resolved = addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no DNS result for {}:{}", host, port))?;
