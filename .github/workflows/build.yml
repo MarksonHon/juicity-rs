@@ -23,9 +23,52 @@ env:
 
 jobs:
   # --------------------------------------------------
+  # Package Offline Source Code
+  # --------------------------------------------------
+  package:
+    name: Package Offline Source Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+
+      - name: Setup vendor for offline build
+        shell: bash
+        run: |
+          cargo vendor
+          mkdir -p .cargo
+          echo '[source.crates-io]
+          replace-with = "vendored-sources"
+
+          [source.vendored-sources]
+          directory = "vendor"' > .cargo/config.toml
+
+      - name: Create offline source package
+        shell: bash
+        run: |
+          # git archive (tracked source) + vendor/ + .cargo/config.toml
+          git archive --format=tar -o juicity-offline-source.tar HEAD
+          tar -rf juicity-offline-source.tar vendor/ .cargo/
+          gzip -f juicity-offline-source.tar
+
+      - name: Upload offline source artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: juicity-offline-source
+          path: juicity-offline-source.tar.gz
+
+      - name: Upload offline source to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: juicity-offline-source.tar.gz
+
+  # --------------------------------------------------
   # Linux — zigbuild
   # --------------------------------------------------
   linux:
+    needs: package
     name: Linux (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
     runs-on: ubuntu-latest
     strategy:
@@ -56,7 +99,16 @@ jobs:
           - target: x86_64-unknown-linux-musl
             cpu_variant: v3
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Download offline source
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-offline-source
+
+      - name: Extract offline source
+        shell: bash
+        run: tar -xzf juicity-offline-source.tar.gz
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -77,7 +129,7 @@ jobs:
       - name: Build with zigbuild
         env:
           RUSTFLAGS: ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
-        run: cargo zigbuild --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
+        run: cargo zigbuild --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
         shell: bash
@@ -104,6 +156,7 @@ jobs:
   # Windows gnullvm — static compile via MSYS2
   # --------------------------------------------------
   windows-gnullvm:
+    needs: package
     name: Windows gnullvm (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -126,7 +179,16 @@ jobs:
             runner: windows-11-arm
             msystem: CLANGARM64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Download offline source
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-offline-source
+
+      - name: Extract offline source
+        shell: bash
+        run: tar -xzf juicity-offline-source.tar.gz
 
       - name: Install MSYS2 toolchain (gnullvm)
         uses: msys2/setup-msys2@v2
@@ -143,7 +205,7 @@ jobs:
         shell: msys2 {0}
         env:
           RUSTFLAGS: -C target-feature=+crt-static ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
-        run: cargo build --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
+        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
         shell: msys2 {0}
@@ -171,6 +233,7 @@ jobs:
   # macOS — native build
   # --------------------------------------------------
   macos:
+    needs: package
     name: macOS (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -182,7 +245,16 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Download offline source
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-offline-source
+
+      - name: Extract offline source
+        shell: bash
+        run: tar -xzf juicity-offline-source.tar.gz
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -191,7 +263,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
+        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
         shell: bash
@@ -214,6 +286,7 @@ jobs:
   # FreeBSD — cross build via actions-rust-cross
   # --------------------------------------------------
   freebsd:
+    needs: package
     name: FreeBSD x86_64${{ format(' - {0}', matrix.cpu_variant) }}
     runs-on: ubuntu-latest
     strategy:
@@ -227,7 +300,16 @@ jobs:
           - target: x86_64-unknown-freebsd
             cpu_variant: v3
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Download offline source
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-offline-source
+
+      - name: Extract offline source
+        shell: bash
+        run: tar -xzf juicity-offline-source.tar.gz
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -242,7 +324,7 @@ jobs:
         with:
           command: build
           target: x86_64-unknown-freebsd
-          args: "--release --workspace --exclude juicity-gui"
+          args: "--frozen --release --workspace --exclude juicity-gui"
 
       - name: Prepare package
         shell: bash
@@ -264,6 +346,299 @@ jobs:
         with:
           name: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
           path: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # GUI native build matrix
+  # --------------------------------------------------
+  gui:
+    needs: package
+    name: GUI (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ss_suffix: x86_64-unknown-linux-gnu.tar.xz
+            os: linux
+
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ss_suffix: aarch64-unknown-linux-gnu.tar.xz
+            os: linux
+
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-gnullvm
+            ss_suffix: x86_64-pc-windows-msvc.zip
+            msystem: CLANG64
+            msystem_arch: clang-x86_64
+            os: windows
+
+          # windows-aarch64 disabled: shadowsocks-rust has no aarch64-pc-windows binary yet
+          # - name: windows-aarch64
+          #   runner: windows-11-arm
+          #   target: aarch64-pc-windows-gnullvm
+          #   ss_suffix: aarch64-pc-windows-msvc.zip
+          #   msystem: CLANGARM64
+          #   msystem_arch: clang-aarch64
+          #   os: windows
+
+          - name: macos-x86_64
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+            ss_suffix: x86_64-apple-darwin.tar.xz
+            os: macos
+
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            ss_suffix: aarch64-apple-darwin.tar.xz
+            os: macos
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download offline source
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-offline-source
+
+      - name: Extract offline source
+        shell: bash
+        run: tar -xzf juicity-offline-source.tar.gz
+
+      # ── Install dependencies ─────────────────────────────────────────────
+
+      - name: Install GTK4 + build tools (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config
+
+      - name: Install GTK4 (macOS)
+        if: matrix.os == 'macos'
+        run: brew install gtk4 libadwaita dbus
+
+      - name: Install Rust toolchain (Linux/macOS)
+        if: matrix.os != 'windows'
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Setup MSYS2 (Windows)
+        if: matrix.os == 'windows'
+        uses: msys2/setup-msys2@v2.31.1
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            mingw-w64-${{ matrix.msystem_arch }}-clang
+            mingw-w64-${{ matrix.msystem_arch }}-lld
+            mingw-w64-${{ matrix.msystem_arch }}-llvm
+            mingw-w64-${{ matrix.msystem_arch }}-rust
+            mingw-w64-${{ matrix.msystem_arch }}-gtk4
+            mingw-w64-${{ matrix.msystem_arch }}-libadwaita
+            mingw-w64-${{ matrix.msystem_arch }}-pkg-config
+            mingw-w64-${{ matrix.msystem_arch }}-dbus
+
+      # ── Build ────────────────────────────────────────────────────────────
+
+      - name: Build (Linux/macOS)
+        if: matrix.os != 'windows'
+        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-server
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-server
+
+      # ── Test ────────────────────────────────────────────────────────────
+
+      - name: Run tests (Linux/macOS)
+        if: matrix.os != 'windows'
+        run: cargo test --frozen -p juicity-gui --target ${{ matrix.target }}
+
+      - name: Run tests (Windows, clear POSIX env vars to validate i18n fallback)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: |
+          unset LANG LC_ALL LC_MESSAGES
+          cargo test --frozen -p juicity-gui --target ${{ matrix.target }}
+
+      # ── Download shadowsocks-rust ─────────────────────────────────────────
+
+      - name: Get shadowsocks-rust latest tag
+        shell: bash
+        run: |
+          SS_TAG=$(curl -sSf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
+            | grep '"tag_name"' | head -1 | sed 's/.*"\(v[^"]*\)".*/\1/')
+          echo "Resolved shadowsocks-rust tag: ${SS_TAG}"
+          echo "SS_TAG=${SS_TAG}" >> "$GITHUB_ENV"
+
+      - name: Download shadowsocks-rust (Linux/macOS)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          echo "Downloading shadowsocks-rust ${SS_TAG}"
+          curl -sSfL \
+            "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_TAG}/shadowsocks-${SS_TAG}.${{ matrix.ss_suffix }}" \
+            -o /tmp/ss.tar.xz
+          mkdir -p /tmp/ss
+          tar -xJf /tmp/ss.tar.xz -C /tmp/ss
+          echo "SS_DIR=/tmp/ss" >> "$GITHUB_ENV"
+
+      - name: Download shadowsocks-rust (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Write-Host "Downloading shadowsocks-rust $env:SS_TAG"
+          $url = "https://github.com/shadowsocks/shadowsocks-rust/releases/download/$env:SS_TAG/shadowsocks-$env:SS_TAG.${{ matrix.ss_suffix }}"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ss.zip"
+          Expand-Archive -Path "$env:TEMP\ss.zip" -DestinationPath "$env:TEMP\ss" -Force
+          Add-Content $env:GITHUB_ENV "SS_DIR=$env:TEMP\ss"
+
+      # ── Prepare package ───────────────────────────────────────────────────
+
+      - name: Prepare package (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          PKG_NAME="juicity-gui-${{ matrix.name }}"
+          mkdir -p "${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-gui"    "${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-client" "${PKG_NAME}/"
+          cp "${SS_DIR}/sslocal" "${PKG_NAME}/"
+          cp "${SS_DIR}/ssurl"   "${PKG_NAME}/"
+          cp client/examples/config.json "${PKG_NAME}/client-config.json"
+
+      - name: Prepare .app bundle (macOS)
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          # Derive version from tag (strip leading 'v') or use '0.0.0' for CI
+          VERSION="${GITHUB_REF_NAME#v}"
+          # If the version looks like a branch name (not semver), use latest tag or fallback
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            VERSION="0.1.0"
+          fi
+          # Generate the .app bundle with all dependencies bundled inside
+          bash gui/macos/bundle.sh \
+            --target-dir "target/${{ matrix.target }}/release" \
+            --app-name "Juicity" \
+            --version "${VERSION}" \
+            --build-number "${{ github.run_number }}"
+          # The bundle.sh creates dist/Juicity.app
+          # Rename to include target name for artifact naming
+          mv dist/Juicity.app "dist/juicity-gui-${{ matrix.name }}.app"
+
+      - name: Prepare package + collect DLLs (Windows)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: |
+          PKG_NAME="juicity-gui-${{ matrix.name }}"
+          PKG_DIR="$(pwd)/${PKG_NAME}"
+          mkdir -p "${PKG_DIR}"
+
+          # Copy built binaries
+          cp "target/${{ matrix.target }}/release/juicity-gui.exe"    "${PKG_DIR}/"
+          cp "target/${{ matrix.target }}/release/juicity-client.exe" "${PKG_DIR}/"
+
+          # Copy shadowsocks-rust binaries (convert Windows path to MSYS2 path)
+          SS_UNIX=$(cygpath -u "${SS_DIR}")
+          cp "${SS_UNIX}/sslocal.exe" "${PKG_DIR}/"
+          cp "${SS_UNIX}/ssurl.exe"   "${PKG_DIR}/"
+
+          cp client/examples/config.json "${PKG_DIR}/client-config.json"
+
+          # Collect DLL dependencies recursively for all EXEs
+          declare -A seen
+          queue=("${PKG_DIR}/juicity-gui.exe" "${PKG_DIR}/juicity-client.exe")
+          while [[ ${#queue[@]} -gt 0 ]]; do
+            bin="${queue[0]}"; queue=("${queue[@]:1}")
+            [[ -f "$bin" ]] || continue
+            while IFS= read -r dll; do
+              name=$(basename "$dll")
+              [[ -n "${seen[$name]+x}" ]] && continue
+              seen[$name]=1
+              cp "$dll" "${PKG_DIR}/"
+              queue+=("${PKG_DIR}/${name}")
+            done < <(ldd "$bin" 2>/dev/null | awk '/=> \// {print $3}' | grep -v '/c/[Ww]indows')
+          done
+
+          # GTK4 runtime data
+          PREFIX="${MSYSTEM_PREFIX}"
+
+          # GLib schemas
+          mkdir -p "${PKG_DIR}/share/glib-2.0/schemas"
+          [[ -f "${PREFIX}/share/glib-2.0/schemas/gschemas.compiled" ]] && \
+            cp "${PREFIX}/share/glib-2.0/schemas/gschemas.compiled" "${PKG_DIR}/share/glib-2.0/schemas/"
+
+          # GDK-pixbuf loaders
+          if [[ -d "${PREFIX}/lib/gdk-pixbuf-2.0" ]]; then
+            mkdir -p "${PKG_DIR}/lib"
+            cp -r "${PREFIX}/lib/gdk-pixbuf-2.0" "${PKG_DIR}/lib/"
+            # Also collect DLL deps of the loaders themselves
+            shopt -s globstar
+            for loader in "${PKG_DIR}/lib/gdk-pixbuf-2.0/"**/*.dll; do
+              [[ -f "$loader" ]] || continue
+              while IFS= read -r dll; do
+                name=$(basename "$dll")
+                [[ -n "${seen[$name]+x}" ]] && continue
+                seen[$name]=1
+                cp "$dll" "${PKG_DIR}/"
+              done < <(ldd "$loader" 2>/dev/null | awk '/=> \// {print $3}' | grep -v '/c/[Ww]indows')
+            done
+          fi
+
+          # GTK4 modules (print backends, media backends)
+          [[ -d "${PREFIX}/lib/gtk-4.0" ]] && \
+            { mkdir -p "${PKG_DIR}/lib"; cp -r "${PREFIX}/lib/gtk-4.0" "${PKG_DIR}/lib/"; }
+
+          # Hicolor icon theme
+          [[ -d "${PREFIX}/share/icons/hicolor" ]] && \
+            { mkdir -p "${PKG_DIR}/share/icons"; cp -r "${PREFIX}/share/icons/hicolor" "${PKG_DIR}/share/icons/"; }
+
+          # Adwaita icon theme
+          [[ -d "${PREFIX}/share/icons/Adwaita" ]] && \
+            { mkdir -p "${PKG_DIR}/share/icons"; cp -r "${PREFIX}/share/icons/Adwaita" "${PKG_DIR}/share/icons/"; }
+
+          # dbus-daemon.exe — GLib/GIO on Windows searches for this binary to start
+          # a session bus; without it the runtime prints:
+          #   GLib-GIO-WARNING: win32 session dbus binary not found
+          if [[ -f "${PREFIX}/bin/dbus-daemon.exe" ]]; then
+            cp "${PREFIX}/bin/dbus-daemon.exe" "${PKG_DIR}/"
+            while IFS= read -r dll; do
+              name=$(basename "$dll")
+              [[ -n "${seen[$name]+x}" ]] && continue
+              seen[$name]=1
+              cp "$dll" "${PKG_DIR}/"
+            done < <(ldd "${PKG_DIR}/dbus-daemon.exe" 2>/dev/null | awk '/=> \//' | awk '{print $3}' | grep -v '/c/[Ww]indows')
+          fi
+
+      # ── Upload artifact ───────────────────────────────────────────────────
+
+      - name: Upload artifact (Linux/Windows)
+        if: matrix.os != 'macos'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: juicity-gui-${{ matrix.name }}
+          path: juicity-gui-${{ matrix.name }}
+          if-no-files-found: error
+
+      - name: Upload artifact (macOS .app bundle)
+        if: matrix.os == 'macos'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: juicity-gui-${{ matrix.name }}.app
+          path: dist/juicity-gui-${{ matrix.name }}.app
           if-no-files-found: error
 
   # --------------------------------------------------
@@ -292,11 +667,13 @@ jobs:
           shopt -s globstar
           for dir in artifacts/*/; do
             target_name=$(basename "$dir")
+            # Skip the offline source package — already uploaded by the package job
+            [[ "$target_name" == "juicity-offline-source" ]] && continue
             zipfile="artifacts/${target_name}.zip"
             echo "Creating zip: $zipfile from $dir"
-            (cd "$dir" && zip -r "../../${zipfile}" .)
+            (cd "$dir" && zip -ry "../../${zipfile}" .)
           done
-          
+
       - name: Upload to Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -304,7 +681,5 @@ jobs:
         shell: bash
         run: |
           shopt -s globstar
-          for zipfile in artifacts/**/*.zip; do
-            echo "Uploading: $zipfile"
-            gh release upload "${{ github.event.release.tag_name }}" "$zipfile" --clobber -R "$GH_REPO"
-          done
+          echo "Uploading: $zipfile"
+          gh release upload "${{ github.event.release.tag_name }}" "artifacts/**/*.zip" --clobber -R "$GH_REPO"

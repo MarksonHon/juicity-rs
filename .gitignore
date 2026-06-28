@@ -1,6 +1,7 @@
-/target
+target/
 cargo_check_output*
 plans/
 node_modules/
 package.json
 package-lock.json
+vendor
