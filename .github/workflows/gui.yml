@@ -21,84 +21,9 @@ env:
 
 jobs:
   # --------------------------------------------------
-  # Source — generate fully offline GUI source package (include all crates)
-  # --------------------------------------------------
-  source:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout source code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Setup Rust toolchain (required for cargo vendor)
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-
-      - name: Generate GUI full source package with vendored dependencies
-        shell: bash
-        run: |
-          set -e
-          SRC_DIR="juicity-rs-gui-source"
-
-          # Step 1: Vendor all workspace dependencies in the original checkout
-          echo "Vendoring all workspace dependencies..."
-          cargo vendor vendor/
-          echo "Vendor complete: $(du -sh vendor/ | cut -f1)"
-
-          # Step 2: Create source directory and copy everything except .git/target/vendor
-          mkdir -p "${SRC_DIR}"
-          rsync -a --exclude='.git' --exclude='target' --exclude='vendor' . "${SRC_DIR}/"
-
-          # Step 3: Keep all directories (gui/, server/, client/, common/, install/)
-          # No directory removal needed for GUI package
-
-          # Step 4: Copy vendored dependencies into the source package
-          cp -r vendor "${SRC_DIR}/vendor"
-
-          # Step 5: Configure cargo to use vendored sources (fully offline capable)
-          cat > "${SRC_DIR}/.cargo/config.toml" << 'EOF'
-          [source.crates-io]
-          replace-with = "vendored-sources"
-
-          [source.vendored-sources]
-          directory = "vendor"
-          EOF
-
-          # Step 6: Clean up original vendor directory
-          rm -rf vendor/
-
-          # Step 7: Clean up nested target directories in the copy
-          find "${SRC_DIR}" -name target -type d -exec rm -rf {} + 2>/dev/null || true
-
-          # Step 8: Create the zip
-          echo "=== Source package structure ==="
-          ls -la "${SRC_DIR}/"
-          echo "=== Total size ==="
-          du -sh "${SRC_DIR}/"
-          echo "=== Vendored crates count ==="
-          ls "${SRC_DIR}/vendor/" | wc -l
-
-          zip -r "juicity-full-gui-source.zip" "${SRC_DIR}"
-
-          echo "=== Package info ==="
-          unzip -l "juicity-full-gui-source.zip" | head -20
-          echo "=== Total files: $(unzip -l "juicity-full-gui-source.zip" | tail -1) ==="
-          echo "=== Package size: $(du -h juicity-full-gui-source.zip | cut -f1) ==="
-
-      - name: Upload GUI source package
-        uses: actions/upload-artifact@v8
-        with:
-          name: juicity-full-gui-source
-          path: ./juicity-full-gui-source.zip
-          if-no-files-found: error
-
-  # --------------------------------------------------
-  # GUI native build matrix (depends on source package)
+  # GUI native build matrix
   # --------------------------------------------------
   gui:
-    needs: source
     name: GUI (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -147,17 +72,7 @@ jobs:
             os: macos
 
     steps:
-      - name: Download GUI source package
-        uses: actions/download-artifact@v8
-        with:
-          name: juicity-full-gui-source
-
-      - name: Extract source package
-        shell: bash
-        run: |
-          unzip -o juicity-full-gui-source.zip
-          echo "Extracted to juicity-rs-gui-source/"
-          ls -la juicity-rs-gui-source/
+      - uses: actions/checkout@v6.0.2
 
       # ── Install dependencies ─────────────────────────────────────────────
 
@@ -198,12 +113,10 @@ jobs:
 
       - name: Build (Linux/macOS)
         if: matrix.os != 'windows'
-        working-directory: ./juicity-rs-gui-source
         run: cargo build --workspace --release --target ${{ matrix.target }} --exclude juicity-server
 
       - name: Build (Windows)
         if: matrix.os == 'windows'
-        working-directory: ./juicity-rs-gui-source
         shell: msys2 {0}
         run: cargo build --workspace --release --target ${{ matrix.target }} --exclude juicity-server
 
@@ -211,12 +124,10 @@ jobs:
 
       - name: Run tests (Linux/macOS)
         if: matrix.os != 'windows'
-        working-directory: ./juicity-rs-gui-source
         run: cargo test -p juicity-gui --target ${{ matrix.target }}
 
       - name: Run tests (Windows, clear POSIX env vars to validate i18n fallback)
         if: matrix.os == 'windows'
-        working-directory: ./juicity-rs-gui-source
         shell: msys2 {0}
         run: |
           unset LANG LC_ALL LC_MESSAGES
@@ -237,7 +148,6 @@ jobs:
       - name: Download shadowsocks-rust (Linux/macOS)
         if: matrix.os != 'windows'
         shell: bash
-        working-directory: ./juicity-rs-gui-source
         run: |
           echo "Downloading shadowsocks-rust ${SS_TAG}"
           curl -sSfL \
@@ -261,7 +171,6 @@ jobs:
 
       - name: Prepare package (Linux)
         if: matrix.os == 'linux'
-        working-directory: ./juicity-rs-gui-source
         shell: bash
         run: |
           PKG_NAME="juicity-gui-${{ matrix.name }}"
@@ -274,7 +183,6 @@ jobs:
 
       - name: Prepare .app bundle (macOS)
         if: matrix.os == 'macos'
-        working-directory: ./juicity-rs-gui-source
         shell: bash
         run: |
           # Derive version from tag (strip leading 'v') or use '0.0.0' for CI
@@ -295,7 +203,6 @@ jobs:
 
       - name: Prepare package + collect DLLs (Windows)
         if: matrix.os == 'windows'
-        working-directory: ./juicity-rs-gui-source
         shell: msys2 {0}
         run: |
           PKG_NAME="juicity-gui-${{ matrix.name }}"
@@ -382,72 +289,48 @@ jobs:
 
       - name: Upload artifact (Linux/Windows)
         if: matrix.os != 'macos'
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-gui-${{ matrix.name }}
-          path: ./juicity-rs-gui-source/juicity-gui-${{ matrix.name }}
+          path: juicity-gui-${{ matrix.name }}
           if-no-files-found: error
 
       - name: Upload artifact (macOS .app bundle)
         if: matrix.os == 'macos'
-        uses: actions/upload-artifact@v8
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: juicity-gui-${{ matrix.name }}.app
-          path: ./juicity-rs-gui-source/dist/juicity-gui-${{ matrix.name }}.app
+          path: dist/juicity-gui-${{ matrix.name }}.app
           if-no-files-found: error
 
   # --------------------------------------------------
-  # Release — attach GUI artifacts + source package to GitHub Release
+  # Release — attach GUI artifacts to GitHub Release
   # --------------------------------------------------
   release:
     name: Attach GUI artifacts to Release
     if: github.event_name == 'release' && github.event.action == 'published'
-    needs:
-      - gui
-      - source
+    needs: [gui]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download all binary artifacts
-        uses: actions/download-artifact@v8
+      - name: Download GUI artifacts
+        uses: actions/download-artifact@v8.0.1
         with:
           pattern: juicity-gui-*
           path: artifacts
 
-      - name: Download source package
-        uses: actions/download-artifact@v8
-        with:
-          name: juicity-full-gui-source
-
-      - name: Upload GUI source package to Release
+      - name: Zip and upload GUI artifacts to Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
-          set -e
-          SRC_ZIP="juicity-full-gui-source.zip"
-          if [ -f "$SRC_ZIP" ]; then
-            echo "Uploading source package: $SRC_ZIP"
-            gh release upload "${{ github.event.release.tag_name }}" "$SRC_ZIP" --clobber -R "$GH_REPO"
-          else
-            echo "Warning: Source package not found!"
-            ls -la
-          fi
-
-      - name: Package binary artifacts and upload to Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          set -e
           for dir in artifacts/*/; do
-            [ -d "$dir" ] || continue
             name=$(basename "$dir")
             zipfile="${name}.zip"
             echo "Zipping ${name} -> ${zipfile}"
+            # -y preserves symlinks (needed for .app bundles), -r recurses
             zip -ry "${zipfile}" "${dir}"
             echo "Uploading: ${zipfile}"
             gh release upload "${{ github.event.release.tag_name }}" "${zipfile}" --clobber -R "$GH_REPO"
