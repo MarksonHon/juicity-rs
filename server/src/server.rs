@@ -1083,18 +1083,12 @@ async fn handle_tcp_relay(
     let mut remote_rx = tokio::io::BufReader::with_capacity(16 * 1024, remote_rx);
     let mut quic_rx = tokio::io::BufReader::with_capacity(16 * 1024, quic_rx);
 
-    // Per-stream idle timeout: if neither direction produces data within
-    // TCP_RELAY_IDLE_TIMEOUT, close the stream to release memory promptly.
-    // This prevents stalled TCP connections from holding buffers indefinitely.
     tokio::select! {
         r = tokio::io::copy_buf(&mut remote_rx, &mut quic_tx) => {
             if let Err(e) = r { tracing::debug!("TCP relay remote->quic: {:?}", e); }
         }
         r = tokio::io::copy_buf(&mut quic_rx, &mut remote_tx) => {
             if let Err(e) = r { tracing::debug!("TCP relay quic->remote: {:?}", e); }
-        }
-        _ = tokio::time::sleep(consts::TCP_RELAY_IDLE_TIMEOUT) => {
-            tracing::debug!("TCP relay idle timeout for {}", target);
         }
     }
 
