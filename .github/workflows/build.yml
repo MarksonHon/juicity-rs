@@ -47,11 +47,10 @@ jobs:
       - name: Create offline source package
         shell: bash
         run: |
-          # Full source + vendored deps + .cargo/config.toml
-          tar -czf juicity-offline-source.tar.gz \
-            --exclude='juicity-offline-source.tar.gz' \
-            --exclude='target' \
-            .
+          # git archive (tracked source) + vendor/ + .cargo/config.toml
+          git archive --format=tar -o juicity-offline-source.tar HEAD
+          tar -rf juicity-offline-source.tar vendor/ .cargo/
+          gzip -f juicity-offline-source.tar
 
       - name: Upload offline source artifact
         uses: actions/upload-artifact@v7
