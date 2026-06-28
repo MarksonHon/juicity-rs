@@ -23,9 +23,89 @@ env:
 
 jobs:
   # --------------------------------------------------
-  # Linux — zigbuild
+  # Source — generate fully offline CLI source package (exclude gui/)
+  # --------------------------------------------------
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain (required for cargo vendor)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Generate CLI full source package with vendored dependencies
+        shell: bash
+        run: |
+          set -e
+          SRC_DIR="juicity-rs-cli-source"
+
+          # Step 1: Vendor all workspace dependencies in the original checkout
+          # This downloads ALL crate sources needed by common/client/server/gui
+          echo "Vendoring all workspace dependencies..."
+          cargo vendor vendor/
+          echo "Vendor complete: $(du -sh vendor/ | cut -f1)"
+
+          # Step 2: Create source directory and copy everything except .git/target/vendor
+          mkdir -p "${SRC_DIR}"
+          rsync -a --exclude='.git' --exclude='target' --exclude='vendor' . "${SRC_DIR}/"
+
+          # Step 3: Remove gui/ (not needed for CLI builds)
+          rm -rf "${SRC_DIR}/gui"
+
+          # Step 4: Remove gui from workspace members in Cargo.toml
+          # (otherwise cargo vendor would fail in the offline copy since gui/ no longer exists)
+          sed -i '/"gui"/d' "${SRC_DIR}/Cargo.toml"
+
+          # Step 5: Copy vendored dependencies into the source package
+          cp -r vendor "${SRC_DIR}/vendor"
+
+          # Step 6: Configure cargo to use vendored sources (fully offline capable)
+          cat > "${SRC_DIR}/.cargo/config.toml" << 'EOF'
+          [source.crates-io]
+          replace-with = "vendored-sources"
+
+          [source.vendored-sources]
+          directory = "vendor"
+          EOF
+
+          # Step 7: Clean up original vendor directory
+          rm -rf vendor/
+
+          # Step 8: Clean up nested target directories in the copy
+          find "${SRC_DIR}" -name target -type d -exec rm -rf {} + 2>/dev/null || true
+
+          # Step 9: Create the zip
+          echo "=== Source package structure ==="
+          ls -la "${SRC_DIR}/"
+          echo "=== Total size ==="
+          du -sh "${SRC_DIR}/"
+          echo "=== Vendored crates count ==="
+          ls "${SRC_DIR}/vendor/" | wc -l
+
+          zip -r "juicity-full-cli-source.zip" "${SRC_DIR}"
+
+          echo "=== Package info ==="
+          unzip -l "juicity-full-cli-source.zip" | head -20
+          echo "=== Total files: $(unzip -l "juicity-full-cli-source.zip" | tail -1) ==="
+          echo "=== Package size: $(du -h juicity-full-cli-source.zip | cut -f1) ==="
+
+      - name: Upload CLI source package
+        uses: actions/upload-artifact@v8
+        with:
+          name: juicity-full-cli-source
+          path: ./juicity-full-cli-source.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # Linux — zigbuild (depends on source package)
   # --------------------------------------------------
   linux:
+    needs: source
     name: Linux (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
     runs-on: ubuntu-latest
     strategy:
@@ -56,7 +136,17 @@ jobs:
           - target: x86_64-unknown-linux-musl
             cpu_variant: v3
     steps:
-      - uses: actions/checkout@v6
+      - name: Download CLI source package
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-full-cli-source
+
+      - name: Extract source package
+        shell: bash
+        run: |
+          unzip -o juicity-full-cli-source.zip
+          echo "Extracted to juicity-rs-cli-source/"
+          ls -la juicity-rs-cli-source/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -75,11 +165,13 @@ jobs:
           tool: cargo-zigbuild
 
       - name: Build with zigbuild
+        working-directory: ./juicity-rs-cli-source
         env:
           RUSTFLAGS: ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
         run: cargo zigbuild --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
+        working-directory: ./juicity-rs-cli-source
         shell: bash
         run: |
           case "${{ matrix.cpu_variant }}" in
@@ -95,15 +187,17 @@ jobs:
           cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v8
         with:
           name: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
-          path: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          path: ./juicity-rs-cli-source/juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          if-no-files-found: error
 
   # --------------------------------------------------
-  # Windows gnullvm — static compile via MSYS2
+  # Windows gnullvm — static compile via MSYS2 (depends on source package)
   # --------------------------------------------------
   windows-gnullvm:
+    needs: source
     name: Windows gnullvm (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -126,7 +220,17 @@ jobs:
             runner: windows-11-arm
             msystem: CLANGARM64
     steps:
-      - uses: actions/checkout@v6
+      - name: Download CLI source package
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-full-cli-source
+
+      - name: Extract source package (bash, not MSYS2)
+        shell: bash
+        run: |
+          unzip -o juicity-full-cli-source.zip
+          echo "Extracted to juicity-rs-cli-source/"
+          ls -la juicity-rs-cli-source/
 
       - name: Install MSYS2 toolchain (gnullvm)
         uses: msys2/setup-msys2@v2
@@ -140,12 +244,14 @@ jobs:
             mingw-w64-${{ matrix.msystem == 'CLANG64' && 'clang-x86_64' || 'clang-aarch64' }}-rust
 
       - name: Build
+        working-directory: ./juicity-rs-cli-source
         shell: msys2 {0}
         env:
           RUSTFLAGS: -C target-feature=+crt-static ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
         run: cargo build --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
+        working-directory: ./juicity-rs-cli-source
         shell: msys2 {0}
         run: |
           case "${{ matrix.cpu_variant }}" in
@@ -161,16 +267,17 @@ jobs:
           cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v8
         with:
           name: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
-          path: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          path: ./juicity-rs-cli-source/juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
           if-no-files-found: error
 
   # --------------------------------------------------
-  # macOS — native build
+  # macOS — native build (depends on source package)
   # --------------------------------------------------
   macos:
+    needs: source
     name: macOS (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -182,7 +289,17 @@ jobs:
           - target: aarch64-apple-darwin
             runner: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - name: Download CLI source package
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-full-cli-source
+
+      - name: Extract source package
+        shell: bash
+        run: |
+          unzip -o juicity-full-cli-source.zip
+          echo "Extracted to juicity-rs-cli-source/"
+          ls -la juicity-rs-cli-source/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -191,9 +308,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
+        working-directory: ./juicity-rs-cli-source
         run: cargo build --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
+        working-directory: ./juicity-rs-cli-source
         shell: bash
         run: |
           PKG_NAME="juicity-${{ matrix.target }}"
@@ -204,16 +323,17 @@ jobs:
           cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v8
         with:
           name: juicity-${{ matrix.target }}
-          path: juicity-${{ matrix.target }}
+          path: ./juicity-rs-cli-source/juicity-${{ matrix.target }}
           if-no-files-found: error
 
   # --------------------------------------------------
-  # FreeBSD — cross build via actions-rust-cross
+  # FreeBSD — cross build via cross CLI (depends on source package)
   # --------------------------------------------------
   freebsd:
+    needs: source
     name: FreeBSD x86_64${{ format(' - {0}', matrix.cpu_variant) }}
     runs-on: ubuntu-latest
     strategy:
@@ -227,7 +347,17 @@ jobs:
           - target: x86_64-unknown-freebsd
             cpu_variant: v3
     steps:
-      - uses: actions/checkout@v6
+      - name: Download CLI source package
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-full-cli-source
+
+      - name: Extract source package
+        shell: bash
+        run: |
+          unzip -o juicity-full-cli-source.zip
+          echo "Extracted to juicity-rs-cli-source/"
+          ls -la juicity-rs-cli-source/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -235,16 +365,19 @@ jobs:
           toolchain: stable
           targets: x86_64-unknown-freebsd
 
-      - name: Build (cross)
-        uses: houseabsolute/actions-rust-cross@v1
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cross build
+        working-directory: ./juicity-rs-cli-source
         env:
           RUSTFLAGS: ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
-        with:
-          command: build
-          target: x86_64-unknown-freebsd
-          args: "--release --workspace --exclude juicity-gui"
+        run: cross build --release --workspace --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
+        working-directory: ./juicity-rs-cli-source
         shell: bash
         run: |
           case "${{ matrix.cpu_variant }}" in
@@ -254,20 +387,20 @@ jobs:
             *)  PKG_NAME="juicity-${{ matrix.target }}" ;;
           esac
           mkdir -p "${PKG_NAME}"
-          cp "target/x86_64-unknown-freebsd/release/juicity-client" "${PKG_NAME}/" || true
-          cp "target/x86_64-unknown-freebsd/release/juicity-server" "${PKG_NAME}/" || true
+          cp "target/${{ matrix.target }}/release/juicity-client" "${PKG_NAME}/" || true
+          cp "target/${{ matrix.target }}/release/juicity-server" "${PKG_NAME}/" || true
           cp client/examples/config.json "${PKG_NAME}/client-config.json"
           cp server/examples/config.json "${PKG_NAME}/server-config.json"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v8
         with:
           name: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
-          path: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          path: ./juicity-rs-cli-source/juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
           if-no-files-found: error
 
   # --------------------------------------------------
-  # Release — attach all artifacts to GitHub Release
+  # Release — attach all artifacts + source package to GitHub Release
   # --------------------------------------------------
   release:
     name: Attach to Release
@@ -277,33 +410,56 @@ jobs:
       - windows-gnullvm
       - macos
       - freebsd
+      - source
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
 
-      - name: Compress artifacts into zip files
-        shell: bash
-        run: |
-          shopt -s globstar
-          for dir in artifacts/*/; do
-            target_name=$(basename "$dir")
-            zipfile="artifacts/${target_name}.zip"
-            echo "Creating zip: $zipfile from $dir"
-            (cd "$dir" && zip -r "../../${zipfile}" .)
-          done
-          
-      - name: Upload to Release
+      - name: Upload CLI source package to Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
+          set -e
+          SRC_ZIP="artifacts/juicity-full-cli-source/juicity-full-cli-source.zip"
+          if [ -f "$SRC_ZIP" ]; then
+            echo "Uploading source package: $SRC_ZIP"
+            gh release upload "${{ github.event.release.tag_name }}" "$SRC_ZIP" --clobber -R "$GH_REPO"
+          else
+            echo "Warning: Source package not found at $SRC_ZIP"
+            ls -la artifacts/juicity-full-cli-source/ 2>/dev/null || echo "Directory not found"
+          fi
+
+      - name: Package and upload binary artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -e
           shopt -s globstar
+          for dir in artifacts/*/; do
+            target_name=$(basename "$dir")
+            # Skip the source package directory
+            if [ "$target_name" = "juicity-full-cli-source" ]; then
+              echo "Skipping source package directory"
+              continue
+            fi
+            zipfile="artifacts/${target_name}.zip"
+            echo "Creating zip: $zipfile from $dir"
+            (cd "$dir" && zip -r "../../${zipfile}" .)
+          done
           for zipfile in artifacts/**/*.zip; do
             echo "Uploading: $zipfile"
             gh release upload "${{ github.event.release.tag_name }}" "$zipfile" --clobber -R "$GH_REPO"
