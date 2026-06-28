@@ -675,11 +675,6 @@ jobs:
           done
 
       - name: Upload to Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          shopt -s globstar
-          echo "Uploading: $zipfile"
-          gh release upload "${{ github.event.release.tag_name }}" "artifacts/**/*.zip" --clobber -R "$GH_REPO"
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*.zip
