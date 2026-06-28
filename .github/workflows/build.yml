@@ -60,14 +60,9 @@ jobs:
 
       - name: Upload offline source to Release
         if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        shell: bash
-        run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            juicity-offline-source.tar.gz \
-            --clobber -R "$GH_REPO"
+        uses: softprops/action-gh-release@v3
+        with:
+          files: juicity-offline-source.tar.gz
 
   # --------------------------------------------------
   # Linux — zigbuild
