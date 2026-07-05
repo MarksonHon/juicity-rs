@@ -4,7 +4,6 @@ use dashmap::DashMap;
 use indexmap::IndexMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::Instant;
 
 use juicity_common::consts;
@@ -311,7 +310,7 @@ impl JuicityServer {
         let udp_pool_cleanup = self.udp_endpoint_pool.clone();
         let _pool_guard = AbortOnDrop(
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                let mut interval = tokio::time::interval(consts::UDP_POOL_CLEANUP_INTERVAL);
                 loop {
                     interval.tick().await;
                     udp_pool_cleanup.cleanup();
@@ -436,7 +435,7 @@ async fn run_underlay_packet_loop(
     let sessions_cleanup = sessions.clone();
     let _sessions_cleanup_guard = AbortOnDrop(
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut interval = tokio::time::interval(consts::UNDERLAY_SESSION_CLEANUP_INTERVAL);
             loop {
                 interval.tick().await;
                 // Collect abort handles while holding the lock, then abort them
@@ -1074,8 +1073,12 @@ async fn handle_tcp_relay(
         tokio::io::copy_buf(&mut remote_rx, &mut quic_tx),
         tokio::io::copy_buf(&mut quic_rx, &mut remote_tx),
     );
-    if let Err(e) = r1 { tracing::debug!("TCP relay remote->quic: {:?}", e); }
-    if let Err(e) = r2 { tracing::debug!("TCP relay quic->remote: {:?}", e); }
+    if let Err(e) = r1 {
+        tracing::debug!("TCP relay remote->quic: {:?}", e);
+    }
+    if let Err(e) = r2 {
+        tracing::debug!("TCP relay quic->remote: {:?}", e);
+    }
 
     // Gracefully finish the send direction so quinn can clean up the stream
     // state immediately instead of holding it until a timeout or stream reset.

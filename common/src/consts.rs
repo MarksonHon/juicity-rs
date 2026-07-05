@@ -25,13 +25,16 @@ pub const KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
 
 /// QUIC per-stream receive window (bytes).
 /// Lowering this bounds worst-case memory per stream in high-throughput scenarios.
-pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = 512 * 1024;
+/// Reduced from 512KB to 256KB to halve worst-case per-stream buffer memory.
+pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 /// QUIC per-connection receive window (bytes).
 /// Must be >= stream window; limits aggregate receive buffering per connection.
-pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+/// Reduced from 8MB to 4MB to lower per-connection memory floor.
+pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
 /// QUIC send window (bytes).
 /// Caps unacknowledged outbound data retained in memory per connection.
-pub const QUIC_SEND_WINDOW: u64 = 8 * 1024 * 1024;
+/// Reduced from 8MB to 4MB.
+pub const QUIC_SEND_WINDOW: u64 = 4 * 1024 * 1024;
 
 /// JUICIY protocol version 0
 pub const JUICIY_VERSION_0: u8 = 0;
@@ -69,3 +72,23 @@ pub const MAX_UNDERLAY_HANDLER_CONCURRENCY: usize = 1_024;
 /// never open streams.  Set higher than the stream-accept timeout so the QUIC
 /// transport layer acts as a second line of defence.
 pub const MAX_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Underlay session cleanup interval.
+/// Reduced from 10s to 3s to evict stale sessions and release their relay-back
+/// task memory (≈12KB per session) more promptly.
+pub const UNDERLAY_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
+
+/// UDP endpoint pool cleanup interval.
+/// Reduced from 10s to 3s to close idle OS sockets and return them to the
+/// kernel sooner, reducing the burst window for fd pressure.
+pub const UDP_POOL_CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Client-side UDP session cleanup interval.
+/// Runs every 5s to remove zombie sessions (those whose tx channel is closed
+/// or which have been idle beyond the NAT timeout).
+pub const CLIENT_UDP_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Maximum idle time for a client-side UDP session before it is considered stale.
+/// Mirrors the server-side NAT timeout so both sides converge on a consistent
+/// eviction timeline.
+pub const CLIENT_UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(180);

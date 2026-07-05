@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use juicity_common::consts;
 use juicity_common::protocol;
@@ -28,6 +30,10 @@ struct UdpOutboundDatagram {
 
 struct UdpSessionEntry {
     id: u64,
+    /// Last time a datagram was forwarded through this session.
+    /// Used by the cleanup task to detect zombie sessions whose tx channel
+    /// remains open but no data has flowed for CLIENT_UDP_SESSION_IDLE_TIMEOUT.
+    last_used: Instant,
     tx: mpsc::Sender<UdpOutboundDatagram>,
 }
 
@@ -223,18 +229,21 @@ async fn handle_socks5(
             let cancel_guard = session_cancel.clone().drop_guard();
 
             // Periodic cleanup: remove UDP ASSOCIATE sessions whose writer channel has
-            // been closed (e.g., supervisor task paniced without removing its entry).
+            // been closed (e.g., supervisor task paniced without removing its entry)
+            // or whose idle time exceeds the NAT timeout.
             // This mirrors the cleanup task in forwarder.rs to keep them consistent.
             let sessions_cleanup = sessions.clone();
             let ctrl_cancel_cleanup = ctrl_cancel_clone.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                let mut interval =
+                    tokio::time::interval(consts::CLIENT_UDP_SESSION_CLEANUP_INTERVAL);
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
+                            let idle_cutoff = Instant::now() - consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT;
                             let mut guard = sessions_cleanup.lock().await;
                             let before = guard.len();
-                            guard.retain(|_, s| !s.tx.is_closed());
+                            guard.retain(|_, s| !s.tx.is_closed() && s.last_used > idle_cutoff);
                             let after = guard.len();
                             drop(guard);
                             if before != after {
@@ -283,6 +292,11 @@ async fn handle_socks5(
 
                                     if let Some((session_id, tx)) = existing {
                                         if tx.send(datagram.clone()).await.is_ok() {
+                                            // Update last_used so the cleanup task does not
+                                            // consider this session stale.
+                                            if let Some(s) = sessions.lock().await.get_mut(&src) {
+                                                s.last_used = Instant::now();
+                                            }
                                             continue;
                                         }
                                         remove_session_if_match(&sessions, src, session_id).await;
@@ -306,6 +320,7 @@ async fn handle_socks5(
                                                 src,
                                                 UdpSessionEntry {
                                                     id: new_session_id,
+                                                    last_used: Instant::now(),
                                                     tx,
                                                 },
                                             );

@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use juicity_common::consts;
 use juicity_common::protocol;
@@ -274,13 +276,14 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
     let sessions_cleanup = sessions.clone();
     let _cleanup_guard = AbortOnDrop(
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut interval = tokio::time::interval(consts::CLIENT_UDP_SESSION_CLEANUP_INTERVAL);
             loop {
                 interval.tick().await;
+                let idle_cutoff = Instant::now() - consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT;
                 sessions_cleanup
                     .lock()
                     .await
-                    .retain(|_, s| !s.tx.is_closed());
+                    .retain(|_, s| !s.tx.is_closed() && s.last_used > idle_cutoff);
             }
         })
         .abort_handle(),
@@ -341,6 +344,10 @@ struct UdpSession {
     /// Unique session ID, used by the supervisor to verify it is removing the
     /// correct entry from the sessions map (prevents races with session replacement).
     id: u64,
+    /// Last time a datagram was forwarded through this session.
+    /// Used by the cleanup task to detect zombie sessions whose tx channel
+    /// remains open but no data has flowed for CLIENT_UDP_SESSION_IDLE_TIMEOUT.
+    last_used: Instant,
     /// Sender channel to push outbound datagrams to the QUIC writer task
     tx: tokio::sync::mpsc::Sender<Bytes>,
 }
@@ -367,6 +374,11 @@ async fn handle_udp_datagram(
         // Session exists, send datagram through it.
         // Bytes is Arc-based, so clone is cheap (refcount increment).
         if tx.send(data.clone()).await.is_ok() {
+            // Update last_used so the cleanup task does not consider this
+            // session stale — a quick, short lock acquisition.
+            if let Some(s) = sessions.lock().await.get_mut(&src_addr) {
+                s.last_used = Instant::now();
+            }
             return Ok(());
         }
         // Session is dead — remove it only if the entry hasn't been replaced
@@ -397,6 +409,7 @@ async fn handle_udp_datagram(
             src_addr,
             UdpSession {
                 id: session_id,
+                last_used: Instant::now(),
                 tx: tx.clone(),
             },
         );
