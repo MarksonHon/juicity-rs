@@ -1,10 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use dashmap::{DashMap, DashSet};
 use lru::LruCache;
 use tokio::sync::Notify;
 
@@ -58,29 +58,27 @@ impl UdpEndpoint {
 ///
 /// Instead of a single global `create_lock` (which serialises all
 /// `get_or_create` calls regardless of target address), this implementation
-/// uses a [`DashSet<SocketAddr>`] to track **per-address** creation state.
+/// uses a [`Mutex<HashSet<SocketAddr>>`] to track **per-address** creation state.
 /// Concurrent calls for different addresses proceed in parallel, eliminating
 /// the global bottleneck while still preventing duplicate `UdpEndpoint::new`
 /// calls for the same address (which would waste system resources on ephemeral
 /// port exhaustion).
 ///
-/// # Lock-free inner cache
+/// # Lock behaviour
 ///
-/// The inner [`Mutex<LruCache>`] uses [`std::sync::Mutex`] instead of
-/// [`tokio::sync::Mutex`] because all critical sections are sub-microsecond
-/// (LRU get/put/remove) and no `.await` point is ever held under the lock.
-/// Using `std::sync::Mutex` avoids the additional bookkeeping overhead of
-/// Tokio's async mutex for these extremely short operations.
+/// All [`std::sync::Mutex`] locks are held only for sub-microsecond critical
+/// sections (lookup, insert, remove) and no `.await` point is ever held under
+/// any lock. This avoids the overhead of Tokio's async mutex.
 pub struct UdpEndpointPool {
     inner: Mutex<LruCache<SocketAddr, UdpEndpoint>>,
     /// Tracks which addresses currently have an in-flight `UdpEndpoint::new`.
     /// Insertion returns `true` iff the caller is the designated creator;
     /// other callers wait on the per-address [`Notify`] stored in
     /// [`notify_map`](Self::notify_map).
-    creating: DashSet<SocketAddr>,
+    creating: Mutex<HashSet<SocketAddr>>,
     /// Maps addresses being created to a [`Notify`] that will be signalled
     /// when creation completes (successfully or otherwise).
-    notify_map: DashMap<SocketAddr, Arc<Notify>>,
+    notify_map: Mutex<HashMap<SocketAddr, Arc<Notify>>>,
 }
 
 impl UdpEndpointPool {
@@ -89,8 +87,8 @@ impl UdpEndpointPool {
             inner: Mutex::new(LruCache::new(NonZeroUsize::new(max_size).expect(
                 "UdpEndpointPool max_size must be > 0; verify MAX_UDP_ENDPOINTS in consts",
             ))),
-            creating: DashSet::new(),
-            notify_map: DashMap::new(),
+            creating: Mutex::new(HashSet::new()),
+            notify_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -152,17 +150,25 @@ impl UdpEndpointPool {
                 }
             }
 
-            // ── Per-addr creation arbitration via DashSet ──
+            // ── Per-addr creation arbitration via Mutex<HashSet> ──
             // Try to become the designated creator for this address.
             // We pre-allocate the Notify so that waiters can always find one.
             let notify = Arc::new(Notify::new());
 
-            if self.creating.insert(addr) {
+            if self
+                .creating
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(addr)
+            {
                 // ── We are the creator ──
                 // Register our Notify so that concurrent waiters can subscribe.
-                self.notify_map.insert(addr, notify.clone());
+                self.notify_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(addr, notify.clone());
 
-                // Double-check: while we waited for the DashSet insert, another
+                // Double-check: while we waited for the HashSet insert, another
                 // task may have inserted a fresh endpoint into the cache.
                 {
                     let mut inner = self
@@ -175,8 +181,14 @@ impl UdpEndpointPool {
                             let socket = endpoint.socket.try_clone()?;
                             let dial_target = endpoint.dial_target.clone();
                             // Clean up creation tracking before returning.
-                            self.creating.remove(&addr);
-                            self.notify_map.remove(&addr);
+                            self.creating
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&addr);
+                            self.notify_map
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&addr);
                             // Notify any concurrent waiters so they find the
                             // cached entry immediately.
                             notify.notify_waiters();
@@ -200,8 +212,14 @@ impl UdpEndpointPool {
                         inner.put(addr, endpoint);
 
                         // Clean up creation tracking and notify waiters.
-                        self.creating.remove(&addr);
-                        self.notify_map.remove(&addr);
+                        self.creating
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&addr);
+                        self.notify_map
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&addr);
                         notify.notify_waiters();
 
                         return Ok(((socket, dial_target), true));
@@ -209,8 +227,14 @@ impl UdpEndpointPool {
                     Err(e) => {
                         // Creation failed — clean up and notify waiters so they
                         // can retry or propagate the error.
-                        self.creating.remove(&addr);
-                        self.notify_map.remove(&addr);
+                        self.creating
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&addr);
+                        self.notify_map
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&addr);
                         notify.notify_waiters();
                         return Err(e);
                     }
@@ -222,16 +246,21 @@ impl UdpEndpointPool {
             // If the creator has already finished (unlikely but possible in a
             // race), the Notify will have been signalled and `notified().await`
             // will return immediately.
-            let wait_notify = self
-                .notify_map
-                .entry(addr)
-                .or_insert_with(|| Arc::new(Notify::new()))
-                .value()
-                .clone();
+            let wait_notify = {
+                let mut map = self.notify_map.lock().unwrap_or_else(|e| e.into_inner());
+                map.entry(addr)
+                    .or_insert_with(|| Arc::new(Notify::new()))
+                    .clone()
+            };
 
             // Double-check: the creator might have completed between our
             // `creating.insert` returning false and registering above.
-            if !self.creating.contains(&addr) {
+            if !self
+                .creating
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&addr)
+            {
                 // Creator finished — check the cache directly and retry
                 // from the top of the loop.
                 let mut inner = self

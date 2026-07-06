@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use dashmap::DashMap;
 use indexmap::IndexMap;
+use moka::sync::Cache;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,8 +27,6 @@ use uuid::Uuid;
 struct UnderlaySession {
     target: Arc<str>,
     cipher: Arc<UnderlayCipher>,
-    /// Last time a packet was handled for this session (updated under the sessions lock).
-    last_used: std::time::Instant,
     /// Abort handle for the relay-back task; `None` until the task is spawned.
     relay_abort: Option<tokio::task::AbortHandle>,
 }
@@ -392,8 +390,9 @@ impl JuicityServer {
 /// [`handle_non_quic_underlay_packet`].
 ///
 /// It also manages the underlay session map (a
-/// [`DashMap`]-backed cache of [`UnderlaySession`]) and
-/// spawns a periodic cleanup subtask that evicts idle sessions.
+/// [`moka::sync::Cache`] of [`UnderlaySession`]) which handles
+/// automatic TTL-based eviction of idle sessions and LRU eviction
+/// when at capacity.
 ///
 /// # Arguments
 ///
@@ -418,51 +417,28 @@ async fn run_underlay_packet_loop(
     server_socket: Arc<tokio::net::UdpSocket>,
     disable_udp_443: bool,
 ) {
-    // ══ DashMap usage note ═══════════════════════════════════════════════
-    // DashMap provides shard-level locking: different SocketAddr keys hash to
-    // different shards, so concurrent access to distinct sessions does not
-    // contend.  Under high packet rates, this eliminates the single-Mutex
-    // bottleneck.  LRU eviction is handled manually (DashMap has no built-in
-    // LRU), using a linear scan for the oldest last_used entry when the map
-    // reaches capacity — acceptable because eviction is rare and MAX_UNDERLAY_
-    // SESSIONS is moderate (5 000).
-    let sessions: Arc<DashMap<SocketAddr, UnderlaySession>> =
-        Arc::new(DashMap::with_capacity(consts::MAX_UNDERLAY_SESSIONS));
-
-    // Periodic cleanup: remove sessions that have been idle for longer than the NAT
-    // timeout and abort their relay-back tasks so they don't run indefinitely.
-    // AbortOnDrop ensures this task is cancelled when run_underlay_packet_loop returns.
-    let sessions_cleanup = sessions.clone();
-    let _sessions_cleanup_guard = AbortOnDrop(
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(consts::UNDERLAY_SESSION_CLEANUP_INTERVAL);
-            loop {
-                interval.tick().await;
-                // Collect abort handles while holding the lock, then abort them
-                // after releasing it, so abort() is not called under the mutex.
-                let to_abort: Vec<tokio::task::AbortHandle> = {
-                    let mut handles = Vec::new();
-                    // DashMap::retain locks each shard sequentially and passes
-                    // &mut V to the closure, which is safe to capture &mut handles.
-                    sessions_cleanup.retain(|_, s| {
-                        if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
-                            if let Some(h) = s.relay_abort.take() {
-                                handles.push(h);
-                            }
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    handles
-                };
-                for h in to_abort {
-                    h.abort();
-                }
-            }
-        })
-        .abort_handle(),
-    );
+    // ══ Moka cache for underlay sessions ══════════════════════════════════
+    // Uses moka::sync::Cache with:
+    //   - time_to_idle: entries idle for > DEFAULT_NAT_TIMEOUT are auto-evicted
+    //   - max_capacity: LRU eviction when at MAX_UNDERLAY_SESSIONS
+    //   - eviction_listener: aborts relay-back tasks and removes from UDP pool
+    //
+    // This replaces the manual DashMap cleanup loop and capacity O(n) scan.
+    let sessions: Arc<Cache<SocketAddr, UnderlaySession>> = {
+        let udp_pool_for_evict = udp_pool.clone();
+        Arc::new(
+            Cache::builder()
+                .max_capacity(consts::MAX_UNDERLAY_SESSIONS as u64)
+                .time_to_idle(consts::DEFAULT_NAT_TIMEOUT)
+                .eviction_listener(move |_k: Arc<SocketAddr>, _v: UnderlaySession, _cause| {
+                    if let Some(h) = _v.relay_abort {
+                        h.abort();
+                    }
+                    udp_pool_for_evict.remove(&*_k);
+                })
+                .build(),
+        )
+    };
 
     // Limit concurrent underlay packet handler tasks to prevent unbounded task
     // accumulation under high traffic. Each handler may wait up to 100ms in
@@ -524,7 +500,7 @@ async fn run_underlay_packet_loop(
 /// * `in_flight` - The shared in-flight auth table used to match salts to
 ///   authenticated underlay sessions.
 /// * `udp_pool` - The shared UDP endpoint pool for full-cone NAT.
-/// * `sessions` - The shared [`DashMap`] of active [`UnderlaySession`]s.
+/// * `sessions` - The shared [`moka::sync::Cache`] of active [`UnderlaySession`]s.
 /// * `server_socket` - The server's main UDP socket, used for relay-back
 ///   traffic.
 /// * `disable_udp_443` - When `true`, outbound UDP to port 443 is blocked.
@@ -545,7 +521,7 @@ async fn handle_non_quic_underlay_packet(
     packet: crate::underlay_socket::UnderlayPacket,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_pool: Arc<crate::udp::UdpEndpointPool>,
-    sessions: Arc<DashMap<SocketAddr, UnderlaySession>>,
+    sessions: Arc<Cache<SocketAddr, UnderlaySession>>,
     server_socket: Arc<tokio::net::UdpSocket>,
     disable_udp_443: bool,
 ) -> anyhow::Result<()> {
@@ -558,24 +534,14 @@ async fn handle_non_quic_underlay_packet(
     let mut payload = packet.payload;
 
     let existing_session = {
-        match sessions.get_mut(&source) {
-            Some(mut s) => {
-                // Check per-session expiry: if idle for too long, remove and fall
-                // through to the new-session path instead of using a stale session.
-                if s.last_used.elapsed() >= consts::DEFAULT_NAT_TIMEOUT {
-                    // Drop the RefMut before calling remove() to avoid deadlock
-                    // (both acquire a write-lock on the same shard).
-                    drop(s);
-                    sessions.remove(&source);
-                    None
-                } else {
-                    s.last_used = std::time::Instant::now();
-                    // Avoid cloning the full UnderlaySession struct. Extract only
-                    // the fields we need:
-                    // - cipher: Arc clone is just a refcount increment
-                    // - target: Arc<str> clone is just a refcount increment
-                    Some((s.cipher.clone(), s.target.clone()))
-                }
+        match sessions.get(&source) {
+            Some(s) => {
+                // moka's time_to_idle handles TTL automatically.
+                // A successful get() means the entry is still valid.
+                // Extract only the fields we need:
+                // - cipher: Arc clone is just a refcount increment
+                // - target: Arc<str> clone is just a refcount increment
+                Some((s.cipher.clone(), s.target.clone()))
             }
             None => None,
         }
@@ -619,12 +585,13 @@ async fn handle_non_quic_underlay_packet(
             .await
         {
             udp_pool.remove(&source);
-            // Remove the session; the relay task will be aborted by cleanup.
-            if let Some((_, s)) = sessions.remove(&source) {
+            // Remove the session and abort its relay task.
+            if let Some(s) = sessions.get(&source) {
                 if let Some(h) = s.relay_abort {
                     h.abort();
                 }
             }
+            sessions.invalidate(&source);
             return Err(anyhow::anyhow!(
                 "underlay send_to {} failed: {:?}",
                 &**target,
@@ -701,30 +668,24 @@ async fn handle_non_quic_underlay_packet(
         let udp_pool_for_task = udp_pool.clone();
 
         // ── SessionGuard ──────────────────────────────────────────────────
-        // A Drop guard that ensures the session entry is removed from the
-        // sessions map when the relay-back task exits, *even if the task is
+        // A Drop guard that ensures the session entry is invalidated from the
+        // sessions cache when the relay-back task exits, *even if the task is
         // externally aborted via AbortHandle*.
         //
         // When abort() is called on a running task, tokio drops the future
         // at the next await point — local variables go through Drop, but code
         // after the loop (the manual cleanup below) never executes.
         // SessionGuard's Drop impl runs regardless of how the task terminates:
-        //   - Normal exit (loop breaks) → guard is dropped → session removed.
-        //   - External abort             → guard is dropped → session removed.
-        //   - Panic                      → guard is dropped → session removed.
-        //
-        // This eliminates the window where an aborted relay task leaves a stale
-        // session entry until the periodic cleanup (30s) removes it.
-        //
-        // Pool cleanup uses std::sync::Mutex (non-async) so periodic
-        // cleanup can also handle stale entries.
+        //   - Normal exit (loop breaks) → guard is dropped → session invalidated.
+        //   - External abort             → guard is dropped → session invalidated.
+        //   - Panic                      → guard is dropped → session invalidated.
         struct SessionGuard {
             source: SocketAddr,
-            sessions: Arc<DashMap<SocketAddr, UnderlaySession>>,
+            sessions: Arc<Cache<SocketAddr, UnderlaySession>>,
         }
         impl Drop for SessionGuard {
             fn drop(&mut self) {
-                self.sessions.remove(&self.source);
+                self.sessions.invalidate(&self.source);
             }
         }
 
@@ -788,33 +749,12 @@ async fn handle_non_quic_underlay_packet(
     let session = UnderlaySession {
         target: Arc::from(target.as_str()),
         cipher,
-        last_used: std::time::Instant::now(),
         relay_abort,
     };
 
-    // Insert session — when at capacity, evict the least-recently-used entry.
-    // DashMap has no built-in LRU, so we scan for the oldest last_used.  The
-    // scan is O(n) but only runs on capacity-miss (rare), and MAX_UNDERLAY_
-    // SESSIONS (5 000) is small enough that the linear cost is negligible.
-    let evicted_session: Option<(SocketAddr, Option<tokio::task::AbortHandle>)> = {
-        let evicted = if sessions.len() >= consts::MAX_UNDERLAY_SESSIONS {
-            sessions
-                .iter()
-                .min_by_key(|entry| entry.last_used)
-                .map(|entry| *entry.key())
-                .and_then(|addr| sessions.remove(&addr).map(|(_, s)| (addr, s.relay_abort)))
-        } else {
-            None
-        };
-        sessions.insert(source, session.clone());
-        evicted
-    };
-    if let Some((oldest_addr, relay_abort)) = evicted_session {
-        if let Some(h) = relay_abort {
-            h.abort()
-        }
-        udp_pool.remove(&oldest_addr);
-    }
+    // Insert session — moka's max_capacity handles LRU eviction automatically.
+    // The eviction listener aborts the relay task and removes from the UDP pool.
+    sessions.insert(source, session.clone());
     tracing::debug!("new underlay session {} -> {}", source, &*session.target);
 
     // Send first packet immediately — relay task is already running.
@@ -824,11 +764,12 @@ async fn handle_non_quic_underlay_packet(
         .await
     {
         udp_pool.remove(&source);
-        if let Some((_, s)) = sessions.remove(&source) {
+        if let Some(s) = sessions.get(&source) {
             if let Some(h) = s.relay_abort {
                 h.abort();
             }
         }
+        sessions.invalidate(&source);
         return Err(anyhow::anyhow!(
             "underlay send_to {} failed: {:?}",
             dial_target,
