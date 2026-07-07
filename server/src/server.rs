@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 
 use indexmap::IndexMap;
 use moka::sync::Cache;
@@ -111,12 +112,14 @@ impl JuicityServer {
             transport_config.initial_rtt(std::time::Duration::from_millis(initial_rtt_ms));
         }
 
-        // Set keep_alive_interval if configured; otherwise use default
-        let keep_alive = config
-            .keep_alive_interval
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(consts::KEEP_ALIVE_PERIOD);
-        transport_config.keep_alive_interval(Some(keep_alive));
+        // Keep-alive is disabled by default so QUIC idle timeout / connection
+        // lifecycle management can release idle connections naturally.
+        // Enable only when explicitly configured.
+        if let Some(keep_alive_secs) = config.keep_alive_interval {
+            transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+                keep_alive_secs,
+            )));
+        }
 
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
             consts::MAX_OPEN_INCOMING_STREAMS as u32,
@@ -198,6 +201,20 @@ impl JuicityServer {
     }
 
     pub async fn serve(&self, addr: &str) -> anyhow::Result<()> {
+        self.serve_with_shutdown(addr, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serve until an external shutdown signal resolves.
+    ///
+    /// Shutdown sequence:
+    /// 1) signal accept loops to stop taking new connections
+    /// 2) allow a grace period for in-flight connection handlers to drain
+    /// 3) abort remaining accept workers/tasks that did not exit in time
+    pub async fn serve_with_shutdown<F>(&self, addr: &str, shutdown: F) -> anyhow::Result<()>
+    where
+        F: Future<Output = ()> + Send,
+    {
         // Support ":port" shorthand (e.g. ":23182").
         // When only a port is given, bind a dual-stack socket ([::]:port with
         // IPV6_V6ONLY=false) so both IPv4 and IPv6 clients are accepted on a
@@ -337,6 +354,19 @@ impl JuicityServer {
             .abort_handle(),
         );
 
+        // Broadcast shutdown to all accept workers.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        // If an accept worker does not stop promptly after shutdown is broadcast,
+        // abort it after this timeout.
+        let accept_stop_timeout = std::time::Duration::from_secs(3);
+        // Grace period for connection handlers after accepting stops.
+        let connection_drain_timeout = std::time::Duration::from_secs(5);
+        // Bound concurrent per-endpoint connection handlers.
+        let max_concurrent_connection_handlers = 1024usize;
+
+        let mut accept_guards: Vec<AbortOnDrop> = Vec::new();
+        let mut accept_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
         // Spawn one accept loop per endpoint so the kernel distributes
         // incoming packets across cores via SO_REUSEPORT.
         for endpoint in endpoints {
@@ -345,37 +375,113 @@ impl JuicityServer {
             let udp_pool = self.udp_endpoint_pool.clone();
             let dialer = self.dialer.clone();
             let disable_443 = self.disable_outbound_udp443;
+            let mut accept_shutdown = shutdown_rx.clone();
 
-            tokio::spawn(async move {
-                while let Some(incoming) = endpoint.accept().await {
-                    let users = users.clone();
-                    let in_flight = in_flight.clone();
-                    let udp_pool = udp_pool.clone();
-                    let dialer = dialer.clone();
-                    let disable_443 = disable_443;
+            let accept_handle = tokio::spawn(async move {
+                let mut conn_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+                let conn_limit = Arc::new(tokio::sync::Semaphore::new(
+                    max_concurrent_connection_handlers,
+                ));
 
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(
-                            incoming,
-                            users,
-                            in_flight,
-                            udp_pool,
-                            dialer,
-                            disable_443,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Connection handler error: {:?}", e);
+                loop {
+                    while conn_tasks.try_join_next().is_some() {}
+
+                    tokio::select! {
+                        changed = accept_shutdown.changed() => {
+                            match changed {
+                                Ok(()) if *accept_shutdown.borrow() => {
+                                    break;
+                                }
+                                Ok(()) => {}
+                                Err(_) => {
+                                    break;
+                                }
+                            }
                         }
-                    });
+                        incoming = endpoint.accept() => {
+                            let Some(incoming) = incoming else {
+                                break;
+                            };
+
+                            let permit = match conn_limit.clone().acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => break,
+                            };
+
+                            let users = users.clone();
+                            let in_flight = in_flight.clone();
+                            let udp_pool = udp_pool.clone();
+                            let dialer = dialer.clone();
+                            let disable_443 = disable_443;
+
+                            conn_tasks.spawn(async move {
+                                let _permit = permit;
+                                if let Err(e) = handle_connection(
+                                    incoming,
+                                    users,
+                                    in_flight,
+                                    udp_pool,
+                                    dialer,
+                                    disable_443,
+                                )
+                                .await
+                                {
+                                    tracing::warn!("Connection handler error: {:?}", e);
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // Drain existing connection handlers first.
+                let deadline = tokio::time::Instant::now() + connection_drain_timeout;
+                while !conn_tasks.is_empty() {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, conn_tasks.join_next()).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+
+                // Any still-running handlers are force-aborted after grace period.
+                if !conn_tasks.is_empty() {
+                    conn_tasks.abort_all();
+                    while conn_tasks.join_next().await.is_some() {}
                 }
             });
+
+            accept_guards.push(AbortOnDrop(accept_handle.abort_handle()));
+            accept_handles.push(accept_handle);
         }
 
-        // Block forever — accept loops run as spawned tasks.
-        // The AbortOnDrop guards ensure cleanup when the caller drops this future.
-        std::future::pending::<()>().await;
-        #[allow(unreachable_code)]
+        // Wait until shutdown is requested by the caller.
+        shutdown.await;
+        tracing::info!("shutdown requested: stopping accept loops");
+
+        // 1) Stop accepting new connections.
+        let _ = shutdown_tx.send(true);
+
+        // 2) Let accept workers finish draining in-flight connection handlers.
+        let stop_deadline = tokio::time::Instant::now() + accept_stop_timeout;
+        while tokio::time::Instant::now() < stop_deadline {
+            if accept_handles.iter().all(|h| h.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // 3) Force-abort any accept workers still not exited.
+        drop(accept_guards);
+
+        // Join all workers so task resources are reclaimed before returning.
+        for handle in accept_handles {
+            let _ = handle.await;
+        }
+
         Ok(())
     }
 }

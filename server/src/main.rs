@@ -149,7 +149,7 @@ async fn run() -> anyhow::Result<()> {
             tracing::info!("Juicity server starting...");
 
             let srv = juicity_server::server::JuicityServer::new(&config).await?;
-            srv.serve(&config.listen).await?;
+            srv.serve_with_shutdown(&config.listen, shutdown_signal()).await?;
         }
 
         Commands::Export {
@@ -242,6 +242,57 @@ async fn run() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                tracing::info!("received SIGINT, starting graceful shutdown");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, starting graceful shutdown");
+            }
+        }
+
+        // Second signal forces immediate termination to avoid hanging shutdown.
+        tokio::spawn(async move {
+            let mut sigint2 = signal(SignalKind::interrupt())
+                .expect("failed to install second SIGINT handler");
+            let mut sigterm2 = signal(SignalKind::terminate())
+                .expect("failed to install second SIGTERM handler");
+
+            tokio::select! {
+                _ = sigint2.recv() => {
+                    tracing::warn!("received second SIGINT, forcing exit");
+                }
+                _ = sigterm2.recv() => {
+                    tracing::warn!("received second SIGTERM, forcing exit");
+                }
+            }
+
+            std::process::exit(130);
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received shutdown signal, starting graceful shutdown");
+
+        // Second Ctrl+C forces immediate termination to avoid hanging shutdown.
+        tokio::spawn(async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::warn!("received second shutdown signal, forcing exit");
+            std::process::exit(130);
+        });
+    }
 }
 
 // ── Host Resolution ──

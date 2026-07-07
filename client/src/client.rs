@@ -120,11 +120,14 @@ impl JuicityClient {
             transport_config.initial_rtt(std::time::Duration::from_millis(initial_rtt_ms));
         }
 
-        // Set keep_alive_interval if configured; otherwise use default
-        let keep_alive = keep_alive_interval
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(consts::KEEP_ALIVE_PERIOD);
-        transport_config.keep_alive_interval(Some(keep_alive));
+        // Keep-alive is disabled by default so QUIC idle timeout / connection
+        // lifecycle management can release idle connections naturally.
+        // Enable only when explicitly configured.
+        if let Some(keep_alive_secs) = keep_alive_interval {
+            transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+                keep_alive_secs,
+            )));
+        }
 
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
             consts::MAX_OPEN_INCOMING_STREAMS as u32,
