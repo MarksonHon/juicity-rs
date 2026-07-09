@@ -132,6 +132,27 @@ impl UdpEndpointPool {
         addr: SocketAddr,
         options: UdpEndpointOptions,
     ) -> anyhow::Result<((std::net::UdpSocket, Arc<str>), bool)> {
+        struct CreationGuard<'a> {
+            addr: SocketAddr,
+            creating: &'a Mutex<HashSet<SocketAddr>>,
+            notify_map: &'a Mutex<HashMap<SocketAddr, Arc<Notify>>>,
+            notify: Arc<Notify>,
+        }
+
+        impl Drop for CreationGuard<'_> {
+            fn drop(&mut self) {
+                self.creating
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.addr);
+                self.notify_map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.addr);
+                self.notify.notify_waiters();
+            }
+        }
+
         // Use a loop instead of recursion to avoid infinitely sized futures
         // (Rust does not allow recursive async fn calls without boxing).
         loop {
@@ -168,6 +189,13 @@ impl UdpEndpointPool {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(addr, notify.clone());
 
+                let _creation_guard = CreationGuard {
+                    addr,
+                    creating: &self.creating,
+                    notify_map: &self.notify_map,
+                    notify,
+                };
+
                 // Double-check: while we waited for the HashSet insert, another
                 // task may have inserted a fresh endpoint into the cache.
                 {
@@ -180,18 +208,6 @@ impl UdpEndpointPool {
                             endpoint.touch();
                             let socket = endpoint.socket.try_clone()?;
                             let dial_target = endpoint.dial_target.clone();
-                            // Clean up creation tracking before returning.
-                            self.creating
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .remove(&addr);
-                            self.notify_map
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .remove(&addr);
-                            // Notify any concurrent waiters so they find the
-                            // cached entry immediately.
-                            notify.notify_waiters();
                             return Ok(((socket, dial_target), false));
                         }
                     }
@@ -211,33 +227,9 @@ impl UdpEndpointPool {
                             .map_err(|e| anyhow::anyhow!("mutex poisoned: {:?}", e))?;
                         inner.put(addr, endpoint);
 
-                        // Clean up creation tracking and notify waiters.
-                        self.creating
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&addr);
-                        self.notify_map
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&addr);
-                        notify.notify_waiters();
-
                         return Ok(((socket, dial_target), true));
                     }
-                    Err(e) => {
-                        // Creation failed — clean up and notify waiters so they
-                        // can retry or propagate the error.
-                        self.creating
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&addr);
-                        self.notify_map
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&addr);
-                        notify.notify_waiters();
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
 

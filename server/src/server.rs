@@ -116,9 +116,8 @@ impl JuicityServer {
         // lifecycle management can release idle connections naturally.
         // Enable only when explicitly configured.
         if let Some(keep_alive_secs) = config.keep_alive_interval {
-            transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-                keep_alive_secs,
-            )));
+            transport_config
+                .keep_alive_interval(Some(std::time::Duration::from_secs(keep_alive_secs)));
         }
 
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
@@ -1312,13 +1311,17 @@ async fn resolve_udp_target(
     }
 
     let key = (Arc::from(host), port);
-    // Check cache with TTL expiry (brief lock)
+    // Check cache with TTL expiry (brief lock).
+    // If found but TTL expired, remove the stale entry immediately so it does
+    // not linger in the map and occupy a slot until the cache fills up.
     {
-        let cache = dns_cache.lock().await;
+        let mut cache = dns_cache.lock().await;
         if let Some((mapped, timestamp)) = cache.get(&key) {
             if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
                 return Ok(*mapped);
             }
+            // TTL expired — evict the stale entry.
+            cache.swap_remove(&key);
         }
     }
 

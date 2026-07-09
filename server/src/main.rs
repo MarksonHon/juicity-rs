@@ -148,8 +148,28 @@ async fn run() -> anyhow::Result<()> {
 
             tracing::info!("Juicity server starting...");
 
+            // On musl targets, periodically force mimalloc to release unused
+            // pages back to the OS. mimalloc is less aggressive than jemalloc
+            // about returning memory to the kernel, so this amortised call
+            // keeps RSS from monotonically increasing under varying load.
+            #[cfg(target_env = "musl")]
+            {
+                tokio::spawn(async {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                    interval.tick().await; // skip the immediate first tick
+                    loop {
+                        interval.tick().await;
+                        // force=false: mild collection, no performance impact
+                        unsafe {
+                            libmimalloc_sys::mi_collect(false);
+                        }
+                    }
+                });
+            }
+
             let srv = juicity_server::server::JuicityServer::new(&config).await?;
-            srv.serve_with_shutdown(&config.listen, shutdown_signal()).await?;
+            srv.serve_with_shutdown(&config.listen, shutdown_signal())
+                .await?;
         }
 
         Commands::Export {
@@ -250,7 +270,8 @@ async fn shutdown_signal() {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
         tokio::select! {
             _ = sigint.recv() => {
@@ -263,10 +284,10 @@ async fn shutdown_signal() {
 
         // Second signal forces immediate termination to avoid hanging shutdown.
         tokio::spawn(async move {
-            let mut sigint2 = signal(SignalKind::interrupt())
-                .expect("failed to install second SIGINT handler");
-            let mut sigterm2 = signal(SignalKind::terminate())
-                .expect("failed to install second SIGTERM handler");
+            let mut sigint2 =
+                signal(SignalKind::interrupt()).expect("failed to install second SIGINT handler");
+            let mut sigterm2 =
+                signal(SignalKind::terminate()).expect("failed to install second SIGTERM handler");
 
             tokio::select! {
                 _ = sigint2.recv() => {

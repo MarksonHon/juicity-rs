@@ -33,3 +33,4 @@ tikv-jemallocator = { workspace = true }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = { workspace = true }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }

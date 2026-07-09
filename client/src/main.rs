@@ -98,7 +98,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-
     let cli = Cli::parse();
 
     // Handle -v/--version before any subcommand logic
@@ -137,6 +136,25 @@ async fn run() -> anyhow::Result<()> {
                 .init();
 
             tracing::info!("Juicity client starting...");
+
+            // On musl targets, periodically force mimalloc to release unused
+            // pages back to the OS. mimalloc is less aggressive than jemalloc
+            // about returning memory to the kernel, so this amortised call
+            // keeps RSS from monotonically increasing under varying load.
+            #[cfg(target_env = "musl")]
+            {
+                tokio::spawn(async {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                    interval.tick().await; // skip the immediate first tick
+                    loop {
+                        interval.tick().await;
+                        // force=false: mild collection, no performance impact
+                        unsafe {
+                            libmimalloc_sys::mi_collect(false);
+                        }
+                    }
+                });
+            }
 
             let client = client::JuicityClient::new(&config).await?;
 

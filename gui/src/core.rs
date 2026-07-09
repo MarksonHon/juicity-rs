@@ -66,9 +66,17 @@ impl CoreManager {
         let (mut cmd, temp_config) = build_command(config, profile)?;
         tracing::info!("starting {:?} core for profile {}", profile.protocol, profile.name);
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn {:?} core process", profile.protocol))?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                if let Some(path) = temp_config.as_ref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                return Err(err).with_context(|| {
+                    format!("failed to spawn {:?} core process", profile.protocol)
+                });
+            }
+        };
 
         self.running = Some(RunningCore {
             protocol: profile.protocol,
