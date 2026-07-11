@@ -78,11 +78,6 @@ pub const MAX_QUIC_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// task memory (≈12KB per session) more promptly.
 pub const UNDERLAY_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
 
-/// UDP endpoint pool cleanup interval.
-/// Reduced from 10s to 3s to close idle OS sockets and return them to the
-/// kernel sooner, reducing the burst window for fd pressure.
-pub const UDP_POOL_CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
-
 /// Client-side UDP session cleanup interval.
 /// Runs every 5s to remove zombie sessions (those whose tx channel is closed
 /// or which have been idle beyond the NAT timeout).

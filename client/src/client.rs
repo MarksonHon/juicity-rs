@@ -124,9 +124,8 @@ impl JuicityClient {
         // lifecycle management can release idle connections naturally.
         // Enable only when explicitly configured.
         if let Some(keep_alive_secs) = keep_alive_interval {
-            transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
-                keep_alive_secs,
-            )));
+            transport_config
+                .keep_alive_interval(Some(std::time::Duration::from_secs(keep_alive_secs)));
         }
 
         transport_config.max_concurrent_bidi_streams(VarInt::from_u32(
@@ -522,6 +521,14 @@ impl JuicityClient {
     ///
     /// The `addr_buf` is a reusable scratch buffer to avoid per-packet heap
     /// allocation. It is cleared before each use.
+    /// Send a subsequent UDP datagram on an existing stream.
+    ///
+    /// Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
+    /// No leading network byte — each datagram carries only its own address.
+    ///
+    /// The `addr_buf` is a reusable scratch buffer to avoid per-packet heap
+    /// allocation. All three wire segments are batched into a single
+    /// `write_all` call to minimise QUIC stream lock acquisitions.
     pub async fn send_udp_datagram(
         send: &mut SendStream,
         addr: &str,
@@ -532,10 +539,14 @@ impl JuicityClient {
         let cached = protocol::CachedAddr::from_host_port(addr, port);
         addr_buf.clear();
         protocol::build_trojanc_addr_cached(addr_buf, &cached)?;
-        send.write_all(addr_buf).await?;
+        // Batch address header + length + payload into a single write_all
+        // to reduce QUIC stream lock acquisitions from 3 to 1.
         let len = (data.len() as u16).to_be_bytes();
-        send.write_all(&len).await?;
-        send.write_all(data).await?;
+        let total_len = addr_buf.len() + 2 + data.len();
+        addr_buf.reserve(total_len - addr_buf.len());
+        addr_buf.extend_from_slice(&len);
+        addr_buf.extend_from_slice(data);
+        send.write_all(addr_buf).await?;
         Ok(())
     }
 }

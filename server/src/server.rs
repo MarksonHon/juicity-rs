@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Mutex as StdMutex;
 
 use indexmap::IndexMap;
 use moka::sync::Cache;
@@ -193,7 +194,7 @@ impl JuicityServer {
                     .unwrap_or(consts::IN_FLIGHT_UNDERLAY_EVICT_TIMEOUT),
             )),
             udp_endpoint_pool: Arc::new(crate::udp::UdpEndpointPool::new(
-                consts::MAX_UDP_ENDPOINTS,
+                consts::MAX_UDP_ENDPOINTS as u64,
             )),
             disable_outbound_udp443: config.disable_outbound_udp443,
         })
@@ -315,19 +316,6 @@ impl JuicityServer {
                 loop {
                     interval.tick().await;
                     inflight_cleanup.cleanup();
-                }
-            })
-            .abort_handle(),
-        );
-
-        // Spawn periodic cleanup task for UDP endpoint pool.
-        let udp_pool_cleanup = self.udp_endpoint_pool.clone();
-        let _pool_guard = AbortOnDrop(
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(consts::UDP_POOL_CLEANUP_INTERVAL);
-                loop {
-                    interval.tick().await;
-                    udp_pool_cleanup.cleanup();
                 }
             })
             .abort_handle(),
@@ -665,13 +653,13 @@ async fn handle_non_quic_underlay_packet(
             return Ok(());
         }
 
-        // Fast path: try to get the pool socket without cloning dial_target.
-        // We already have `target`, so we use it directly for send_to.
-        let udp_socket = match udp_pool.get_socket(&source) {
-            Some(socket) => socket,
+        // Fast path: pool returns tokio::net::UdpSocket directly —
+        // no expensive from_std() syscall registration needed.
+        let (send_socket, pool_target) = match udp_pool.get_socket(&source) {
+            Some(result) => result,
             None => {
                 // Pool endpoint expired — create a new one (rare).
-                let ((s, _), _) = udp_pool
+                udp_pool
                     .get_or_create(
                         source,
                         crate::udp::UdpEndpointOptions {
@@ -679,14 +667,12 @@ async fn handle_non_quic_underlay_packet(
                             dial_target: String::from(target.as_ref()),
                         },
                     )
-                    .await?;
-                s
+                    .await?
+                    .0
             }
         };
-
-        let send_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
         if let Err(e) = send_socket
-            .send_to(&payload[juicity_underlay::SALT_LEN..], &**target)
+            .send_to(&payload[juicity_underlay::SALT_LEN..], &*pool_target)
             .await
         {
             udp_pool.remove(&source);
@@ -699,7 +685,7 @@ async fn handle_non_quic_underlay_packet(
             sessions.invalidate(&source);
             return Err(anyhow::anyhow!(
                 "underlay send_to {} failed: {:?}",
-                &**target,
+                &*pool_target,
                 e
             ));
         }
@@ -757,14 +743,15 @@ async fn handle_non_quic_underlay_packet(
         )
         .await?;
 
-    // Convert both sockets BEFORE any spawn so that a conversion failure
+    // Pool returns tokio socket directly — no from_std() needed.
+    // Convert BEFORE any spawn so a conversion failure
     // (e.g. kernel fd exhaustion) cannot produce an orphaned relay-back task.
     let recv_socket_for_relay = if is_new {
-        Some(tokio::net::UdpSocket::from_std(udp_socket.try_clone()?)?)
+        Some(udp_socket.clone())
     } else {
         None
     };
-    let send_socket = tokio::net::UdpSocket::from_std(udp_socket)?;
+    let send_socket = udp_socket;
 
     let relay_abort = if let Some(recv_socket) = recv_socket_for_relay {
         let relay_back = server_socket.clone();
@@ -805,6 +792,14 @@ async fn handle_non_quic_underlay_packet(
             let max_out_len = consts::ETHERNET_MTU * 4 + 48;
             let mut buf = vec![0u8; consts::ETHERNET_MTU * 4];
             let mut outbuf = Vec::with_capacity(max_out_len);
+
+            // ── Pre-generated salt pool ──
+            // Generates 4096 salts upfront (single fill_bytes call) to amortise
+            // CSPRNG overhead.  When the pool is exhausted, a fresh batch is
+            // generated.  4096 × 32 bytes = 128 KB per task, acceptable for the
+            // 180-second NAT timeout window.
+            let mut salt_pool = generate_salt_batch();
+
             loop {
                 match tokio::time::timeout(
                     consts::DEFAULT_NAT_TIMEOUT,
@@ -813,7 +808,12 @@ async fn handle_non_quic_underlay_packet(
                 .await
                 {
                     Ok(Ok((n, _))) => {
-                        let salt = juicity_underlay::generate_underlay_salt();
+                        // Get a salt from the pre-generated pool; refill if empty.
+                        let salt = salt_pool.pop().unwrap_or_else(|| {
+                            let new_batch = generate_salt_batch();
+                            salt_pool = new_batch;
+                            salt_pool.pop().unwrap()
+                        });
                         // Pre-allocate with SALT_LEN headroom at front — avoids O(n) shift in encrypt_in_place
                         outbuf.clear();
                         outbuf.reserve(n + juicity_underlay::SALT_LEN + juicity_underlay::TAG_LEN);
@@ -938,8 +938,14 @@ async fn handle_connection(
     };
 
     // Shared DNS cache across all UDP relay streams within this QUIC connection.
-    let dns_cache: Arc<tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>> =
-        Arc::new(tokio::sync::Mutex::new(IndexMap::new()));
+    // Uses StdMutex because critical sections are sub-microsecond with no .await
+    // held under lock — avoids the heavier tokio::sync::Mutex waker overhead.
+    let dns_cache: Arc<StdMutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>> =
+        Arc::new(StdMutex::new(IndexMap::new()));
+    // Tracks in-flight DNS resolutions so concurrent lookups for the same
+    // domain don't all issue DNS queries in parallel.
+    let dns_resolving: Arc<StdMutex<HashMap<(Arc<str>, u16), Arc<tokio::sync::Notify>>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
 
     // Keep reading underlay auth entries from the authenticated uni stream.
     // Store the abort handle so the task can be cancelled when the connection drops,
@@ -974,6 +980,7 @@ async fn handle_connection(
                 let s_user_uuid = user_uuid;
                 let s_disable_443 = disable_udp_443;
                 let s_dns_cache = dns_cache.clone();
+                let s_dns_resolving = dns_resolving.clone();
 
                 stream_tasks.spawn(async move {
                     if let Err(e) = handle_stream(
@@ -983,6 +990,7 @@ async fn handle_connection(
                         s_user_uuid,
                         s_disable_443,
                         s_dns_cache,
+                        s_dns_resolving,
                     )
                     .await
                     {
@@ -1062,7 +1070,8 @@ async fn handle_stream(
     dialer: Arc<dyn crate::dialer::Dialer>,
     user_uuid: Uuid,
     disable_udp_443: bool,
-    dns_cache: Arc<tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>>,
+    dns_cache: Arc<StdMutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>>,
+    dns_resolving: Arc<StdMutex<HashMap<(Arc<str>, u16), Arc<tokio::sync::Notify>>>>,
 ) -> anyhow::Result<()> {
     // Read proxy header via async reader
     let (network, hostname, port) = protocol::read_proxy_header_async(&mut recv_stream).await?;
@@ -1086,7 +1095,15 @@ async fn handle_stream(
                 event = "relay",
                 "UDP relay"
             );
-            handle_udp_relay(send_stream, recv_stream, dialer, disable_udp_443, dns_cache).await
+            handle_udp_relay(
+                send_stream,
+                recv_stream,
+                dialer,
+                disable_udp_443,
+                dns_cache,
+                dns_resolving,
+            )
+            .await
         }
         _ => anyhow::bail!("unknown network type: {}", network),
     }
@@ -1144,7 +1161,8 @@ async fn handle_udp_relay(
     mut recv_stream: RecvStream,
     dialer: Arc<dyn crate::dialer::Dialer>,
     disable_udp_443: bool,
-    dns_cache: Arc<tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>>,
+    dns_cache: Arc<StdMutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>>,
+    dns_resolving: Arc<StdMutex<HashMap<(Arc<str>, u16), Arc<tokio::sync::Notify>>>>,
 ) -> anyhow::Result<()> {
     // First datagram: [trojanc_addr][len(2)][payload]
     let (first_host, first_port) = protocol::read_trojanc_addr_async(&mut recv_stream).await?;
@@ -1154,7 +1172,8 @@ async fn handle_udp_relay(
         return Ok(());
     }
 
-    let first_target_addr = resolve_udp_target(&first_host, first_port, &dns_cache).await?;
+    let first_target_addr =
+        resolve_udp_target(&first_host, first_port, &dns_cache, &dns_resolving).await?;
     let remote = dialer.dial_udp(&first_target_addr.to_string()).await?;
     let remote = Arc::new(remote);
 
@@ -1173,6 +1192,7 @@ async fn handle_udp_relay(
     let mut quic_to_remote = {
         let remote = remote.clone();
         let dns_cache = dns_cache.clone();
+        let dns_resolving = dns_resolving.clone();
         tokio::spawn(async move {
             // Reuse the first-datagram buffer for all subsequent datagrams.
             let mut payload = data;
@@ -1199,13 +1219,15 @@ async fn handle_udp_relay(
                     break;
                 }
 
-                let target = match resolve_udp_target(&t_addr_buf, t_port, &dns_cache).await {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        tracing::debug!("UDP target resolve error: {:?}", e);
-                        break;
-                    }
-                };
+                let target =
+                    match resolve_udp_target(&t_addr_buf, t_port, &dns_cache, &dns_resolving).await
+                    {
+                        Ok(addr) => addr,
+                        Err(e) => {
+                            tracing::debug!("UDP target resolve error: {:?}", e);
+                            break;
+                        }
+                    };
                 if let Err(e) = remote.send_to(&payload, target).await {
                     tracing::debug!("UDP relay write error: {:?}", e);
                     break;
@@ -1301,55 +1323,145 @@ async fn handle_udp_relay(
 ///
 /// Returns an error if DNS resolution fails (e.g. NXDOMAIN) or returns
 /// zero addresses.
+/// Resolve a UDP target address (hostname or IP) with DNS caching and
+/// per-key resolution locking to prevent duplicate concurrent lookups.
+///
+/// If `host` is already a valid [`IpAddr`], it is returned directly
+/// without DNS resolution.  Otherwise, the function performs an async DNS
+/// lookup via [`tokio::net::lookup_host`] and caches the first result in
+/// the provided `dns_cache` to avoid repeated queries for the same
+/// host/port pair within the [`consts::UDP_DNS_CACHE_TTL`] window.
+///
+/// The cache uses [`std::sync::Mutex`] (not tokio's async Mutex) because
+/// all critical sections are sub-microsecond lookups/inserts with no
+/// `.await` held under the lock.
+///
+/// # Concurrency guard
+///
+/// When a cache miss occurs, the first task marks the key as "resolving"
+/// in `dns_resolving`, performs the DNS lookup, then caches the result.
+/// Subsequent tasks for the same key wait on a per-key [`Notify`] and
+/// retry the cache — preventing N concurrent DNS queries for the same
+/// domain during cache-cold bursts.
 async fn resolve_udp_target(
     host: &str,
     port: u16,
-    dns_cache: &tokio::sync::Mutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>,
+    dns_cache: &StdMutex<IndexMap<(Arc<str>, u16), (SocketAddr, Instant)>>,
+    dns_resolving: &StdMutex<HashMap<(Arc<str>, u16), Arc<tokio::sync::Notify>>>,
 ) -> anyhow::Result<SocketAddr> {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
 
-    let key = (Arc::from(host), port);
-    // Check cache with TTL expiry (brief lock).
-    // If found but TTL expired, remove the stale entry immediately so it does
-    // not linger in the map and occupy a slot until the cache fills up.
-    {
-        let mut cache = dns_cache.lock().await;
-        if let Some((mapped, timestamp)) = cache.get(&key) {
-            if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
-                return Ok(*mapped);
-            }
-            // TTL expired — evict the stale entry.
-            cache.swap_remove(&key);
-        }
-    }
+    // Use a loop instead of recursion to avoid infinitely sized futures
+    // (Rust does not allow recursive async fn calls without boxing).
+    loop {
+        let key = (Arc::from(host), port);
 
-    // Perform DNS lookup (no lock held)
-    let mut addrs = tokio::time::timeout(
-        consts::DNS_QUERY_TIMEOUT,
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("DNS query timeout for {}:{}", host, port))??;
-    let resolved = addrs
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no DNS result for {}:{}", host, port))?;
-    // When the cache is full, evict the oldest entry (the one that will be
-    // iterated first) instead of clearing the entire map. This preserves
-    // recently-used entries and avoids unnecessary DNS re-resolutions.
-    // Insert into cache (brief lock)
-    {
-        let mut cache = dns_cache.lock().await;
-        if cache.len() >= consts::MAX_UDP_DNS_CACHE {
-            if let Some(oldest_key) = cache.keys().next().cloned() {
-                cache.swap_remove(&oldest_key);
+        // ── Check cache with TTL expiry (brief lock, no .await) ──
+        {
+            let mut cache = dns_cache.lock().unwrap();
+            if let Some((mapped, timestamp)) = cache.get(&key) {
+                if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
+                    return Ok(*mapped);
+                }
+                // TTL expired — evict the stale entry.
+                cache.swap_remove(&key);
             }
         }
-        cache.insert(key, (resolved, Instant::now()));
-    }
 
-    Ok(resolved)
+        // ── Per-key resolution guard ──
+        // Try to become the designated resolver for this key.
+        let notify = Arc::new(tokio::sync::Notify::new());
+
+        let is_designated = {
+            let mut resolving = dns_resolving.lock().unwrap();
+            if resolving.contains_key(&key) {
+                false
+            } else {
+                resolving.insert(key.clone(), notify.clone());
+                true
+            }
+        };
+
+        if !is_designated {
+            // Wait for the designated resolver to finish.
+            let wait_notify = {
+                let resolving = dns_resolving.lock().unwrap();
+                resolving.get(&key).cloned()
+            };
+            if let Some(n) = wait_notify {
+                n.notified().await;
+            }
+            // Retry cache.
+            {
+                let cache = dns_cache.lock().unwrap();
+                if let Some((mapped, _)) = cache.get(&key) {
+                    return Ok(*mapped);
+                }
+            }
+            // Cache miss — retry from the top (creates a new resolving entry).
+            continue;
+        }
+
+        // ── We are the designated resolver ──
+        // Perform DNS lookup (no lock held during async I/O)
+        let result = tokio::time::timeout(
+            consts::DNS_QUERY_TIMEOUT,
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS query timeout for {}:{}", host, port))?;
+
+        let resolved = match result?.next() {
+            Some(addr) => addr,
+            None => {
+                // Remove the resolving marker and notify waiters.
+                dns_resolving.lock().unwrap().remove(&key);
+                notify.notify_waiters();
+                return Err(anyhow::anyhow!("no DNS result for {}:{}", host, port));
+            }
+        };
+
+        // Insert into cache (brief lock, no .await)
+        {
+            let mut cache = dns_cache.lock().unwrap();
+            if cache.len() >= consts::MAX_UDP_DNS_CACHE {
+                if let Some(oldest_key) = cache.keys().next().cloned() {
+                    cache.swap_remove(&oldest_key);
+                }
+            }
+            cache.insert(key.clone(), (resolved, Instant::now()));
+        }
+
+        // Remove the resolving marker and notify all waiters.
+        dns_resolving.lock().unwrap().remove(&key);
+        notify.notify_waiters();
+
+        return Ok(resolved);
+    }
+}
+
+/// Pre-generate a batch of underlay salts using a single `fill_bytes` call
+/// to amortise CSPRNG overhead.  Each salt has bytes [0..=1] = 0 and
+/// bytes [2..32] filled with random data (matching `generate_underlay_salt`).
+fn generate_salt_batch() -> Vec<[u8; 32]> {
+    const BATCH_SIZE: usize = 4096;
+    let mut batch = Vec::with_capacity(BATCH_SIZE);
+    // Generate all random bytes in one shot (30 random bytes × 4096 = 122880).
+    use rand::RngCore;
+    let mut random_bytes = vec![0u8; BATCH_SIZE * 30];
+    rand::thread_rng().fill_bytes(&mut random_bytes);
+
+    for i in 0..BATCH_SIZE {
+        let mut salt = [0u8; 32];
+        salt[0] = 0;
+        salt[1] = 0;
+        let offset = i * 30;
+        salt[2..].copy_from_slice(&random_bytes[offset..offset + 30]);
+        batch.push(salt);
+    }
+    batch
 }
 
 fn load_certs(path: &str) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {

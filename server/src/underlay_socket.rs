@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::io::IoSliceMut;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use quinn::udp::{RecvMeta, Transmit};
@@ -181,19 +181,25 @@ impl AsyncUdpSocket for DemuxUdpSocket {
                     // We swap the buffer out, fill it, clone the result for the
                     // channel, then put the (still-capacitive) buffer back — this
                     // amortises the allocation cost across all packets on this thread.
+                    // Zero-copy: swap the filled buffer with a fresh pre-capacitive
+                    // Vec, avoiding the per-packet heap allocation that clone() would
+                    // require.  The thread-local buffer retains its 65535 capacity.
                     let payload = UDP_PACKET_BUF.with(|buf| {
-                        let mut buf = buf.borrow_mut();
-                        buf.clear();
-                        buf.extend_from_slice(&bufs[i][offset..end]);
-                        // Clone returns a new Vec with exactly the right size,
-                        // while the thread-local buffer retains its 65535 capacity
-                        // for the next packet — avoiding repeated resize cycles.
-                        buf.clone()
+                        let mut buf_ref = buf.borrow_mut();
+                        buf_ref.clear();
+                        buf_ref.extend_from_slice(&bufs[i][offset..end]);
+                        // Replace with a fresh 65535-capacity Vec, taking ownership
+                        // of the filled buffer — this is O(1), no heap allocation.
+                        std::mem::replace(&mut *buf_ref, Vec::with_capacity(65535))
                     });
-                    if self.underlay_tx.try_send(UnderlayPacket {
-                        peer: meta[i].addr,
-                        payload,
-                    }).is_err() {
+                    if self
+                        .underlay_tx
+                        .try_send(UnderlayPacket {
+                            peer: meta[i].addr,
+                            payload,
+                        })
+                        .is_err()
+                    {
                         // Channel full: drop packet. Warn only periodically to avoid
                         // log storms amplifying CPU under hostile/burst traffic.
                         let dropped = UNDERLAY_DROPPED_PACKETS.fetch_add(1, Ordering::Relaxed) + 1;
