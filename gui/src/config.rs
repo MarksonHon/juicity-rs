@@ -39,10 +39,7 @@ pub const SS_METHODS: &[&str] = &[
 ];
 
 pub fn method_to_index(method: &str) -> u32 {
-    SS_METHODS
-        .iter()
-        .position(|m| *m == method)
-        .unwrap_or(0) as u32
+    SS_METHODS.iter().position(|m| *m == method).unwrap_or(0) as u32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

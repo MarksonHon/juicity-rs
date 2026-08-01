@@ -2,12 +2,11 @@
 # ============================================
 # Juicity macOS .app Bundle Script
 # ============================================
-# Creates a self-contained Juicity.app bundle with all GTK4/libadwaita
-# dylib dependencies and runtime resources bundled inside.
+# Creates a self-contained Juicity.app bundle with all non-system
+# dylib dependencies bundled inside.
 #
 # Prerequisites:
 #   - macOS build already completed (release binaries exist)
-#   - GTK4 + libadwaita installed via Homebrew
 #   - icon.svg in the gui directory
 #
 # Usage:
@@ -267,108 +266,6 @@ done
 
 echo "==> Fixed dylib paths"
 
-# ── Bundle GTK4 runtime resources ────────────────────────────────────────
-echo "==> Bundling GTK4 runtime resources..."
-
-# Find Homebrew prefix
-BREW_PREFIX=""
-if command -v brew &>/dev/null; then
-  BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
-fi
-if [[ -z "${BREW_PREFIX}" ]]; then
-  # Fallback: common paths
-  for p in /opt/homebrew /usr/local; do
-    if [[ -f "${p}/lib/libgtk-4.dylib" ]]; then
-      BREW_PREFIX="${p}"
-      break
-    fi
-  done
-fi
-
-if [[ -z "${BREW_PREFIX}" ]]; then
-  echo "WARNING: Homebrew prefix not found. GTK4 runtime resources will not be bundled."
-else
-  echo "  Homebrew prefix: ${BREW_PREFIX}"
-
-  # GLib schemas
-  SCHEMAS_SRC="${BREW_PREFIX}/share/glib-2.0/schemas"
-  SCHEMAS_DST="${RESOURCES_DIR}/share/glib-2.0/schemas"
-  if [[ -d "${SCHEMAS_SRC}" ]]; then
-    mkdir -p "${SCHEMAS_DST}"
-    cp -R "${SCHEMAS_SRC}/" "${SCHEMAS_DST}/"
-    # Ensure compiled schemas exist
-    if [[ ! -f "${SCHEMAS_DST}/gschemas.compiled" ]]; then
-      if command -v glib-compile-schemas &>/dev/null; then
-        glib-compile-schemas "${SCHEMAS_DST}" || true
-      fi
-    fi
-    echo "  Bundled GLib schemas"
-  fi
-
-  # GDK pixbuf loaders
-  PIXBUF_LIB="${BREW_PREFIX}/lib/gdk-pixbuf-2.0"
-  PIXBUF_DST="${RESOURCES_DIR}/lib/gdk-pixbuf-2.0"
-  if [[ -d "${PIXBUF_LIB}" ]]; then
-    mkdir -p "${PIXBUF_DST}"
-    cp -R "${PIXBUF_LIB}/" "${PIXBUF_DST}/"
-    echo "  Bundled GDK pixbuf loaders"
-  fi
-
-  # GTK4 modules (print backends, media backends, imm modules)
-  GTK_MODULES_SRC="${BREW_PREFIX}/lib/gtk-4.0"
-  GTK_MODULES_DST="${RESOURCES_DIR}/lib/gtk-4.0"
-  if [[ -d "${GTK_MODULES_SRC}" ]]; then
-    mkdir -p "${GTK_MODULES_DST}"
-    cp -R "${GTK_MODULES_SRC}/" "${GTK_MODULES_DST}/"
-    echo "  Bundled GTK4 modules"
-  fi
-
-  # Hicolor icon theme (minimal — just the index.theme + some fallback)
-  ICON_SRC="${BREW_PREFIX}/share/icons/hicolor"
-  ICON_DST="${RESOURCES_DIR}/share/icons/hicolor"
-  if [[ -d "${ICON_SRC}" ]]; then
-    mkdir -p "${ICON_DST}"
-    cp -R "${ICON_SRC}/" "${ICON_DST}/"
-    echo "  Bundled hicolor icon theme"
-  fi
-
-  # Adwaita icon theme (needed by GTK4)
-  ADW_ICON_SRC="${BREW_PREFIX}/share/icons/Adwaita"
-  ADW_ICON_DST="${RESOURCES_DIR}/share/icons/Adwaita"
-  if [[ -d "${ADW_ICON_SRC}" ]]; then
-    mkdir -p "${ADW_ICON_DST}"
-    cp -R "${ADW_ICON_SRC}/" "${ADW_ICON_DST}/"
-    echo "  Bundled Adwaita icon theme"
-  fi
-
-  # dbus-daemon binary (GLib/GIO needs this to start a session bus;
-  # without it GTK4 prints "win32 session dbus binary not found" or
-  # the macOS equivalent and some GIO features may not work).
-  DBUS_BIN="${BREW_PREFIX}/bin/dbus-daemon"
-  if [[ -f "${DBUS_BIN}" ]]; then
-    cp "${DBUS_BIN}" "${MACOS_DIR}/dbus-daemon"
-    chmod +x "${MACOS_DIR}/dbus-daemon"
-    # Bundle any additional dylibs required by dbus-daemon that were not
-    # already pulled in while processing the main application binaries.
-    while IFS= read -r dep; do
-      [[ -z "${dep}" ]] && continue
-      case "${dep}" in /usr/lib/*|/System/*) continue ;; esac
-      dep_name="$(basename "${dep}")"
-      if [[ -f "${dep}" && ! -f "${FRAMEWORKS_DIR}/${dep_name}" ]]; then
-        cp -n "${dep}" "${FRAMEWORKS_DIR}/${dep_name}" 2>/dev/null || true
-        chmod 644 "${FRAMEWORKS_DIR}/${dep_name}" 2>/dev/null || true
-        fix_rpath "${FRAMEWORKS_DIR}/${dep_name}"
-        echo "  Copied dbus dep: ${dep_name}"
-      fi
-    done < <(otool -L "${MACOS_DIR}/dbus-daemon" 2>/dev/null | tail -n +2 | awk '{print $1}')
-    fix_rpath "${MACOS_DIR}/dbus-daemon"
-    echo "  Bundled dbus-daemon"
-  else
-    echo "  WARNING: dbus-daemon not found at ${DBUS_BIN}"
-    echo "           Install with: brew install dbus"
-  fi
-fi
-
 # ── Ad-hoc code signing ─────────────────────────────────────────────────
 echo "==> Applying ad-hoc code signature..."
 if command -v codesign &>/dev/null; then
@@ -383,8 +280,6 @@ if command -v codesign &>/dev/null; then
     codesign --force --sign - "${MACOS_DIR}/juicity-gui" 2>/dev/null || true
   [[ -f "${MACOS_DIR}/juicity-client" ]] && \
     codesign --force --sign - "${MACOS_DIR}/juicity-client" 2>/dev/null || true
-  [[ -f "${MACOS_DIR}/dbus-daemon" ]] && \
-    codesign --force --sign - "${MACOS_DIR}/dbus-daemon" 2>/dev/null || true
   # Sign entire bundle
   codesign --force --deep --sign - "${APP_BUNDLE}" 2>/dev/null || true
   echo "  Ad-hoc code signature applied"
@@ -403,8 +298,7 @@ echo "  Contents:"
 echo "    Info.plist"
 echo "    MacOS/juicity-gui"
 echo "    MacOS/juicity-client"
-echo "    MacOS/dbus-daemon  (GLib/GIO session bus)"
 echo "    Frameworks/ ($(ls "${FRAMEWORKS_DIR}" 2>/dev/null | wc -l) dylibs)"
-echo "    Resources/ (icons, schemas, themes)"
+echo "    Resources/ (icons)"
 echo "  Size: $(du -sh "${APP_BUNDLE}" | cut -f1)"
 echo "============================================"

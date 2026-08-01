@@ -5,19 +5,16 @@ fn main() {
     let svg_data = std::fs::read(&svg_path).expect("gui/icon.svg not found");
 
     let opt = resvg::usvg::Options::default();
-    let tree = resvg::usvg::Tree::from_data(&svg_data, &opt)
-        .expect("failed to parse icon.svg");
+    let tree = resvg::usvg::Tree::from_data(&svg_data, &opt).expect("failed to parse icon.svg");
 
     let src_w = tree.size().width();
     let src_h = tree.size().height();
 
     for size in [16u32, 32, 48, 64, 128, 256] {
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)
-            .expect("failed to create pixmap");
-        let transform = resvg::tiny_skia::Transform::from_scale(
-            size as f32 / src_w,
-            size as f32 / src_h,
-        );
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(size, size).expect("failed to create pixmap");
+        let transform =
+            resvg::tiny_skia::Transform::from_scale(size as f32 / src_w, size as f32 / src_h);
         resvg::render(&tree, transform, &mut pixmap.as_mut());
         let out_path = format!("{out_dir}/{size}.png");
         pixmap.save_png(&out_path).expect("failed to save PNG");

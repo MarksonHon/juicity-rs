@@ -1,9 +1,9 @@
 use crate::config::{AppConfig, ProxyProfile, ProxyProtocol};
 use anyhow::Context;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 
 /// Resolve the path of a proxy binary:
 /// 1. If `override_path` is given and the file exists, use it.
@@ -60,11 +60,19 @@ impl CoreManager {
         self.running.as_ref().map(|v| v.protocol)
     }
 
-    pub fn start_profile(&mut self, config: &AppConfig, profile: &ProxyProfile) -> anyhow::Result<()> {
+    pub fn start_profile(
+        &mut self,
+        config: &AppConfig,
+        profile: &ProxyProfile,
+    ) -> anyhow::Result<()> {
         self.stop()?;
 
         let (mut cmd, temp_config) = build_command(config, profile)?;
-        tracing::info!("starting {:?} core for profile {}", profile.protocol, profile.name);
+        tracing::info!(
+            "starting {:?} core for profile {}",
+            profile.protocol,
+            profile.name
+        );
 
         let child = match cmd.spawn() {
             Ok(child) => child,
@@ -125,7 +133,10 @@ impl CoreManager {
 }
 
 /// Returns the command and an optional temp config path that must be cleaned up.
-fn build_command(config: &AppConfig, profile: &ProxyProfile) -> anyhow::Result<(Command, Option<PathBuf>)> {
+fn build_command(
+    config: &AppConfig,
+    profile: &ProxyProfile,
+) -> anyhow::Result<(Command, Option<PathBuf>)> {
     match profile.protocol {
         ProxyProtocol::Juicity => build_juicity_command(config, profile),
         ProxyProtocol::Shadowsocks => build_shadowsocks_command(config, profile),
@@ -140,7 +151,10 @@ fn write_temp_config(prefix: &str, json: &str) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-fn build_juicity_command(config: &AppConfig, profile: &ProxyProfile) -> anyhow::Result<(Command, Option<PathBuf>)> {
+fn build_juicity_command(
+    config: &AppConfig,
+    profile: &ProxyProfile,
+) -> anyhow::Result<(Command, Option<PathBuf>)> {
     let binary = find_binary("juicity-client", config.juicity_client_path.as_ref());
 
     // Use legacy config_path if set; otherwise generate from individual fields.
@@ -179,7 +193,10 @@ fn build_juicity_command(config: &AppConfig, profile: &ProxyProfile) -> anyhow::
     Ok((cmd, temp))
 }
 
-fn build_shadowsocks_command(config: &AppConfig, profile: &ProxyProfile) -> anyhow::Result<(Command, Option<PathBuf>)> {
+fn build_shadowsocks_command(
+    config: &AppConfig,
+    profile: &ProxyProfile,
+) -> anyhow::Result<(Command, Option<PathBuf>)> {
     let binary = find_binary("sslocal", config.ss_local_path.as_ref());
 
     // Use legacy config_path if set; otherwise generate from individual fields.

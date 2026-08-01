@@ -30,14 +30,35 @@ pub struct TraySharedState {
     pub active_server_name: String,
 }
 
-#[derive(Debug)]
 pub struct TrayService {
     /// Linux: keeps background ksni thread alive.
     #[cfg(target_os = "linux")]
     _join: Option<std::thread::JoinHandle<()>>,
-    /// Windows/macOS: keeps TrayIcon alive on the main thread.
+    /// Windows/macOS: polled on the app's main loop by [`poll`].
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    _tray: Option<Box<dyn std::any::Any>>,
+    native: Option<NativeTray>,
+}
+
+/// Drive the tray from the application's own main loop.
+///
+/// On Linux the ksni tray runs on a background thread and needs no polling;
+/// on Windows/macOS the menu is rebuilt and pending events are dispatched
+/// here.  Call this periodically (e.g. from the 300ms poll loop).
+pub fn poll(
+    service: Option<&mut TrayService>,
+    shared: &Arc<Mutex<TraySharedState>>,
+    event_tx: &Sender<TrayEvent>,
+) {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    if let Some(service) = service {
+        if let Some(native) = service.native.as_mut() {
+            native.poll(shared, event_tx);
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = (service, shared, event_tx);
+    }
 }
 
 /// Start the system tray in a background thread.
@@ -66,7 +87,7 @@ pub fn start(event_tx: Sender<TrayEvent>, shared: Arc<Mutex<TraySharedState>>) -
                 }
             });
         });
-        return TrayService { _join: Some(join) };
+        TrayService { _join: Some(join) }
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -112,16 +133,31 @@ impl ksni::Tray for LinuxTray {
         const D32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray_32_argb.raw"));
         const D48: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray_48_argb.raw"));
         vec![
-            ksni::Icon { width: 16, height: 16, data: D16.to_vec() },
-            ksni::Icon { width: 32, height: 32, data: D32.to_vec() },
-            ksni::Icon { width: 48, height: 48, data: D48.to_vec() },
+            ksni::Icon {
+                width: 16,
+                height: 16,
+                data: D16.to_vec(),
+            },
+            ksni::Icon {
+                width: 32,
+                height: 32,
+                data: D32.to_vec(),
+            },
+            ksni::Icon {
+                width: 48,
+                height: 48,
+                data: D48.to_vec(),
+            },
         ]
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
 
-        let state = self.shared.lock().ok()
+        let state = self
+            .shared
+            .lock()
+            .ok()
             .map(|s| s.clone())
             .unwrap_or_default();
 
@@ -131,11 +167,17 @@ impl ksni::Tray for LinuxTray {
             StandardItem {
                 label: format!(
                     "{} {}",
-                    if proxy_mode == SystemProxyMode::Disable { "●" } else { "○" },
+                    if proxy_mode == SystemProxyMode::Disable {
+                        "●"
+                    } else {
+                        "○"
+                    },
                     t!("proxy.disable")
                 ),
                 activate: Box::new(|this: &mut Self| {
-                    let _ = this.event_tx.send(TrayEvent::SetSystemProxy(SystemProxyMode::Disable));
+                    let _ = this
+                        .event_tx
+                        .send(TrayEvent::SetSystemProxy(SystemProxyMode::Disable));
                 }),
                 ..Default::default()
             }
@@ -143,11 +185,17 @@ impl ksni::Tray for LinuxTray {
             StandardItem {
                 label: format!(
                     "{} {}",
-                    if proxy_mode == SystemProxyMode::Pac { "●" } else { "○" },
+                    if proxy_mode == SystemProxyMode::Pac {
+                        "●"
+                    } else {
+                        "○"
+                    },
                     t!("proxy.pac")
                 ),
                 activate: Box::new(|this: &mut Self| {
-                    let _ = this.event_tx.send(TrayEvent::SetSystemProxy(SystemProxyMode::Pac));
+                    let _ = this
+                        .event_tx
+                        .send(TrayEvent::SetSystemProxy(SystemProxyMode::Pac));
                 }),
                 ..Default::default()
             }
@@ -155,11 +203,17 @@ impl ksni::Tray for LinuxTray {
             StandardItem {
                 label: format!(
                     "{} {}",
-                    if proxy_mode == SystemProxyMode::Global { "●" } else { "○" },
+                    if proxy_mode == SystemProxyMode::Global {
+                        "●"
+                    } else {
+                        "○"
+                    },
                     t!("proxy.global")
                 ),
                 activate: Box::new(|this: &mut Self| {
-                    let _ = this.event_tx.send(TrayEvent::SetSystemProxy(SystemProxyMode::Global));
+                    let _ = this
+                        .event_tx
+                        .send(TrayEvent::SetSystemProxy(SystemProxyMode::Global));
                 }),
                 ..Default::default()
             }
@@ -172,11 +226,17 @@ impl ksni::Tray for LinuxTray {
             StandardItem {
                 label: format!(
                     "{} {}",
-                    if pac_mode == PacRuleMode::BypassChina { "●" } else { "○" },
+                    if pac_mode == PacRuleMode::BypassChina {
+                        "●"
+                    } else {
+                        "○"
+                    },
                     t!("pac.bypass_china")
                 ),
                 activate: Box::new(|this: &mut Self| {
-                    let _ = this.event_tx.send(TrayEvent::SetPacRuleMode(PacRuleMode::BypassChina));
+                    let _ = this
+                        .event_tx
+                        .send(TrayEvent::SetPacRuleMode(PacRuleMode::BypassChina));
                 }),
                 ..Default::default()
             }
@@ -184,11 +244,17 @@ impl ksni::Tray for LinuxTray {
             StandardItem {
                 label: format!(
                     "{} {}",
-                    if pac_mode == PacRuleMode::ProxyGfw { "●" } else { "○" },
+                    if pac_mode == PacRuleMode::ProxyGfw {
+                        "●"
+                    } else {
+                        "○"
+                    },
                     t!("pac.gfw_only")
                 ),
                 activate: Box::new(|this: &mut Self| {
-                    let _ = this.event_tx.send(TrayEvent::SetPacRuleMode(PacRuleMode::ProxyGfw));
+                    let _ = this
+                        .event_tx
+                        .send(TrayEvent::SetPacRuleMode(PacRuleMode::ProxyGfw));
                 }),
                 ..Default::default()
             }
@@ -254,13 +320,10 @@ impl ksni::Tray for LinuxTray {
         );
 
         // Parent labels show the current active value as a hint.
-        let proxy_parent_label = format!(
-            "{}: {}",
-            t!("tray.system_proxy"),
-            proxy_mode.label()
-        );
+        let proxy_parent_label = format!("{}: {}", t!("tray.system_proxy"), proxy_mode.label());
         let active_server_hint = if state.is_running {
-            state.server_names
+            state
+                .server_names
                 .get(state.active_server_idx)
                 .map(|n| format!(": {n}"))
                 .unwrap_or_default()
@@ -340,15 +403,45 @@ impl ksni::Tray for LinuxTray {
 // ── Windows / macOS implementation via tray-icon + muda ───────────────────────
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn start_native(
-    event_tx: Sender<TrayEvent>,
-    shared: Arc<Mutex<TraySharedState>>,
-) -> TrayService {
+struct NativeTray {
+    tray: std::rc::Rc<std::cell::RefCell<Option<tray_icon::TrayIcon>>>,
+    id_map: std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<tray_icon::menu::MenuId, TrayEvent>>,
+    >,
+    last_state: std::rc::Rc<std::cell::RefCell<TraySharedState>>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl NativeTray {
+    /// Rebuild the menu when shared state changes, then dispatch pending
+    /// menu events.  Called from the app's main loop via [`poll`].
+    fn poll(&self, shared: &Arc<Mutex<TraySharedState>>, event_tx: &Sender<TrayEvent>) {
+        let current = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if *self.last_state.borrow() != current {
+            let (new_menu, new_ids) = build_native_menu(&current);
+            if let Some(t) = self.tray.borrow_mut().as_mut() {
+                let _ = t.set_menu(Some(Box::new(new_menu)));
+            }
+            *self.id_map.borrow_mut() = new_ids;
+            *self.last_state.borrow_mut() = current;
+        }
+
+        // Dispatch pending menu events.
+        while let Ok(ev) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            if let Some(action) = self.id_map.borrow().get(&ev.id).copied() {
+                let _ = event_tx.send(action);
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn start_native(event_tx: Sender<TrayEvent>, shared: Arc<Mutex<TraySharedState>>) -> TrayService {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
     use tray_icon::{
-        menu::{Menu, MenuEvent, MenuId},
+        menu::{Menu, MenuId},
         Icon, TrayIconBuilder,
     };
 
@@ -374,39 +467,18 @@ fn start_native(
         .map_err(|e| tracing::warn!("tray icon creation failed: {e}"))
         .ok();
 
-    let tray = Rc::new(RefCell::new(tray));
-    let id_map: Rc<RefCell<HashMap<MenuId, TrayEvent>>> = Rc::new(RefCell::new(id_map));
-    let last_state: Rc<RefCell<TraySharedState>> = Rc::new(RefCell::new(init_state));
+    let native = NativeTray {
+        tray: Rc::new(RefCell::new(tray)),
+        id_map: Rc::new(RefCell::new(id_map)),
+        last_state: Rc::new(RefCell::new(init_state)),
+    };
 
-    let tray_c = tray.clone();
-    let id_map_c = id_map.clone();
-    let last_state_c = last_state.clone();
-    let shared_c = shared.clone();
-    let event_tx_c = event_tx;
+    // Own the sender; events are forwarded via the returned service.
+    let _ = event_tx;
 
-    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        // Rebuild menu when shared state changes.
-        let current = shared_c.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if *last_state_c.borrow() != current {
-            let (new_menu, new_ids) = build_native_menu(&current);
-            if let Some(t) = tray_c.borrow_mut().as_mut() {
-                let _ = t.set_menu(Some(Box::new(new_menu)));
-            }
-            *id_map_c.borrow_mut() = new_ids;
-            *last_state_c.borrow_mut() = current;
-        }
-
-        // Dispatch pending menu events.
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if let Some(action) = id_map_c.borrow().get(&ev.id).copied() {
-                let _ = event_tx_c.send(action);
-            }
-        }
-
-        gtk4::glib::ControlFlow::Continue
-    });
-
-    TrayService { _tray: Some(Box::new(tray)) }
+    TrayService {
+        native: Some(native),
+    }
 }
 
 /// Build a `muda` context menu from the current tray state.
@@ -452,11 +524,20 @@ fn build_native_menu(
         item
     };
     let p_disable = mk_proxy(SystemProxyMode::Disable, &t!("proxy.disable"));
-    ids.insert(p_disable.id().clone(), TrayEvent::SetSystemProxy(SystemProxyMode::Disable));
+    ids.insert(
+        p_disable.id().clone(),
+        TrayEvent::SetSystemProxy(SystemProxyMode::Disable),
+    );
     let p_pac = mk_proxy(SystemProxyMode::Pac, &t!("proxy.pac"));
-    ids.insert(p_pac.id().clone(), TrayEvent::SetSystemProxy(SystemProxyMode::Pac));
+    ids.insert(
+        p_pac.id().clone(),
+        TrayEvent::SetSystemProxy(SystemProxyMode::Pac),
+    );
     let p_global = mk_proxy(SystemProxyMode::Global, &t!("proxy.global"));
-    ids.insert(p_global.id().clone(), TrayEvent::SetSystemProxy(SystemProxyMode::Global));
+    ids.insert(
+        p_global.id().clone(),
+        TrayEvent::SetSystemProxy(SystemProxyMode::Global),
+    );
 
     let proxy_label = format!("{}: {}", t!("tray.system_proxy"), pm.label());
     let proxy_sub = Submenu::with_items(&proxy_label, true, &[&p_disable, &p_pac, &p_global])
@@ -465,17 +546,39 @@ fn build_native_menu(
     // ── PAC Rules submenu ─────────────────────────────────────────────────
     let rm = state.pac_rule_mode;
     let r_bypass = MenuItem::new(
-        &format!("{} {}", if rm == PacRuleMode::BypassChina { "●" } else { "○" }, t!("pac.bypass_china")),
+        &format!(
+            "{} {}",
+            if rm == PacRuleMode::BypassChina {
+                "●"
+            } else {
+                "○"
+            },
+            t!("pac.bypass_china")
+        ),
         true,
         None,
     );
-    ids.insert(r_bypass.id().clone(), TrayEvent::SetPacRuleMode(PacRuleMode::BypassChina));
+    ids.insert(
+        r_bypass.id().clone(),
+        TrayEvent::SetPacRuleMode(PacRuleMode::BypassChina),
+    );
     let r_gfw = MenuItem::new(
-        &format!("{} {}", if rm == PacRuleMode::ProxyGfw { "●" } else { "○" }, t!("pac.gfw_only")),
+        &format!(
+            "{} {}",
+            if rm == PacRuleMode::ProxyGfw {
+                "●"
+            } else {
+                "○"
+            },
+            t!("pac.gfw_only")
+        ),
         true,
         None,
     );
-    ids.insert(r_gfw.id().clone(), TrayEvent::SetPacRuleMode(PacRuleMode::ProxyGfw));
+    ids.insert(
+        r_gfw.id().clone(),
+        TrayEvent::SetPacRuleMode(PacRuleMode::ProxyGfw),
+    );
     let update_rules = MenuItem::new(&t!("tray.update_rules").to_string(), true, None);
     ids.insert(update_rules.id().clone(), TrayEvent::UpdatePacRules);
     let pac_settings_item = MenuItem::new(&t!("tray.pac_settings").to_string(), true, None);
@@ -484,7 +587,14 @@ fn build_native_menu(
     let pac_sub = Submenu::with_items(
         &t!("tray.pac_rules").to_string(),
         true,
-        &[&r_bypass, &r_gfw, &PredefinedMenuItem::separator(), &update_rules, &PredefinedMenuItem::separator(), &pac_settings_item],
+        &[
+            &r_bypass,
+            &r_gfw,
+            &PredefinedMenuItem::separator(),
+            &update_rules,
+            &PredefinedMenuItem::separator(),
+            &pac_settings_item,
+        ],
     )
     .expect("pac submenu");
 
@@ -521,8 +631,10 @@ fn build_native_menu(
     };
     let servers_label = format!("{}{}", t!("tray.servers"), active_hint);
 
-    let mut srv_refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
-        server_items.iter().map(|i| i as &dyn tray_icon::menu::IsMenuItem).collect();
+    let mut srv_refs: Vec<&dyn tray_icon::menu::IsMenuItem> = server_items
+        .iter()
+        .map(|i| i as &dyn tray_icon::menu::IsMenuItem)
+        .collect();
     let sep = PredefinedMenuItem::separator();
     srv_refs.push(&sep);
     srv_refs.push(&edit_servers);
@@ -532,7 +644,10 @@ fn build_native_menu(
 
     // ── Startup Settings ──────────────────────────────────────────────────
     let startup_settings = MenuItem::new(&t!("tray.startup_settings").to_string(), true, None);
-    ids.insert(startup_settings.id().clone(), TrayEvent::ShowStartupSettings);
+    ids.insert(
+        startup_settings.id().clone(),
+        TrayEvent::ShowStartupSettings,
+    );
 
     // ── Quit ─────────────────────────────────────────────────────────────
     let quit = MenuItem::new(&t!("tray.quit").to_string(), true, None);

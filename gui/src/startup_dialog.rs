@@ -3,227 +3,240 @@
 //!   - Connection state on startup: Off / On / LastState
 //!   - Auto-start on boot
 
-use adw::prelude::*;
-use gtk::prelude::*;
-use gtk4 as gtk;
+use crate::app::AppView;
+use crate::config::{RuntimeState, StartupConnectionState};
+use crate::widgets;
+use gpui::prelude::*;
+use gpui::{
+    div, px, rgb, size, App, Bounds, ClickEvent, Context, WeakEntity, Window, WindowBounds,
+    WindowOptions,
+};
 use rust_i18n::t;
 
-use crate::config::{RuntimeState, StartupConnectionState};
-
-/// Open the startup settings dialog as a modal window on top of `parent`.
-///
-/// * `state`   – current runtime state snapshot for initial widget values.
-/// * `on_save` – called with the updated `RuntimeState` when the user clicks Save.
-pub fn open(
-    parent: &gtk::ApplicationWindow,
-    state: RuntimeState,
-    on_save: impl Fn(RuntimeState) + 'static,
-) {
-    let window = gtk::Window::builder()
-        .transient_for(parent)
-        .modal(true)
-        .title(&*t!("startup_dialog.title"))
-        .default_width(420)
-        .resizable(false)
-        .build();
-
-    // ── Root layout ───────────────────────────────────────────────────────
-    let root = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .build();
-
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(18)
-        .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
-        .build();
-
-    // ── "Hide window on startup" group ─────────────────────────────────────────
-    let hide_group = adw::PreferencesGroup::builder()
-        .title(&*t!("startup_dialog.group_hide_window"))
-        .description(&*t!("startup_dialog.hide_window_desc"))
-        .build();
-
-    let hide_yes_radio = gtk::CheckButton::builder()
-        .label(&*t!("startup_dialog.yes"))
-        .css_classes(["radio"])
-        .group(&gtk::CheckButton::new())
-        .build();
-    let hide_no_radio = gtk::CheckButton::builder()
-        .label(&*t!("startup_dialog.no"))
-        .css_classes(["radio"])
-        .group(&hide_yes_radio)
-        .active(true)
-        .build();
-
-    // Set initial value
-    if state.hide_window_on_startup {
-        hide_yes_radio.set_active(true);
-    } else {
-        hide_no_radio.set_active(true);
-    }
-
-    let hide_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .margin_start(12)
-        .margin_top(6)
-        .build();
-    hide_box.append(&hide_yes_radio);
-    hide_box.append(&hide_no_radio);
-
-    let hide_row = adw::ActionRow::new();
-    hide_row.add_suffix(&hide_box);
-    hide_group.add(&hide_row);
-    content.append(&hide_group);
-
-    // ── "Connection state on startup" group ─────────────────────────────────────────
-    let conn_group = adw::PreferencesGroup::builder()
-        .title(&*t!("startup_dialog.group_connection"))
-        .description(&*t!("startup_dialog.connection_desc"))
-        .build();
-
-    let conn_off_radio = gtk::CheckButton::builder()
-        .label(&*t!("startup_dialog.connection_off"))
-        .css_classes(["radio"])
-        .group(&gtk::CheckButton::new())
-        .build();
-    let conn_on_radio = gtk::CheckButton::builder()
-        .label(&*t!("startup_dialog.connection_on"))
-        .css_classes(["radio"])
-        .group(&conn_off_radio)
-        .build();
-    let conn_last_radio = gtk::CheckButton::builder()
-        .label(&*t!("startup_dialog.connection_last"))
-        .css_classes(["radio"])
-        .group(&conn_off_radio)
-        .build();
-
-    // Set initial value
-    match state.startup_connection_state {
-        StartupConnectionState::On => conn_on_radio.set_active(true),
-        StartupConnectionState::LastState => conn_last_radio.set_active(true),
-        StartupConnectionState::Off => conn_off_radio.set_active(true),
-    }
-
-    let conn_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .margin_start(12)
-        .margin_top(6)
-        .build();
-    conn_box.append(&conn_off_radio);
-    conn_box.append(&conn_on_radio);
-    conn_box.append(&conn_last_radio);
-
-    let conn_row = adw::ActionRow::new();
-    conn_row.add_suffix(&conn_box);
-    conn_group.add(&conn_row);
-    content.append(&conn_group);
-
-    // ── "Auto-start on boot" group ─────────────────────────────────────────────
-    let autostart_group = adw::PreferencesGroup::builder()
-        .title(&*t!("startup_dialog.group_autostart"))
-        .description(&*t!("startup_dialog.autostart_desc"))
-        .build();
-
-    let autostart_yes_radio = gtk::CheckButton::builder()
-        .label(&*t!("startup_dialog.yes"))
-        .css_classes(["radio"])
-        .group(&gtk::CheckButton::new())
-        .build();
-    let autostart_no_radio = gtk::CheckButton::builder()
-        .label(&*t!("startup_dialog.no"))
-        .css_classes(["radio"])
-        .group(&autostart_yes_radio)
-        .active(true)
-        .build();
-
-    // Set initial value
-    if state.auto_start {
-        autostart_yes_radio.set_active(true);
-    } else {
-        autostart_no_radio.set_active(true);
-    }
-
-    let autostart_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .margin_start(12)
-        .margin_top(6)
-        .build();
-    autostart_box.append(&autostart_yes_radio);
-    autostart_box.append(&autostart_no_radio);
-
-    let autostart_row = adw::ActionRow::new();
-    autostart_row.add_suffix(&autostart_box);
-    autostart_group.add(&autostart_row);
-    content.append(&autostart_group);
-
-    root.append(&content);
-    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-
-    // ── Bottom action bar ─────────────────────────────────────────────────
-    let btn_bar = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .margin_start(12)
-        .margin_end(12)
-        .margin_top(8)
-        .margin_bottom(8)
-        .build();
-
-    let spacer = gtk::Box::builder().hexpand(true).build();
-    let cancel_btn = gtk::Button::with_label(&*t!("btn.cancel"));
-    let save_btn = gtk::Button::with_label(&*t!("startup_dialog.save"));
-    save_btn.add_css_class("suggested-action");
-
-    btn_bar.append(&spacer);
-    btn_bar.append(&cancel_btn);
-    btn_bar.append(&save_btn);
-    root.append(&btn_bar);
-
-    window.set_child(Some(&root));
-
-    // Helper: collect current widget values into a RuntimeState.
-    let collect = {
-        let state = state.clone();
-        std::rc::Rc::new(move || -> RuntimeState {
-            let mut s = state.clone();
-            s.hide_window_on_startup = hide_yes_radio.is_active();
-            if conn_on_radio.is_active() {
-                s.startup_connection_state = StartupConnectionState::On;
-            } else if conn_last_radio.is_active() {
-                s.startup_connection_state = StartupConnectionState::LastState;
-            } else {
-                s.startup_connection_state = StartupConnectionState::Off;
-            }
-            s.auto_start = autostart_yes_radio.is_active();
-            s
-        })
+/// Open the startup settings dialog as its own window.
+pub fn open(owner: &WeakEntity<AppView>, cx: &mut App) {
+    let Some(state) = owner.update(cx, |view, _| view.runtime_snapshot()).ok() else {
+        return;
     };
+    let owner = owner.clone();
 
-    let on_save = std::rc::Rc::new(on_save);
+    let handle = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(460.), px(420.)),
+                    cx,
+                ))),
+                app_id: Some("io.juicity.gui".to_string()),
+                ..Default::default()
+            },
+            |window, cx| {
+                window.set_window_title(&t!("startup_dialog.title"));
+                window.set_app_id("io.juicity.gui");
+                cx.new(|cx| StartupDialog::new(owner, state, cx))
+            },
+        )
+        .ok();
 
-    // ── Cancel ────────────────────────────────────────────────────────────
-    {
-        let window = window.clone();
-        cancel_btn.connect_clicked(move |_| window.close());
+    if let Some(handle) = handle {
+        handle
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+    }
+}
+
+/// Dialog state: the owner view plus editable fields.
+pub struct StartupDialog {
+    owner: WeakEntity<AppView>,
+    hide_window: bool,
+    connection_state: StartupConnectionState,
+    auto_start: bool,
+}
+
+impl StartupDialog {
+    fn new(owner: WeakEntity<AppView>, state: RuntimeState, _cx: &mut Context<Self>) -> Self {
+        Self {
+            owner,
+            hide_window: state.hide_window_on_startup,
+            connection_state: state.startup_connection_state,
+            auto_start: state.auto_start,
+        }
     }
 
-    // ── Save ──────────────────────────────────────────────────────────────
-    {
-        let window = window.clone();
-        let collect = std::rc::Rc::clone(&collect);
-        let on_save = std::rc::Rc::clone(&on_save);
-        save_btn.connect_clicked(move |_| {
-            on_save(collect());
-            window.close();
-        });
+    fn set_connection_state(&mut self, state: StartupConnectionState, cx: &mut Context<Self>) {
+        self.connection_state = state;
+        cx.notify();
     }
 
-    window.present();
+    fn toggle_hide_window(&mut self, cx: &mut Context<Self>) {
+        self.hide_window = !self.hide_window;
+        cx.notify();
+    }
+
+    fn toggle_auto_start(&mut self, cx: &mut Context<Self>) {
+        self.auto_start = !self.auto_start;
+        cx.notify();
+    }
+
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = RuntimeState {
+            hide_window_on_startup: self.hide_window,
+            startup_connection_state: self.connection_state,
+            auto_start: self.auto_start,
+            ..self
+                .owner
+                .update(cx, |view, _| view.runtime_snapshot())
+                .ok()
+                .unwrap_or_default()
+        };
+        let owner = self.owner.clone();
+        owner
+            .update(cx, |view, cx| view.apply_runtime_state(state, cx))
+            .ok();
+        window.remove_window();
+    }
+
+    fn cancel(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+        window.remove_window();
+    }
+}
+
+impl Render for StartupDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.weak_entity();
+
+        let group_header = |title: &str| {
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(rgb(0x24292f))
+                .mb_1()
+                .child(title.to_string())
+        };
+
+        let conn_options = [
+            StartupConnectionState::Off,
+            StartupConnectionState::On,
+            StartupConnectionState::LastState,
+        ];
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0xf6f8fa))
+            .child(
+                div()
+                    .id("startup-scroll")
+                    .flex_grow()
+                    .overflow_y_scroll()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        group_header(&t!("startup_dialog.group_hide_window"))
+                            .child(div().h(px(1.)).w_full().bg(rgb(0xe0e0e0)).mt_1()),
+                    )
+                    .child(div().pl(px(8.)).child(widgets::checkbox(
+                        "startup-hide-window",
+                        t!("startup_dialog.hide_window_desc").to_string(),
+                        self.hide_window,
+                        with_view(&this, StartupDialog::toggle_hide_window),
+                    )))
+                    .child(separator())
+                    .child(
+                        group_header(&t!("startup_dialog.group_connection"))
+                            .child(div().h(px(1.)).w_full().bg(rgb(0xe0e0e0)).mt_1()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .children(conn_options.iter().map(|&option| {
+                                let selected = option == self.connection_state;
+                                let label = option.label();
+                                let this = this.clone();
+                                widgets::button(
+                                    ("startup-conn", option.index()),
+                                    label,
+                                    selected,
+                                    move |_e: &ClickEvent, _w: &mut Window, cx: &mut App| {
+                                        this.update(cx, |dialog, cx| {
+                                            dialog.set_connection_state(option, cx);
+                                        })
+                                        .ok();
+                                    },
+                                )
+                            })),
+                    )
+                    .child(separator())
+                    .child(
+                        group_header(&t!("startup_dialog.group_autostart"))
+                            .child(div().h(px(1.)).w_full().bg(rgb(0xe0e0e0)).mt_1()),
+                    )
+                    .child(div().pl(px(8.)).child(widgets::checkbox(
+                        "startup-auto-start",
+                        t!("startup_dialog.autostart_desc").to_string(),
+                        self.auto_start,
+                        with_view(&this, StartupDialog::toggle_auto_start),
+                    ))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(0xd0d7de))
+                    .bg(rgb(0xffffff))
+                    .child(div().flex_grow())
+                    .child(widgets::button(
+                        "startup-cancel",
+                        t!("btn.cancel").to_string(),
+                        false,
+                        {
+                            let this = this.clone();
+                            move |_e, window, cx| {
+                                this.update(cx, |dialog, cx| dialog.cancel(window, cx)).ok();
+                            }
+                        },
+                    ))
+                    .child(widgets::button(
+                        "startup-save",
+                        t!("startup_dialog.save").to_string(),
+                        true,
+                        {
+                            let this = this.clone();
+                            move |_e, window, cx| {
+                                this.update(cx, |dialog, cx| dialog.save(window, cx)).ok();
+                            }
+                        },
+                    )),
+            )
+    }
+}
+
+/// Build a click handler that routes to a `&mut self` view method.
+fn with_view<F>(
+    this: &WeakEntity<StartupDialog>,
+    f: F,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static
+where
+    F: Fn(&mut StartupDialog, &mut Context<StartupDialog>) + 'static,
+{
+    let this = this.clone();
+    move |_e, _window, cx| {
+        this.update(cx, |view, cx| f(view, cx)).ok();
+    }
+}
+
+/// Thin horizontal separator line.
+fn separator() -> impl IntoElement {
+    div().h(px(1.)).w_full().bg(rgb(0xe0e0e0)).my_1()
 }

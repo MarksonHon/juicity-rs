@@ -1,5 +1,5 @@
 use crate::config::{ProxyProfile, ProxyProtocol};
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use base64::Engine;
 
 /// All parsed fields from an imported share link.
@@ -77,7 +77,10 @@ fn export_juicity_link(profile: &ProxyProfile) -> anyhow::Result<String> {
     let mut params = Vec::new();
     if let Some(sni) = &profile.sni {
         if !sni.is_empty() {
-            params.push(format!("sni={}", url::form_urlencoded::byte_serialize(sni.as_bytes()).collect::<String>()));
+            params.push(format!(
+                "sni={}",
+                url::form_urlencoded::byte_serialize(sni.as_bytes()).collect::<String>()
+            ));
         }
     }
     if profile.allow_insecure {
@@ -89,7 +92,9 @@ fn export_juicity_link(profile: &ProxyProfile) -> anyhow::Result<String> {
     }
     if !profile.name.is_empty() && profile.name != "New Server" {
         s.push('#');
-        s.push_str(&url::form_urlencoded::byte_serialize(profile.name.as_bytes()).collect::<String>());
+        s.push_str(
+            &url::form_urlencoded::byte_serialize(profile.name.as_bytes()).collect::<String>(),
+        );
     }
     Ok(s)
 }
@@ -101,7 +106,11 @@ fn export_ss_link(profile: &ProxyProfile) -> anyhow::Result<String> {
     // SIP002 format: ss://method:password@host:port[#remarks]
     let userinfo = format!("{}:{}", profile.method, profile.password);
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(userinfo.as_bytes());
-    let mut s = format!("ss://{}@{}", b64, crate::util::format_host_port(&profile.server, profile.server_port));
+    let mut s = format!(
+        "ss://{}@{}",
+        b64,
+        crate::util::format_host_port(&profile.server, profile.server_port)
+    );
     if let Some(plugin) = &profile.plugin {
         if !plugin.is_empty() {
             let mut plugin_str = plugin.clone();
@@ -119,7 +128,9 @@ fn export_ss_link(profile: &ProxyProfile) -> anyhow::Result<String> {
     }
     if !profile.name.is_empty() && profile.name != "New Server" {
         s.push('#');
-        s.push_str(&url::form_urlencoded::byte_serialize(profile.name.as_bytes()).collect::<String>());
+        s.push_str(
+            &url::form_urlencoded::byte_serialize(profile.name.as_bytes()).collect::<String>(),
+        );
     }
     Ok(s)
 }
@@ -139,7 +150,10 @@ fn parse_juicity_link(raw: &str) -> anyhow::Result<ImportedShareLink> {
         bail!("juicity link missing password in userinfo")
     }
 
-    let host = url.host_str().context("juicity link missing host")?.to_string();
+    let host = url
+        .host_str()
+        .context("juicity link missing host")?
+        .to_string();
     let port = url.port().context("juicity link missing port")?;
 
     let mut sni = None;
@@ -201,15 +215,14 @@ fn parse_ss_sip002(raw: &str) -> anyhow::Result<ImportedShareLink> {
 
     let (method, password) = if let Some(plain_pass) = url.password() {
         // method is in username, password is in password field
-        (
-            percent_decode(username),
-            percent_decode(plain_pass),
-        )
+        (percent_decode(username), percent_decode(plain_pass))
     } else {
         // base64(method:password) in username
         let decoded = decode_base64_variants(username)
             .context("ss link username must be plain method:password or base64(method:password)")?;
-        let (m, p) = decoded.split_once(':').context("ss credentials missing method:password pair")?;
+        let (m, p) = decoded
+            .split_once(':')
+            .context("ss credentials missing method:password pair")?;
         (m.to_string(), p.to_string())
     };
 
@@ -267,7 +280,9 @@ fn parse_ss_legacy(raw: &str) -> anyhow::Result<ImportedShareLink> {
     let creds = &decoded[..at_pos];
     let endpoint = &decoded[at_pos + 1..];
 
-    let (method, password) = creds.split_once(':').context("legacy ss credentials missing method:password pair")?;
+    let (method, password) = creds
+        .split_once(':')
+        .context("legacy ss credentials missing method:password pair")?;
     let (host, port) = crate::util::split_host_port(endpoint);
 
     let name = remark.unwrap_or_else(|| format!("{}:{}", host, port));
@@ -348,7 +363,8 @@ mod tests {
 
     #[test]
     fn parse_ss_legacy_ok() {
-        let parsed = import_share_link("ss://YWVzLTI1Ni1nY206cGFzc0AxMjcuMC4wLjE6ODM4OA==").unwrap();
+        let parsed =
+            import_share_link("ss://YWVzLTI1Ni1nY206cGFzc0AxMjcuMC4wLjE6ODM4OA==").unwrap();
         assert_eq!(parsed.protocol, ProxyProtocol::Shadowsocks);
         assert_eq!(parsed.server, "127.0.0.1");
     }

@@ -418,16 +418,16 @@ jobs:
         run: tar -xzf juicity-offline-source.tar.gz
 
       # ── Install dependencies ─────────────────────────────────────────────
+      # GPUI needs libxkbcommon (x11 + wayland), libwayland-client and libxcb
+      # at build time. Vulkan (blade) is dlopen'd at runtime, not linked, so
+      # no vulkan dev packages are required to build. macOS uses Metal and
+      # Windows uses native Win32/Direct3D, so no extra packages are needed.
 
-      - name: Install GTK4 + build tools (Linux)
+      - name: Install GPUI build deps (Linux)
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config
-
-      - name: Install GTK4 (macOS)
-        if: matrix.os == 'macos'
-        run: brew install gtk4 libadwaita dbus
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxcb1-dev
 
       - name: Install Rust toolchain (Linux/macOS)
         if: matrix.os != 'windows'
@@ -447,10 +447,6 @@ jobs:
             mingw-w64-${{ matrix.msystem_arch }}-lld
             mingw-w64-${{ matrix.msystem_arch }}-llvm
             mingw-w64-${{ matrix.msystem_arch }}-rust
-            mingw-w64-${{ matrix.msystem_arch }}-gtk4
-            mingw-w64-${{ matrix.msystem_arch }}-libadwaita
-            mingw-w64-${{ matrix.msystem_arch }}-pkg-config
-            mingw-w64-${{ matrix.msystem_arch }}-dbus
 
       # ── Build ────────────────────────────────────────────────────────────
 
@@ -577,56 +573,6 @@ jobs:
               queue+=("${PKG_DIR}/${name}")
             done < <(ldd "$bin" 2>/dev/null | awk '/=> \// {print $3}' | grep -v '/c/[Ww]indows')
           done
-
-          # GTK4 runtime data
-          PREFIX="${MSYSTEM_PREFIX}"
-
-          # GLib schemas
-          mkdir -p "${PKG_DIR}/share/glib-2.0/schemas"
-          [[ -f "${PREFIX}/share/glib-2.0/schemas/gschemas.compiled" ]] && \
-            cp "${PREFIX}/share/glib-2.0/schemas/gschemas.compiled" "${PKG_DIR}/share/glib-2.0/schemas/"
-
-          # GDK-pixbuf loaders
-          if [[ -d "${PREFIX}/lib/gdk-pixbuf-2.0" ]]; then
-            mkdir -p "${PKG_DIR}/lib"
-            cp -r "${PREFIX}/lib/gdk-pixbuf-2.0" "${PKG_DIR}/lib/"
-            # Also collect DLL deps of the loaders themselves
-            shopt -s globstar
-            for loader in "${PKG_DIR}/lib/gdk-pixbuf-2.0/"**/*.dll; do
-              [[ -f "$loader" ]] || continue
-              while IFS= read -r dll; do
-                name=$(basename "$dll")
-                [[ -n "${seen[$name]+x}" ]] && continue
-                seen[$name]=1
-                cp "$dll" "${PKG_DIR}/"
-              done < <(ldd "$loader" 2>/dev/null | awk '/=> \// {print $3}' | grep -v '/c/[Ww]indows')
-            done
-          fi
-
-          # GTK4 modules (print backends, media backends)
-          [[ -d "${PREFIX}/lib/gtk-4.0" ]] && \
-            { mkdir -p "${PKG_DIR}/lib"; cp -r "${PREFIX}/lib/gtk-4.0" "${PKG_DIR}/lib/"; }
-
-          # Hicolor icon theme
-          [[ -d "${PREFIX}/share/icons/hicolor" ]] && \
-            { mkdir -p "${PKG_DIR}/share/icons"; cp -r "${PREFIX}/share/icons/hicolor" "${PKG_DIR}/share/icons/"; }
-
-          # Adwaita icon theme
-          [[ -d "${PREFIX}/share/icons/Adwaita" ]] && \
-            { mkdir -p "${PKG_DIR}/share/icons"; cp -r "${PREFIX}/share/icons/Adwaita" "${PKG_DIR}/share/icons/"; }
-
-          # dbus-daemon.exe — GLib/GIO on Windows searches for this binary to start
-          # a session bus; without it the runtime prints:
-          #   GLib-GIO-WARNING: win32 session dbus binary not found
-          if [[ -f "${PREFIX}/bin/dbus-daemon.exe" ]]; then
-            cp "${PREFIX}/bin/dbus-daemon.exe" "${PKG_DIR}/"
-            while IFS= read -r dll; do
-              name=$(basename "$dll")
-              [[ -n "${seen[$name]+x}" ]] && continue
-              seen[$name]=1
-              cp "$dll" "${PKG_DIR}/"
-            done < <(ldd "${PKG_DIR}/dbus-daemon.exe" 2>/dev/null | awk '/=> \//' | awk '{print $3}' | grep -v '/c/[Ww]indows')
-          fi
 
       # ── Upload artifact ───────────────────────────────────────────────────
 

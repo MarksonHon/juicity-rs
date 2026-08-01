@@ -49,8 +49,8 @@ impl PacServer {
 /// Bind a TCP listener on `listen_addr` and start a background thread that
 /// serves the current PAC content as an HTTP response.
 pub fn start(listen_addr: &str, initial_content: String) -> anyhow::Result<PacServer> {
-    let listener =
-        TcpListener::bind(listen_addr).with_context(|| format!("PAC server: bind {listen_addr}"))?;
+    let listener = TcpListener::bind(listen_addr)
+        .with_context(|| format!("PAC server: bind {listen_addr}"))?;
 
     let content: PacContent = Arc::new(Mutex::new(initial_content));
     let content_thread = Arc::clone(&content);
@@ -60,10 +60,7 @@ pub fn start(listen_addr: &str, initial_content: String) -> anyhow::Result<PacSe
         .spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let pac = content_thread
-                    .lock()
-                    .map(|c| c.clone())
-                    .unwrap_or_default();
+                let pac = content_thread.lock().map(|c| c.clone()).unwrap_or_default();
                 // Minimal HTTP/1.0 response – no keep-alive needed.
                 let response = format!(
                     "HTTP/1.0 200 OK\r\n\

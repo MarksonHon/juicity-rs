@@ -13,17 +13,32 @@ pub fn apply_system_proxy(config: &AppConfig) -> anyhow::Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        return apply_linux(config.system_proxy_mode, &pac_url, &config.http_listen, &config.socks_listen);
+        return apply_linux(
+            config.system_proxy_mode,
+            &pac_url,
+            &config.http_listen,
+            &config.socks_listen,
+        );
     }
 
     #[cfg(target_os = "macos")]
     {
-        return apply_macos(config.system_proxy_mode, &pac_url, &config.http_listen, &config.socks_listen);
+        return apply_macos(
+            config.system_proxy_mode,
+            &pac_url,
+            &config.http_listen,
+            &config.socks_listen,
+        );
     }
 
     #[cfg(target_os = "windows")]
     {
-        return apply_windows(config.system_proxy_mode, &pac_url, &config.http_listen, &config.socks_listen);
+        return apply_windows(
+            config.system_proxy_mode,
+            &pac_url,
+            &config.http_listen,
+            &config.socks_listen,
+        );
     }
 
     #[allow(unreachable_code)]
@@ -33,9 +48,13 @@ pub fn apply_system_proxy(config: &AppConfig) -> anyhow::Result<()> {
     }
 }
 
-
 #[cfg(target_os = "linux")]
-fn apply_linux(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_listen: &str) -> anyhow::Result<()> {
+fn apply_linux(
+    mode: SystemProxyMode,
+    pac_url: &str,
+    http_listen: &str,
+    socks_listen: &str,
+) -> anyhow::Result<()> {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     let desktop_lower = desktop.to_lowercase();
 
@@ -77,14 +96,25 @@ fn apply_linux(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_li
 }
 
 #[cfg(target_os = "linux")]
-fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_listen: &str) -> anyhow::Result<bool> {
+fn apply_linux_gnome(
+    mode: SystemProxyMode,
+    pac_url: &str,
+    http_listen: &str,
+    socks_listen: &str,
+) -> anyhow::Result<bool> {
     let mut ok = false;
     match mode {
         SystemProxyMode::Disable => {
-            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "none"])?;
+            ok |= run_if_available(
+                "gsettings",
+                &["set", "org.gnome.system.proxy", "mode", "none"],
+            )?;
         }
         SystemProxyMode::Pac => {
-            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "auto"])?;
+            ok |= run_if_available(
+                "gsettings",
+                &["set", "org.gnome.system.proxy", "mode", "auto"],
+            )?;
             ok |= run_if_available(
                 "gsettings",
                 &["set", "org.gnome.system.proxy", "autoconfig-url", pac_url],
@@ -94,15 +124,26 @@ fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, so
             let (http_host, http_port) = crate::util::split_host_port(http_listen);
             let (socks_host, socks_port) = crate::util::split_host_port(socks_listen);
 
-            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "mode", "manual"])?;
-            ok |= run_if_available("gsettings", &["set", "org.gnome.system.proxy", "use-same-proxy", "true"])?;
+            ok |= run_if_available(
+                "gsettings",
+                &["set", "org.gnome.system.proxy", "mode", "manual"],
+            )?;
+            ok |= run_if_available(
+                "gsettings",
+                &["set", "org.gnome.system.proxy", "use-same-proxy", "true"],
+            )?;
             ok |= run_if_available(
                 "gsettings",
                 &["set", "org.gnome.system.proxy.http", "host", http_host],
             )?;
             ok |= run_if_available(
                 "gsettings",
-                &["set", "org.gnome.system.proxy.http", "port", &http_port.to_string()],
+                &[
+                    "set",
+                    "org.gnome.system.proxy.http",
+                    "port",
+                    &http_port.to_string(),
+                ],
             )?;
             ok |= run_if_available(
                 "gsettings",
@@ -110,7 +151,12 @@ fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, so
             )?;
             ok |= run_if_available(
                 "gsettings",
-                &["set", "org.gnome.system.proxy.https", "port", &http_port.to_string()],
+                &[
+                    "set",
+                    "org.gnome.system.proxy.https",
+                    "port",
+                    &http_port.to_string(),
+                ],
             )?;
             ok |= run_if_available(
                 "gsettings",
@@ -118,7 +164,12 @@ fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, so
             )?;
             ok |= run_if_available(
                 "gsettings",
-                &["set", "org.gnome.system.proxy.socks", "port", &socks_port.to_string()],
+                &[
+                    "set",
+                    "org.gnome.system.proxy.socks",
+                    "port",
+                    &socks_port.to_string(),
+                ],
             )?;
         }
     }
@@ -127,20 +178,41 @@ fn apply_linux_gnome(mode: SystemProxyMode, pac_url: &str, http_listen: &str, so
 }
 
 #[cfg(target_os = "linux")]
-fn apply_linux_kde(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_listen: &str) -> anyhow::Result<bool> {
+fn apply_linux_kde(
+    mode: SystemProxyMode,
+    pac_url: &str,
+    http_listen: &str,
+    socks_listen: &str,
+) -> anyhow::Result<bool> {
     let mut ok = false;
 
     match mode {
         SystemProxyMode::Disable => {
             ok |= run_if_available(
                 "kwriteconfig5",
-                &["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"],
+                &[
+                    "--file",
+                    "kioslaverc",
+                    "--group",
+                    "Proxy Settings",
+                    "--key",
+                    "ProxyType",
+                    "0",
+                ],
             )?;
         }
         SystemProxyMode::Pac => {
             ok |= run_if_available(
                 "kwriteconfig5",
-                &["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "2"],
+                &[
+                    "--file",
+                    "kioslaverc",
+                    "--group",
+                    "Proxy Settings",
+                    "--key",
+                    "ProxyType",
+                    "2",
+                ],
             )?;
             ok |= run_if_available(
                 "kwriteconfig5",
@@ -172,7 +244,15 @@ fn apply_linux_kde(mode: SystemProxyMode, pac_url: &str, http_listen: &str, sock
 
             ok |= run_if_available(
                 "kwriteconfig5",
-                &["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "1"],
+                &[
+                    "--file",
+                    "kioslaverc",
+                    "--group",
+                    "Proxy Settings",
+                    "--key",
+                    "ProxyType",
+                    "1",
+                ],
             )?;
             ok |= run_if_available(
                 "kwriteconfig5",
@@ -224,7 +304,12 @@ fn apply_linux_kde(mode: SystemProxyMode, pac_url: &str, http_listen: &str, sock
 }
 
 #[cfg(target_os = "macos")]
-fn apply_macos(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_listen: &str) -> anyhow::Result<()> {
+fn apply_macos(
+    mode: SystemProxyMode,
+    pac_url: &str,
+    http_listen: &str,
+    socks_listen: &str,
+) -> anyhow::Result<()> {
     let services = list_macos_network_services()?;
     if services.is_empty() {
         bail!("no active macOS network services found")
@@ -234,16 +319,28 @@ fn apply_macos(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_li
         match mode {
             SystemProxyMode::Disable => {
                 run_required("networksetup", &["-setwebproxystate", &service, "off"])?;
-                run_required("networksetup", &["-setsecurewebproxystate", &service, "off"])?;
-                run_required("networksetup", &["-setsocksfirewallproxystate", &service, "off"])?;
+                run_required(
+                    "networksetup",
+                    &["-setsecurewebproxystate", &service, "off"],
+                )?;
+                run_required(
+                    "networksetup",
+                    &["-setsocksfirewallproxystate", &service, "off"],
+                )?;
                 run_required("networksetup", &["-setautoproxystate", &service, "off"])?;
             }
             SystemProxyMode::Pac => {
                 run_required("networksetup", &["-setautoproxyurl", &service, pac_url])?;
                 run_required("networksetup", &["-setautoproxystate", &service, "on"])?;
                 run_required("networksetup", &["-setwebproxystate", &service, "off"])?;
-                run_required("networksetup", &["-setsecurewebproxystate", &service, "off"])?;
-                run_required("networksetup", &["-setsocksfirewallproxystate", &service, "off"])?;
+                run_required(
+                    "networksetup",
+                    &["-setsecurewebproxystate", &service, "off"],
+                )?;
+                run_required(
+                    "networksetup",
+                    &["-setsocksfirewallproxystate", &service, "off"],
+                )?;
             }
             SystemProxyMode::Global => {
                 // Only parse host/port in the branch that actually needs them.
@@ -256,7 +353,12 @@ fn apply_macos(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_li
                 )?;
                 run_required(
                     "networksetup",
-                    &["-setsecurewebproxy", &service, &http_host, &http_port.to_string()],
+                    &[
+                        "-setsecurewebproxy",
+                        &service,
+                        &http_host,
+                        &http_port.to_string(),
+                    ],
                 )?;
                 run_required(
                     "networksetup",
@@ -269,7 +371,10 @@ fn apply_macos(mode: SystemProxyMode, pac_url: &str, http_listen: &str, socks_li
                 )?;
                 run_required("networksetup", &["-setwebproxystate", &service, "on"])?;
                 run_required("networksetup", &["-setsecurewebproxystate", &service, "on"])?;
-                run_required("networksetup", &["-setsocksfirewallproxystate", &service, "on"])?;
+                run_required(
+                    "networksetup",
+                    &["-setsocksfirewallproxystate", &service, "on"],
+                )?;
                 run_required("networksetup", &["-setautoproxystate", &service, "off"])?;
             }
         }
@@ -304,7 +409,12 @@ fn list_macos_network_services() -> anyhow::Result<Vec<String>> {
 }
 
 #[cfg(target_os = "windows")]
-fn apply_windows(mode: SystemProxyMode, pac_url: &str, http_listen: &str, _socks_listen: &str) -> anyhow::Result<()> {
+fn apply_windows(
+    mode: SystemProxyMode,
+    pac_url: &str,
+    http_listen: &str,
+    _socks_listen: &str,
+) -> anyhow::Result<()> {
     match mode {
         SystemProxyMode::Disable => {
             run_required(
@@ -423,11 +533,23 @@ fn run_if_available(program: &str, args: &[&str]) -> anyhow::Result<bool> {
     let status = match cmd.status() {
         Ok(v) => v,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(anyhow::anyhow!("failed to run {} {:?}: {}", program, args, err)),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to run {} {:?}: {}",
+                program,
+                args,
+                err
+            ))
+        }
     };
 
     if !status.success() {
-        return Err(anyhow::anyhow!("{} {:?} exited with {}", program, args, status));
+        return Err(anyhow::anyhow!(
+            "{} {:?} exited with {}",
+            program,
+            args,
+            status
+        ));
     }
 
     Ok(true)
