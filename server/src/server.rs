@@ -543,9 +543,37 @@ async fn run_underlay_packet_loop(
     ));
 
     while let Some(packet) = rx.recv().await {
-        // Acquire a permit before spawning. If all permits are taken, this await will back-pressure
-        // the channel receiver, causing the DemuxUdpSocket's try_send to fail and
-        // drop excess packets — a controlled degradation instead of unbounded growth.
+        if packet.payload.len() < consts::UNDERLAY_SALT_LEN {
+            continue;
+        }
+
+        let source = packet.peer;
+
+        // ── Fast path: existing session → decrypt + forward inline (no spawn) ──
+        // Only attempt inline processing when both session and endpoint are cached.
+        // This avoids modifying payload in-place when we might fall through to the
+        // slow path (which expects the original salt-prefixed payload).
+        if let Some(session) = sessions.get(&source) {
+            if let Some((send_socket, pool_target)) = udp_pool.get_socket(&source) {
+                // Clone payload only when we're committed to the fast path.
+                // This is the hot path — most packets hit here.
+                let mut payload = packet.payload.clone();
+                if session.cipher.decrypt_in_place(&mut payload).is_ok() {
+                    if send_socket
+                        .send_to(&payload[juicity_underlay::SALT_LEN..], &*pool_target)
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    // send failed — clean up stale endpoint, fall through to slow path
+                    udp_pool.remove(&source);
+                }
+                // decrypt or send failed — fall through to slow path
+            }
+        }
+
+        // ── Slow path: new session or recovery → spawn task for async auth/endpoint creation ──
         let permit = concurrency_limit.clone().acquire_owned().await;
         let in_flight = in_flight.clone();
         let udp_pool = udp_pool.clone();
@@ -1199,6 +1227,10 @@ async fn handle_udp_relay(
             // Reusable string buffer for per-datagram address — avoids a String
             // heap allocation on every UDP datagram in the hot loop.
             let mut t_addr_buf = String::with_capacity(64);
+            // Local resolved-address cache: most UDP sessions talk to the same
+            // target, so this avoids repeated `Arc<str>` allocation + DNS lookup.
+            let mut local_resolved: std::collections::HashMap<(String, u16), SocketAddr> =
+                std::collections::HashMap::new();
             loop {
                 // Each subsequent datagram: [trojanc_addr][len(2)][payload]
                 let t_port =
@@ -1219,8 +1251,18 @@ async fn handle_udp_relay(
                     break;
                 }
 
-                let target =
-                    match resolve_udp_target(&t_addr_buf, t_port, &dns_cache, &dns_resolving).await
+                // Fast local cache: avoid DNS lookup + Arc<str> allocation for
+                // the common case where all datagrams go to the same target.
+                let target = if let Some(&cached) = local_resolved.get(&(t_addr_buf.clone(), t_port)) {
+                    cached
+                } else {
+                    let resolved = match resolve_udp_target(
+                        &t_addr_buf,
+                        t_port,
+                        &dns_cache,
+                        &dns_resolving,
+                    )
+                    .await
                     {
                         Ok(addr) => addr,
                         Err(e) => {
@@ -1228,6 +1270,9 @@ async fn handle_udp_relay(
                             break;
                         }
                     };
+                    local_resolved.insert((t_addr_buf.clone(), t_port), resolved);
+                    resolved
+                };
                 if let Err(e) = remote.send_to(&payload, target).await {
                     tracing::debug!("UDP relay write error: {:?}", e);
                     break;

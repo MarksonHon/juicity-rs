@@ -24,17 +24,14 @@ pub const MAX_OPEN_INCOMING_STREAMS: u64 = 100;
 pub const KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
 
 /// QUIC per-stream receive window (bytes).
-/// Lowering this bounds worst-case memory per stream in high-throughput scenarios.
-/// Reduced from 512KB to 256KB to halve worst-case per-stream buffer memory.
-pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
+/// Balances per-stream memory with throughput on high-BDP links.
+pub const QUIC_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
 /// QUIC per-connection receive window (bytes).
 /// Must be >= stream window; limits aggregate receive buffering per connection.
-/// Reduced from 8MB to 4MB to lower per-connection memory floor.
-pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
+pub const QUIC_CONNECTION_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
 /// QUIC send window (bytes).
 /// Caps unacknowledged outbound data retained in memory per connection.
-/// Reduced from 8MB to 4MB.
-pub const QUIC_SEND_WINDOW: u64 = 4 * 1024 * 1024;
+pub const QUIC_SEND_WINDOW: u64 = 16 * 1024 * 1024;
 
 /// JUICIY protocol version 0
 pub const JUICIY_VERSION_0: u8 = 0;

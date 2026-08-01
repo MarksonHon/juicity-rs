@@ -29,6 +29,7 @@ indexmap = "2"
 if-addrs = "0.13"
 dialoguer = "0.11"
 moka = { version = "0.12", features = ["sync"] }
+dashmap = "6"
 
 [target.'cfg(not(any(target_env = "musl", target_os = "windows")))'.dependencies]
 tikv-jemallocator = { workspace = true }
