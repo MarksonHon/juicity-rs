@@ -5,7 +5,7 @@
 # The caller is responsible for running build-package.yml first
 # (this workflow consumes the juicity-offline-source artifact).
 # Builds client / server for all supported platforms:
-#   Linux  (glibc and musl, zigbuild): x86_64, aarch64, i686, armv7, riscv64gc, loongarch64
+#   Linux  (zigbuild; ARMv7 glibc via cross): x86_64, aarch64, i686, armv7, riscv64gc, loongarch64
 #   Windows gnullvm (static): x86_64, aarch64  (via MSYS2 CLANG64/CLANGARM64)
 #   macOS        (native)  : x86_64, aarch64
 #   FreeBSD      (cross)   : x86_64
@@ -32,7 +32,7 @@ env:
 
 jobs:
   # --------------------------------------------------
-  # Linux — zigbuild
+  # Linux — zigbuild, with cross for ARMv7 GNU
   # --------------------------------------------------
   linux:
     name: Linux (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
@@ -86,6 +86,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install Zig
+        if: matrix.target != 'armv7-unknown-linux-gnueabihf'
         shell: bash
         run: |
           sudo apt-get update
@@ -93,11 +94,27 @@ jobs:
 
 
       - name: Install cargo-zigbuild
+        if: matrix.target != 'armv7-unknown-linux-gnueabihf'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-zigbuild
 
+      # ARMv7 GNU's jemalloc C build fails through the Zig wrapper; use GCC via cross.
+      - name: Install cross for ARMv7 GNU
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build ARMv7 GNU with cross
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        env:
+          CROSS_BUILD_ENV_PASSTHROUGH: JUICITY_BUILD_TAG JUICITY_BUILD_COMMIT
+          CROSS_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_IMAGE: ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf@sha256:2d3df5c06507fd14f29133d6ec6abbd662829731367cc8bbf2861d83eb533ef5
+        run: cross build --frozen --workspace --release --target armv7-unknown-linux-gnueabihf --exclude juicity-gui
+
       - name: Build with zigbuild
+        if: matrix.target != 'armv7-unknown-linux-gnueabihf'
         shell: bash
         env:
           RUSTFLAGS: ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
