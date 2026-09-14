@@ -111,7 +111,7 @@ jobs:
         env:
           CROSS_BUILD_ENV_PASSTHROUGH: JUICITY_BUILD_TAG JUICITY_BUILD_COMMIT
           CROSS_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_IMAGE: ghcr.io/cross-rs/armv7-unknown-linux-gnueabihf@sha256:2d3df5c06507fd14f29133d6ec6abbd662829731367cc8bbf2861d83eb533ef5
-        run: cross build --frozen --workspace --release --target armv7-unknown-linux-gnueabihf --exclude juicity-gui
+        run: cross build --locked --frozen --offline  --workspace --release --target armv7-unknown-linux-gnueabihf --exclude juicity-gui
 
       - name: Build with zigbuild
         if: matrix.target != 'armv7-unknown-linux-gnueabihf'
@@ -119,7 +119,7 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
         run: |
-          cargo-zigbuild zigbuild --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
+          cargo-zigbuild zigbuild --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
         shell: bash
@@ -197,7 +197,7 @@ jobs:
         shell: msys2 {0}
         env:
           RUSTFLAGS: -C target-feature=+crt-static ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
-        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
+        run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
         shell: msys2 {0}
@@ -257,7 +257,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --frozen --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
+        run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
 
       - name: Prepare package
         shell: bash
@@ -320,7 +320,7 @@ jobs:
         with:
           command: build
           target: x86_64-unknown-freebsd
-          args: "--frozen --release --workspace --exclude juicity-gui"
+          args: "--locked --frozen --offline  --release --workspace --exclude juicity-gui"
 
       - name: Prepare package
         shell: bash

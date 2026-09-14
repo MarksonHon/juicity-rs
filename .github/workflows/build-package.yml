@@ -31,7 +31,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || '' }}
+          fetch-depth: 0
+
+      - name: Checkout tag if provided
+        if: ${{ inputs.tag != '' }}
+        shell: bash
+        run: |
+          git fetch --tags --prune
+          git checkout "refs/tags/${{ inputs.tag }}" || git checkout -b "release-${{ inputs.tag }}" "refs/tags/${{ inputs.tag }}"
 
       - name: Record source revision
         id: source
