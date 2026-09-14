@@ -14,8 +14,12 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        type: string
+        description: "The tag to release"
+        required: true
 
 permissions:
   contents: write
@@ -28,7 +32,7 @@ jobs:
     name: Package Offline Source Code
     uses: ./.github/workflows/build-package.yml
     with:
-      tag: ${{ github.event.release.tag_name }}
+      tag: ${{ github.event.inputs.tag }}
     secrets: inherit
 
   # --------------------------------------------------
@@ -39,7 +43,7 @@ jobs:
     needs: package
     uses: ./.github/workflows/build-core.yml
     with:
-      tag: ${{ github.event.release.tag_name }}
+      tag: ${{ github.event.inputs.tag }}
       sha: ${{ github.sha }}
     secrets: inherit
 
@@ -51,7 +55,7 @@ jobs:
     needs: package
     uses: ./.github/workflows/build-gui.yml
     with:
-      tag: ${{ github.event.release.tag_name }}
+      tag: ${{ github.event.inputs.tag }}
       sha: ${{ github.sha }}
     secrets: inherit
 
@@ -84,8 +88,13 @@ jobs:
           done
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            artifacts/*.zip
-            artifacts/juicity-offline-source/juicity-offline-source.tar.gz
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Latest_Releases=$(curl -s -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.tag_name')
+          Latest_tag=${{ github.event.inputs.tag }}
+          if [ "$Latest_Releases" != "$Latest_tag" ]; then
+            gh release create "${{ github.event.inputs.tag }}" -t "${{ github.event.inputs.tag }}" --generate-notes
+          fi
+          gh release upload "${{ github.event.inputs.tag }}"
