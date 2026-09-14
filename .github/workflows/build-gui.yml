@@ -130,25 +130,25 @@ jobs:
 
       - name: Build (Linux/macOS)
         if: matrix.os != 'windows'
-        run: cargo build --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-server
+        run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-server
 
       - name: Build (Windows)
         if: matrix.os == 'windows'
         shell: msys2 {0}
-        run: cargo build --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-server
+        run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-server
 
       # ── Test ────────────────────────────────────────────────────────────
 
       - name: Run tests (Linux/macOS)
         if: matrix.os != 'windows'
-        run: cargo test --offline  -p juicity-gui --target ${{ matrix.target }}
+        run: cargo test --locked --frozen --offline  -p juicity-gui --target ${{ matrix.target }}
 
       - name: Run tests (Windows, clear POSIX env vars to validate i18n fallback)
         if: matrix.os == 'windows'
         shell: msys2 {0}
         run: |
           unset LANG LC_ALL LC_MESSAGES
-          cargo test --offline  -p juicity-gui --target ${{ matrix.target }}
+          cargo test --locked --frozen --offline  -p juicity-gui --target ${{ matrix.target }}
 
       # ── Download shadowsocks-rust ─────────────────────────────────────────
 
