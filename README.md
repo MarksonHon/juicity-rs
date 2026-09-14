@@ -34,6 +34,8 @@ gui/                  # Optional GUI front-end (desktop tray app)
 | [`juicity-client`](client/src/main.rs) | `JuicityClient` (QUIC+auth), `LocalServer` (SOCKS5/HTTP), `Forwarder` (TCP/UDP) |
 | [`juicity-server`](server/src/lib.rs) | `JuicityServer` (listener+relay), `Dialer`, `InFlightUnderlayKey`, `UdpEndpointPool`, `DemuxUdpSocket` |
 
+Docker server packaging, Compose usage, and release publication: [Docker guide](docker/README.md).
+
 ## Build
 
 ```bash

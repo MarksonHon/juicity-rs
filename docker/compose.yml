@@ -1,0 +1,16 @@
+services:
+  juicity:
+    image: ghcr.io/juicity/juicity-rs:${JUICITY_VERSION:?Set JUICITY_VERSION to a published release tag}
+    container_name: juicity
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    volumes:
+      - ./server.json:/etc/juicity/server.json:ro
+      - ./certs/server.crt:/etc/juicity/server.crt:ro
+      - ./certs/server.key:/etc/juicity/server.key:ro

@@ -1,7 +1,7 @@
 # ============================================
 # Juicity-RS Release Workflow
 # ============================================
-# Runs when a GitHub Release is published.
+# Builds a selected existing tag, attaches release assets, then publishes tested images.
 # Orchestrates the reusable workflows:
 #   1. build-package.yml — offline source packaging (checked out at the tag)
 #   2. build-core.yml    — core targets, with:
@@ -22,7 +22,7 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # --------------------------------------------------
@@ -44,7 +44,7 @@ jobs:
     uses: ./.github/workflows/build-core.yml
     with:
       tag: ${{ github.event.inputs.tag }}
-      sha: ${{ github.sha }}
+      sha: ${{ needs.package.outputs.revision }}
     secrets: inherit
 
   # --------------------------------------------------
@@ -56,7 +56,7 @@ jobs:
     uses: ./.github/workflows/build-gui.yml
     with:
       tag: ${{ github.event.inputs.tag }}
-      sha: ${{ github.sha }}
+      sha: ${{ needs.package.outputs.revision }}
     secrets: inherit
 
   # --------------------------------------------------
@@ -72,6 +72,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
+          pattern: juicity-*
           path: artifacts
 
       - name: Compress artifacts into zip files
@@ -91,10 +92,77 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          Latest_Releases=$(curl -s -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.tag_name')
-          Latest_tag=${{ github.event.inputs.tag }}
-          if [ "$Latest_Releases" != "$Latest_tag" ]; then
-            gh release create "${{ github.event.inputs.tag }}" -t "${{ github.event.inputs.tag }}" --generate-notes
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
           fi
-          gh release upload "${{ github.event.inputs.tag }}"
+          gh release upload "$RELEASE_TAG" artifacts/*.zip \
+            artifacts/juicity-offline-source/juicity-offline-source.tar.gz --clobber
+
+  docker:
+    name: Test Docker images
+    needs: [package, build-core]
+    uses: ./.github/workflows/docker.yml
+    with:
+      revision: ${{ needs.package.outputs.revision }}
+      version: ${{ inputs.tag }}
+
+  publish-docker:
+    name: Publish tested images to GHCR
+    needs: [package, docker, publish]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: ghcr-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.package.outputs.revision }}
+      - name: Require a published stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REVISION: ${{ needs.package.outputs.revision }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]
+          gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,tagName > release.json
+          jq -e --arg tag "$RELEASE_TAG" '.tagName == $tag and (.isDraft | not) and (.isPrerelease | not)' release.json
+          git fetch origin "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "FETCH_HEAD^{commit}")" = "$REVISION"
+          echo "image=ghcr.io/${GH_REPO,,}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: docker-image-*
+          path: images
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push verified architecture images and manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          refs=()
+          for arch in amd64 arm64 armv7; do
+            docker load -i "images/docker-image-$arch/docker-image.tar"
+            ref="$IMAGE:$RELEASE_TAG-$arch"
+            docker tag juicity-container:test "$ref"
+            docker push "$ref"
+            refs+=("$ref")
+          done
+          docker buildx imagetools create --tag "$IMAGE:$RELEASE_TAG" "${refs[@]}"
+          if [ "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$RELEASE_TAG" ]; then
+            docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$RELEASE_TAG"
+          fi

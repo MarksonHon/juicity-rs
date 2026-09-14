@@ -1,0 +1,70 @@
+name: Docker packaging (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      revision:
+        description: Commit used to build the musl artifacts
+        type: string
+        required: true
+      version:
+        description: Release tag, or empty for a PR build
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Container (${{ matrix.platform }})
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            artifact: juicity-x86_64-unknown-linux-musl
+            suffix: amd64
+          - platform: linux/arm64
+            artifact: juicity-aarch64-unknown-linux-musl
+            suffix: arm64
+          - platform: linux/arm/v7
+            artifact: juicity-armv7-unknown-linux-musleabihf
+            suffix: armv7
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.revision }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.platform }}
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Package existing binary
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          REVISION: ${{ inputs.revision }}
+          VERSION: ${{ inputs.version || inputs.revision }}
+        run: |
+          docker buildx build --platform "$PLATFORM" --load \
+            --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" \
+            --tag juicity-container:test .
+      - name: Verify container startup and shutdown
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          REVISION: ${{ inputs.revision }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          bash docker/smoke-test.sh juicity-container:test "$PLATFORM" "$REVISION"
+          if [ -n "$VERSION" ]; then
+            docker run --rm --platform "$PLATFORM" juicity-container:test --version | grep -F -- "$VERSION"
+          fi
+      - name: Save the tested image
+        run: docker save juicity-container:test -o docker-image.tar
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docker-image-${{ matrix.suffix }}
+          path: docker-image.tar
+          retention-days: 3
