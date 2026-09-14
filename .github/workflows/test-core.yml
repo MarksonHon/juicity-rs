@@ -23,6 +23,9 @@ on:
       - 'build.sh'
       - 'build.bat'
       - '.github/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker/**'
   pull_request:
     paths:
       - 'common/**'
@@ -33,6 +36,12 @@ on:
       - 'build.sh'
       - 'build.bat'
       - '.github/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker/**'
+
+permissions:
+  contents: read
 
 jobs:
   server_tests:
@@ -61,5 +70,12 @@ jobs:
     needs: package
     uses: ./.github/workflows/build-core.yml
     with:
-      sha: ${{ github.sha }}
+      sha: ${{ needs.package.outputs.revision }}
     secrets: inherit
+
+  docker:
+    name: Test Docker images
+    needs: [package, test_core]
+    uses: ./.github/workflows/docker.yml
+    with:
+      revision: ${{ needs.package.outputs.revision }}

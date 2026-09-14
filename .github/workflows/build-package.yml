@@ -17,10 +17,17 @@ on:
         required: false
         default: ''
 
+    outputs:
+      revision:
+        description: Exact source commit in the offline package
+        value: ${{ jobs.package.outputs.revision }}
+
 jobs:
   package:
     name: Package Offline Source Code
     runs-on: ubuntu-26.04
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -32,6 +39,10 @@ jobs:
         run: |
           git fetch --tags --prune
           git checkout "refs/tags/${{ inputs.tag }}" || git checkout -b "release-${{ inputs.tag }}" "refs/tags/${{ inputs.tag }}"
+
+      - name: Record source revision
+        id: source
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Setup vendor for offline build
         shell: bash
