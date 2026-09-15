@@ -37,8 +37,10 @@ jobs:
         if: ${{ inputs.tag != '' }}
         shell: bash
         run: |
-          git fetch --tags --prune
-          git checkout "refs/tags/${{ inputs.tag }}" || git checkout -b "release-${{ inputs.tag }}" "refs/tags/${{ inputs.tag }}"
+          if [ -n "$(git tag -l "${{ inputs.tag }}")" ]; then
+            git tag ${{ inputs.tag }}
+            git checkout ${{ inputs.tag }}
+          fi
 
       - name: Record source revision
         id: source
