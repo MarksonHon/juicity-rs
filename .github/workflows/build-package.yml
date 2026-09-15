@@ -49,7 +49,10 @@ jobs:
 
       - name: Push new tag if created
         if: ${{ inputs.tag != '' }}
-        uses:
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tags: true
 
       - name: Record source revision
         id: source
