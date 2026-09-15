@@ -36,6 +36,8 @@ jobs:
       - name: Checkout tag if provided
         if: ${{ inputs.tag != '' }}
         shell: bash
+        env:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -z "$(git tag -l "${{ inputs.tag }}")" ]; then
             git tag ${{ inputs.tag }}
