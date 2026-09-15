@@ -37,12 +37,12 @@ jobs:
         if: ${{ inputs.tag != '' }}
         shell: bash
         run: |
-          if [ -n "$(git tag -l "${{ inputs.tag }}")" ]; then
+          if [ -z "$(git tag -l "${{ inputs.tag }}")" ]; then
             git tag ${{ inputs.tag }}
             git checkout ${{ inputs.tag }}
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git push origin ${{ inputs.tag }}
+            git push "https://github.com/${{ github.repository }}.git" ${{ inputs.tag }}
           else
             echo "Tag already exists, checking out existing tag."
             git checkout ${{ inputs.tag }}
