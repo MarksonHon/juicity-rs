@@ -40,6 +40,12 @@ jobs:
           if [ -n "$(git tag -l "${{ inputs.tag }}")" ]; then
             git tag ${{ inputs.tag }}
             git checkout ${{ inputs.tag }}
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git push origin ${{ inputs.tag }}
+          else
+            echo "Tag already exists, checking out existing tag."
+            git checkout ${{ inputs.tag }}
           fi
 
       - name: Record source revision
