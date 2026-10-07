@@ -43,40 +43,33 @@ jobs:
           - name: linux-x86_64
             runner: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
-            ss_suffix: x86_64-unknown-linux-gnu.tar.xz
             os: linux
 
           - name: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            ss_suffix: aarch64-unknown-linux-gnu.tar.xz
             os: linux
 
           - name: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-gnullvm
             toolchain: gnullvm
-            ss_suffix: x86_64-pc-windows-msvc.zip
             msystem: CLANG64
             msystem_arch: clang-x86_64
             os: windows
 
-          # Static MSVC build: same toolchain as the bundled shadowsocks-rust
-          # binaries and no MSYS2 runtime DLLs to ship alongside.
+          # Static MSVC build: no MSYS2 runtime DLLs to ship alongside.
           - name: windows-x86_64-msvc
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             toolchain: msvc
-            ss_suffix: x86_64-pc-windows-msvc.zip
             os: windows
 
-          # windows-aarch64 disabled: shadowsocks-rust has no aarch64-pc-windows binary yet
-          # (affects both the gnullvm and the MSVC toolchain)
+          # windows-aarch64 disabled
           # - name: windows-aarch64
           #   runner: windows-11-arm
           #   target: aarch64-pc-windows-gnullvm
           #   toolchain: gnullvm
-          #   ss_suffix: aarch64-pc-windows-msvc.zip
           #   msystem: CLANGARM64
           #   msystem_arch: clang-aarch64
           #   os: windows
@@ -84,13 +77,11 @@ jobs:
           - name: macos-x86_64
             runner: macos-26-intel
             target: x86_64-apple-darwin
-            ss_suffix: x86_64-apple-darwin.tar.xz
             os: macos
 
           - name: macos-aarch64
             runner: macos-latest
             target: aarch64-apple-darwin
-            ss_suffix: aarch64-apple-darwin.tar.xz
             os: macos
 
     steps:
@@ -187,40 +178,6 @@ jobs:
           AWS_LC_SYS_PREBUILT_NASM: '1'
         run: cargo test --locked --frozen --offline  -p juicity-gui --target ${{ matrix.target }}
 
-      # ── Download shadowsocks-rust ─────────────────────────────────────────
-
-      - name: Get shadowsocks-rust latest tag
-        shell: bash
-        run: |
-          SS_TAG=$(curl -sSf \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest" \
-            | grep '"tag_name"' | head -1 | sed 's/.*"\(v[^"]*\)".*/\1/')
-          echo "Resolved shadowsocks-rust tag: ${SS_TAG}"
-          echo "SS_TAG=${SS_TAG}" >> "$GITHUB_ENV"
-
-      - name: Download shadowsocks-rust (Linux/macOS)
-        if: matrix.os != 'windows'
-        shell: bash
-        run: |
-          echo "Downloading shadowsocks-rust ${SS_TAG}"
-          curl -sSfL \
-            "https://github.com/shadowsocks/shadowsocks-rust/releases/download/${SS_TAG}/shadowsocks-${SS_TAG}.${{ matrix.ss_suffix }}" \
-            -o /tmp/ss.tar.xz
-          mkdir -p /tmp/ss
-          tar -xJf /tmp/ss.tar.xz -C /tmp/ss
-          echo "SS_DIR=/tmp/ss" >> "$GITHUB_ENV"
-
-      - name: Download shadowsocks-rust (Windows)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          Write-Host "Downloading shadowsocks-rust $env:SS_TAG"
-          $url = "https://github.com/shadowsocks/shadowsocks-rust/releases/download/$env:SS_TAG/shadowsocks-$env:SS_TAG.${{ matrix.ss_suffix }}"
-          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ss.zip"
-          Expand-Archive -Path "$env:TEMP\ss.zip" -DestinationPath "$env:TEMP\ss" -Force
-          Add-Content $env:GITHUB_ENV "SS_DIR=$env:TEMP\ss"
-
       # ── Prepare package ───────────────────────────────────────────────────
 
       - name: Prepare package (Linux)
@@ -230,10 +187,6 @@ jobs:
           PKG_NAME="juicity-gui-${{ matrix.name }}"
           mkdir -p "${PKG_NAME}"
           cp "target/${{ matrix.target }}/release/juicity-gui"    "${PKG_NAME}/"
-          cp "target/${{ matrix.target }}/release/juicity-client" "${PKG_NAME}/"
-          cp "${SS_DIR}/sslocal" "${PKG_NAME}/"
-          cp "${SS_DIR}/ssurl"   "${PKG_NAME}/"
-          cp client/examples/config.json "${PKG_NAME}/client-config.json"
 
       - name: Prepare .app bundle (macOS)
         if: matrix.os == 'macos'
@@ -267,18 +220,10 @@ jobs:
 
           # Copy built binaries
           cp "target/${{ matrix.target }}/release/juicity-gui.exe"    "${PKG_DIR}/"
-          cp "target/${{ matrix.target }}/release/juicity-client.exe" "${PKG_DIR}/"
-
-          # Copy shadowsocks-rust binaries (convert Windows path to MSYS2 path)
-          SS_UNIX=$(cygpath -u "${SS_DIR}")
-          cp "${SS_UNIX}/sslocal.exe" "${PKG_DIR}/"
-          cp "${SS_UNIX}/ssurl.exe"   "${PKG_DIR}/"
-
-          cp client/examples/config.json "${PKG_DIR}/client-config.json"
 
           # Collect DLL dependencies recursively for all EXEs
           declare -A seen
-          queue=("${PKG_DIR}/juicity-gui.exe" "${PKG_DIR}/juicity-client.exe")
+          queue=("${PKG_DIR}/juicity-gui.exe")
           while [[ ${#queue[@]} -gt 0 ]]; do
             bin="${queue[0]}"; queue=("${queue[@]:1}")
             [[ -f "$bin" ]] || continue
@@ -291,8 +236,7 @@ jobs:
             done < <(ldd "$bin" 2>/dev/null | awk '/=> \// {print $3}' | grep -v '/c/[Ww]indows')
           done
 
-      # The MSVC build links the CRT statically, so only the shadowsocks-rust
-      # binaries are shipped next to it.
+      # The MSVC build links the CRT statically, so no extra DLLs are needed.
       - name: Prepare package (Windows MSVC)
         if: matrix.toolchain == 'msvc'
         shell: pwsh
@@ -300,10 +244,6 @@ jobs:
           $pkg = "juicity-gui-${{ matrix.name }}"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/juicity-gui.exe"    $pkg
-          Copy-Item "target/${{ matrix.target }}/release/juicity-client.exe" $pkg
-          Copy-Item "$env:SS_DIR\sslocal.exe" $pkg
-          Copy-Item "$env:SS_DIR\ssurl.exe"   $pkg
-          Copy-Item "client/examples/config.json" "$pkg/client-config.json"
 
       # ── Upload artifact ───────────────────────────────────────────────────
 

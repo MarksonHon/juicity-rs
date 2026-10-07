@@ -69,7 +69,6 @@ if [[ ! -f "${GUI_BIN}" ]]; then
   echo "Run 'cargo build --release -p juicity-gui' first."
   exit 1
 fi
-CLIENT_BIN="${TARGET_DIR}/juicity-client.exe"
 
 # ── Create distribution directory ────────────────────────────────────────
 DIST_DIR="${REPO_ROOT}/dist/${APP_NAME}"
@@ -79,9 +78,6 @@ echo "==> Created distribution directory: ${DIST_DIR}"
 
 # ── Copy main binaries ────────────────────────────────────────────────────
 cp "${GUI_BIN}" "${DIST_DIR}/juicity-gui.exe"
-if [[ -f "${CLIENT_BIN}" ]]; then
-  cp "${CLIENT_BIN}" "${DIST_DIR}/juicity-client.exe"
-fi
 echo "==> Copied binaries"
 
 # ── Collect DLL dependencies ─────────────────────────────────────────────
@@ -110,7 +106,7 @@ copy_dll() {
   fi
 }
 
-for bin in "${DIST_DIR}/juicity-gui.exe" "${DIST_DIR}/juicity-client.exe"; do
+for bin in "${DIST_DIR}/juicity-gui.exe"; do
   [[ -f "${bin}" ]] || continue
   while IFS= read -r dep; do
     copy_dll "${dep}"
@@ -204,7 +200,7 @@ TOTAL_DLLS="$(find "${DIST_DIR}" -maxdepth 1 -name "*.dll" -o -name "*.exe" | gr
 echo ""
 echo "============================================"
 echo "  Bundle created: ${DIST_DIR}"
-echo "  Binaries: juicity-gui.exe, juicity-client.exe"
+echo "  Binaries: juicity-gui.exe"
 echo "  dbus-daemon.exe: $([ -f "${DIST_DIR}/dbus-daemon.exe" ] && echo yes || echo MISSING)"
 echo "  DLLs: ${TOTAL_DLLS}"
 echo "  Size: $(du -sh "${DIST_DIR}" | cut -f1)"

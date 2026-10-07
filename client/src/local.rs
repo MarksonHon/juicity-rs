@@ -44,6 +44,14 @@ impl LocalServer {
 
     pub async fn serve(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.bind_addr).await?;
+        self.serve_with_listener(listener).await
+    }
+
+    /// Serve connections accepted from an already bound listener.
+    ///
+    /// Embedders (e.g. the GUI) use this to surface bind errors synchronously
+    /// before handing the accept loop to a background task.
+    pub async fn serve_with_listener(&self, listener: TcpListener) -> anyhow::Result<()> {
         tracing::info!("Local proxy listening on {}", self.bind_addr);
 
         // Limit concurrent inbound TCP connections to avoid unbounded memory growth

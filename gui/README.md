@@ -6,9 +6,12 @@ A [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) based desk
 
 - Main window with Shadowsocks-Windows-like split layout (Servers + Details)
 - JSON config persistence in the platform standard config directory
-- Protocol-driven core process manager (no manual core type switch):
-  - Juicity profile -> `juicity-client run -c <config>`
-  - Shadowsocks profile -> `sslocal -c <config>`
+- Self-contained core manager: both protocols run **inside** the GUI process on
+  a dedicated Tokio runtime, so no external helper binaries are required
+  - Juicity profile -> embedded `juicity-client` QUIC client + local
+    SOCKS5/HTTP server (linked as a library)
+  - Shadowsocks profile -> embedded `shadowsocks-service` (official
+    shadowsocks-rust library) SOCKS5 + HTTP local servers
 - Profile/protocol selectors and a server editor with per-field validation
 - URL import/export entry for `juicity://` and `ss://` with parser validation
 - System tray support:
@@ -17,8 +20,26 @@ A [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) based desk
 - System proxy (Disable / PAC / Global): Linux GNOME/KDE, macOS `networksetup`, Windows registry. The proxy is restored to "Disable" when the app quits.
 - Corrupt config files are moved aside as `*.json.bad` and defaults are used instead of failing to start
 - Closing the main window keeps the app running in the tray (on by default; a hidden background window keeps GPUI's event loop alive), as long as a tray icon is actually available
-- Start/stop and process status polling (300 ms)
+- Start/stop and core status polling (300 ms)
 - PAC settings dialog and Startup settings dialog
+
+## Embedded protocol backends
+
+The GUI does not shell out to `juicity-client` or `sslocal`. Instead it links
+them directly:
+
+| Protocol | Implementation | Local listeners |
+| --- | --- | --- |
+| Juicity | `juicity-client` crate (this workspace) | SOCKS5 + HTTP on `socks_listen` |
+| Shadowsocks | `shadowsocks-service` (shadowsocks-rust) | SOCKS5 on `socks_listen`, HTTP on `http_listen` |
+
+Supported Shadowsocks ciphers follow shadowsocks-rust: AEAD-2022, AEAD and the
+deprecated stream ciphers. SIP003 plugins (`plugin`, `plugin_opts`,
+`plugin_args`) are passed through to the library unchanged.
+
+Legacy profiles that still point at a full `juicity-client` / `sslocal` JSON
+config file via `config_path` are loaded from that file; otherwise the
+configuration is generated from the individual profile fields.
 
 ## Config directory
 

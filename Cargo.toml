@@ -47,6 +47,14 @@ url = "2"
 zeroize = "1"
 tikv-jemallocator = "0.7"
 mimalloc = "0.1"
+# Official shadowsocks-rust implementation, embedded by the GUI.
+shadowsocks-service = { version = "1.25", default-features = false, features = [
+    "local",
+    "local-http-rustls",
+    "aead-cipher",
+    "aead-cipher-2022",
+    "stream-cipher",
+] }
 
 [profile.release]
 opt-level = 3

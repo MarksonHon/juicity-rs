@@ -1255,11 +1255,11 @@ impl AppView {
             }
         }
 
-        // Poll the core process status.
+        // Poll the embedded core status.
         match self.gui.core_manager.poll() {
-            Ok(Some(exit)) => {
+            Ok(Some(reason)) => {
                 self.announced_running = false;
-                self.set_status(&t!("status.core_exited", code = exit.to_string()), cx);
+                self.set_status(&t!("status.core_exited", reason = reason), cx);
                 if let Ok(mut ts) = self.tray_shared.lock() {
                     ts.is_running = false;
                     ts.active_server_name = String::new();

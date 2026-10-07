@@ -31,7 +31,7 @@ gui/                  # 可选的图形界面前端（桌面托盘应用）
 | Crate | 主要类型 |
 |-------|----------|
 | [`juicity-common`](common/src/lib.rs) | `Config`、`protocol`（线格式）、`crypto`（AES-GCM、ChaCha20-Poly1305、证书链哈希）、`consts`、`link` |
-| [`juicity-client`](client/src/main.rs) | `JuicityClient`（QUIC+认证）、`LocalServer`（SOCKS5/HTTP）、`Forwarder`（TCP/UDP） |
+| [`juicity-client`](client/src/lib.rs) | `JuicityClient`（QUIC+认证）、`LocalServer`（SOCKS5/HTTP）、`Forwarder`（TCP/UDP） |
 | [`juicity-server`](server/src/lib.rs) | `JuicityServer`（监听+中转）、`Dialer`、`InFlightUnderlayKey`、`UdpEndpointPool`、`DemuxUdpSocket` |
 
 Docker 服务端镜像、Compose 示例与发布流程：[Docker 使用说明](docker/README.md)。

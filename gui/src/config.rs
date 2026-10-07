@@ -194,8 +194,6 @@ impl Default for ProxyProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    pub juicity_client_path: Option<PathBuf>,
-    pub ss_local_path: Option<PathBuf>,
     pub socks_listen: String,
     pub http_listen: String,
     pub system_proxy_mode: SystemProxyMode,
@@ -215,8 +213,9 @@ pub struct AppConfig {
 impl AppConfig {
     /// Address of the local HTTP proxy for the given core.
     ///
-    /// juicity-client serves SOCKS5 and HTTP on the same port, so it reuses
-    /// `socks_listen`; the Shadowsocks core gets a dedicated HTTP listener.
+    /// The embedded juicity core serves SOCKS5 and HTTP on the same port, so
+    /// it reuses `socks_listen`; the Shadowsocks core gets a dedicated HTTP
+    /// listener.
     pub fn http_proxy_addr(&self, protocol: ProxyProtocol) -> &str {
         match protocol {
             ProxyProtocol::Juicity => &self.socks_listen,
@@ -228,8 +227,6 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            juicity_client_path: None,
-            ss_local_path: None,
             socks_listen: "127.0.0.1:1080".to_string(),
             http_listen: "127.0.0.1:1081".to_string(),
             system_proxy_mode: SystemProxyMode::Disable,

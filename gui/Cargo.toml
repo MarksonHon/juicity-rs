@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+juicity-common = { path = "../common" }
+# Embedded proxy core (QUIC client + local SOCKS5/HTTP server).
+juicity-client = { path = "../client" }
+# Official shadowsocks-rust library, used for the Shadowsocks protocol.
+shadowsocks-service = { workspace = true }
+
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

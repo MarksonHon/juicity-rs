@@ -59,16 +59,10 @@ echo "    Version:      ${VERSION} (build ${BUILD_NUMBER})"
 
 # Verify binaries exist
 BINARY="${TARGET_DIR}/juicity-gui"
-CLIENT="${TARGET_DIR}/juicity-client"
 if [[ ! -f "${BINARY}" ]]; then
   echo "ERROR: juicity-gui binary not found at ${BINARY}"
   echo "Run 'cargo build --release -p juicity-gui' first."
   exit 1
-fi
-if [[ ! -f "${CLIENT}" ]]; then
-  echo "WARNING: juicity-client binary not found at ${CLIENT}"
-  echo "Run 'cargo build --release -p juicity-client' first."
-  CLIENT=""
 fi
 
 # ── Create .app bundle structure ─────────────────────────────────────────
@@ -95,24 +89,6 @@ echo "==> Generated Info.plist"
 # ── Copy binaries ────────────────────────────────────────────────────────
 cp "${BINARY}" "${MACOS_DIR}/juicity-gui"
 chmod +x "${MACOS_DIR}/juicity-gui"
-
-if [[ -n "${CLIENT}" ]]; then
-  cp "${CLIENT}" "${MACOS_DIR}/juicity-client"
-  chmod +x "${MACOS_DIR}/juicity-client"
-fi
-
-# Copy shadowsocks-rust binaries (sslocal, ssurl) if available
-SS_DIR="${SS_DIR:-}"
-if [[ -n "${SS_DIR}" && -d "${SS_DIR}" ]]; then
-  if [[ -f "${SS_DIR}/sslocal" ]]; then
-    cp "${SS_DIR}/sslocal" "${MACOS_DIR}/"
-    chmod +x "${MACOS_DIR}/sslocal"
-  fi
-  if [[ -f "${SS_DIR}/ssurl" ]]; then
-    cp "${SS_DIR}/ssurl" "${MACOS_DIR}/"
-    chmod +x "${MACOS_DIR}/ssurl"
-  fi
-fi
 
 echo "==> Copied binaries to MacOS/"
 
@@ -174,17 +150,8 @@ echo "==> Bundling dylib dependencies..."
 COPIED_FILE="$(mktemp "${FRAMEWORKS_DIR}/.copied.XXXXXX")"
 trap 'rm -f "${COPIED_FILE}"' EXIT
 
-# We need to process multiple binaries
+# We need to process the main binary
 BINS_TO_PROCESS=("${MACOS_DIR}/juicity-gui")
-if [[ -n "${CLIENT}" ]]; then
-  BINS_TO_PROCESS+=("${MACOS_DIR}/juicity-client")
-fi
-if [[ -f "${MACOS_DIR}/sslocal" ]]; then
-  BINS_TO_PROCESS+=("${MACOS_DIR}/sslocal")
-fi
-if [[ -f "${MACOS_DIR}/ssurl" ]]; then
-  BINS_TO_PROCESS+=("${MACOS_DIR}/ssurl")
-fi
 
 # Process binaries and their dependencies
 QUEUE=("${BINS_TO_PROCESS[@]}")
@@ -256,9 +223,6 @@ fix_rpath() {
 
 # Fix all binaries and dylibs in the bundle
 fix_rpath "${MACOS_DIR}/juicity-gui"
-[[ -f "${MACOS_DIR}/juicity-client" ]] && fix_rpath "${MACOS_DIR}/juicity-client"
-[[ -f "${MACOS_DIR}/sslocal" ]] && fix_rpath "${MACOS_DIR}/sslocal"
-[[ -f "${MACOS_DIR}/ssurl" ]] && fix_rpath "${MACOS_DIR}/ssurl"
 
 for dylib in "${FRAMEWORKS_DIR}"/*.dylib; do
   [[ -f "${dylib}" ]] && fix_rpath "${dylib}"
@@ -278,17 +242,12 @@ if command -v codesign &>/dev/null; then
     --entitlements "${GUI_DIR}/macos/Entitlements.plist" \
     "${MACOS_DIR}/juicity-gui" 2>/dev/null || \
     codesign --force --sign - "${MACOS_DIR}/juicity-gui" 2>/dev/null || true
-  [[ -f "${MACOS_DIR}/juicity-client" ]] && \
-    codesign --force --sign - "${MACOS_DIR}/juicity-client" 2>/dev/null || true
   # Sign entire bundle
   codesign --force --deep --sign - "${APP_BUNDLE}" 2>/dev/null || true
   echo "  Ad-hoc code signature applied"
 else
   echo "  WARNING: codesign not found, skipping"
 fi
-
-# ── Copy config file ─────────────────────────────────────────────────────
-cp "${REPO_ROOT}/client/examples/config.json" "${RESOURCES_DIR}/client-config.json" 2>/dev/null || true
 
 # ── Output ───────────────────────────────────────────────────────────────
 echo ""
@@ -297,7 +256,6 @@ echo "  Bundle created: ${APP_BUNDLE}"
 echo "  Contents:"
 echo "    Info.plist"
 echo "    MacOS/juicity-gui"
-echo "    MacOS/juicity-client"
 echo "    Frameworks/ ($(ls "${FRAMEWORKS_DIR}" 2>/dev/null | wc -l) dylibs)"
 echo "    Resources/ (icons)"
 echo "  Size: $(du -sh "${APP_BUNDLE}" | cut -f1)"
