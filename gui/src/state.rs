@@ -11,6 +11,7 @@ use crate::config::{
 use crate::core::CoreManager;
 use crate::pac;
 use crate::tray::TrayService;
+use std::path::Path;
 use std::sync::mpsc::Receiver;
 
 pub struct GuiState {
@@ -27,9 +28,10 @@ pub struct GuiState {
 impl GuiState {
     pub fn new() -> anyhow::Result<Self> {
         let storage = Storage::new()?;
-        let config = storage.load_app_config()?;
-        let mut profiles = storage.load_profiles()?;
-        let mut runtime = storage.load_runtime_state()?;
+        let paths = storage.paths().clone();
+        let config = load_or_recover(&paths.app_json, || storage.load_app_config());
+        let mut profiles = load_or_recover(&paths.profiles_json, || storage.load_profiles());
+        let mut runtime = load_or_recover(&paths.runtime_json, || storage.load_runtime_state());
 
         if profiles.profiles.is_empty() {
             profiles.profiles.push(ProxyProfile::default());
@@ -75,6 +77,24 @@ impl GuiState {
     }
 }
 
+/// Load a config file; if it is unreadable or corrupt, move it aside as
+/// `<name>.json.bad` and fall back to defaults instead of failing to start.
+fn load_or_recover<T: Default>(path: &Path, load: impl FnOnce() -> anyhow::Result<T>) -> T {
+    match load() {
+        Ok(value) => value,
+        Err(err) => {
+            let backup = path.with_extension("json.bad");
+            tracing::warn!(
+                "{} is invalid ({err:#}); moving it to {} and using defaults",
+                path.display(),
+                backup.display()
+            );
+            let _ = std::fs::rename(path, &backup);
+            T::default()
+        }
+    }
+}
+
 /// Restart or update the PAC server with fresh rules from disk.
 ///
 /// If `force_restart` is `true` (e.g. the listen address changed), a new
@@ -109,5 +129,27 @@ pub fn non_empty_text(input: &str) -> Option<String> {
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corrupt_file_is_moved_aside_and_defaults_used() {
+        let dir = std::env::temp_dir().join(format!("juicity-gui-state-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profiles.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let store: crate::config::ProfileStore = load_or_recover(&path, || {
+            anyhow::bail!("invalid json")
+        });
+
+        assert!(store.profiles.is_empty());
+        assert!(!path.exists());
+        assert!(dir.join("profiles.json.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

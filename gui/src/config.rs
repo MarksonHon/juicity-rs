@@ -212,6 +212,19 @@ pub struct AppConfig {
     pub pac_auto_update_hours: u32,
 }
 
+impl AppConfig {
+    /// Address of the local HTTP proxy for the given core.
+    ///
+    /// juicity-client serves SOCKS5 and HTTP on the same port, so it reuses
+    /// `socks_listen`; the Shadowsocks core gets a dedicated HTTP listener.
+    pub fn http_proxy_addr(&self, protocol: ProxyProtocol) -> &str {
+        match protocol {
+            ProxyProtocol::Juicity => &self.socks_listen,
+            ProxyProtocol::Shadowsocks => &self.http_listen,
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -410,5 +423,17 @@ impl Storage {
         })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_proxy_addr_follows_protocol() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.http_proxy_addr(ProxyProtocol::Juicity), cfg.socks_listen);
+        assert_eq!(cfg.http_proxy_addr(ProxyProtocol::Shadowsocks), cfg.http_listen);
     }
 }

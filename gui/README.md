@@ -14,7 +14,9 @@ A [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) based desk
 - System tray support:
   - Linux: StatusNotifierItem via `ksni` (background thread)
   - Windows/macOS: native tray via `tray-icon` (polled on the main loop)
-- System proxy apply action (Linux GNOME/KDE implemented, macOS/Windows scaffolded)
+- System proxy (Disable / PAC / Global): Linux GNOME/KDE, macOS `networksetup`, Windows registry. The proxy is restored to "Disable" when the app quits.
+- Corrupt config files are moved aside as `*.json.bad` and defaults are used instead of failing to start
+- Closing the main window keeps the app running in the tray (on by default; a hidden background window keeps GPUI's event loop alive), as long as a tray icon is actually available
 - Start/stop and process status polling (300 ms)
 - PAC settings dialog and Startup settings dialog
 

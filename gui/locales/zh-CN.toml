@@ -57,6 +57,9 @@ pac_download_failed = "状态: PAC 下载失败: %{err}"
 pac_updated = "状态: PAC 规则已更新"
 core_exited = "状态: 进程已退出 (%{code})"
 poll_error = "状态: 轮询错误: %{err}"
+invalid_fields = "状态: 以下字段的值无效: %{fields}"
+incomplete_profile = "状态: 服务器信息不完整,缺少: %{fields}"
+system_proxy_failed = "状态: 设置系统代理失败: %{err}"
 
 [tray]
 title = "Juicity GUI"

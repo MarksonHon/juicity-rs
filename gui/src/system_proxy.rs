@@ -1,8 +1,20 @@
-use crate::config::{AppConfig, PacMode, SystemProxyMode};
+use crate::config::{AppConfig, PacMode, ProxyProtocol, SystemProxyMode};
 use anyhow::bail;
 use std::process::Command;
 
-pub fn apply_system_proxy(config: &AppConfig) -> anyhow::Result<()> {
+/// Command that never flashes a console window on Windows.
+fn command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
+pub fn apply_system_proxy(config: &AppConfig, protocol: ProxyProtocol) -> anyhow::Result<()> {
+    let http_listen = config.http_proxy_addr(protocol);
     let pac_url = match config.pac_mode {
         PacMode::Online => config
             .online_pac_url
@@ -16,7 +28,7 @@ pub fn apply_system_proxy(config: &AppConfig) -> anyhow::Result<()> {
         return apply_linux(
             config.system_proxy_mode,
             &pac_url,
-            &config.http_listen,
+            http_listen,
             &config.socks_listen,
         );
     }
@@ -26,7 +38,7 @@ pub fn apply_system_proxy(config: &AppConfig) -> anyhow::Result<()> {
         return apply_macos(
             config.system_proxy_mode,
             &pac_url,
-            &config.http_listen,
+            http_listen,
             &config.socks_listen,
         );
     }
@@ -36,7 +48,7 @@ pub fn apply_system_proxy(config: &AppConfig) -> anyhow::Result<()> {
         return apply_windows(
             config.system_proxy_mode,
             &pac_url,
-            &config.http_listen,
+            http_listen,
             &config.socks_listen,
         );
     }
@@ -435,7 +447,7 @@ fn apply_windows(
             // was previously set to Global mode and AutoConfigURL was never written).
             // Ignore the exit code — the desired end-state (no AutoConfigURL) is the
             // same regardless of whether the value was present beforehand.
-            let _ = Command::new("reg")
+            let _ = command("reg")
                 .args(&[
                     "delete",
                     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
@@ -514,7 +526,7 @@ fn apply_windows(
 fn run_required(program: &str, args: &[&str]) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
-    let status = Command::new(program)
+    let status = command(program)
         .args(args)
         .status()
         .with_context(|| format!("failed to run {} {:?}", program, args))?;
@@ -527,7 +539,7 @@ fn run_required(program: &str, args: &[&str]) -> anyhow::Result<()> {
 }
 
 fn run_if_available(program: &str, args: &[&str]) -> anyhow::Result<bool> {
-    let mut cmd = Command::new(program);
+    let mut cmd = command(program);
     cmd.args(args);
 
     let status = match cmd.status() {
