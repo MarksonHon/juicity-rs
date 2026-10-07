@@ -11,7 +11,9 @@ A [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) based desk
   - Juicity profile -> embedded `juicity-client` QUIC client + local
     SOCKS5/HTTP server (linked as a library)
   - Shadowsocks profile -> embedded `shadowsocks-service` (official
-    shadowsocks-rust library) SOCKS5 + HTTP local servers
+    shadowsocks-rust library) mixed SOCKS5/HTTP local inbound
+- Single mixed inbound port per protocol (SOCKS5 and HTTP proxy on the same
+  address); the system proxy and PAC both point at it
 - Profile/protocol selectors and a server editor with per-field validation
 - URL import/export entry for `juicity://` and `ss://` with parser validation
 - System tray support:
@@ -28,10 +30,15 @@ A [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) based desk
 The GUI does not shell out to `juicity-client` or `sslocal`. Instead it links
 them directly:
 
-| Protocol | Implementation | Local listeners |
+| Protocol | Implementation | Local listener |
 | --- | --- | --- |
-| Juicity | `juicity-client` crate (this workspace) | SOCKS5 + HTTP on `socks_listen` |
-| Shadowsocks | `shadowsocks-service` (shadowsocks-rust) | SOCKS5 on `socks_listen`, HTTP on `http_listen` |
+| Juicity | `juicity-client` crate (this workspace) | mixed SOCKS5 + HTTP on `mixed_listen` |
+| Shadowsocks | `shadowsocks-service` (shadowsocks-rust) | mixed SOCKS5 + HTTP on `mixed_listen` |
+
+Both protocols expose a single **mixed inbound**: one port that accepts SOCKS5
+and HTTP proxy traffic, dispatched per connection by inspecting the first byte.
+The system proxy settings and the PAC file both point at that single address, so
+there is no separate HTTP port to configure.
 
 Supported Shadowsocks ciphers follow shadowsocks-rust: AEAD-2022, AEAD and the
 deprecated stream ciphers. SIP003 plugins (`plugin`, `plugin_opts`,

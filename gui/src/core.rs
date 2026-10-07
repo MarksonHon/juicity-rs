@@ -307,7 +307,7 @@ fn build_juicity_config(
         password: profile.password.clone(),
         sni,
         allow_insecure: profile.allow_insecure,
-        listen: config.socks_listen.clone(),
+        listen: config.mixed_listen.clone(),
         log_level: "info".to_string(),
         ..Default::default()
     };
@@ -332,9 +332,12 @@ fn build_shadowsocks_config(
         }
     }
 
-    let (socks_addr, socks_port) = crate::util::split_host_port(&config.socks_listen);
-    let (http_addr, http_port) = crate::util::split_host_port(&config.http_listen);
+    let (addr, port) = crate::util::split_host_port(&config.mixed_listen);
 
+    // A shadowsocks-rust "socks" local also answers HTTP proxy requests on the
+    // same listener when built with `local-http`, which is exactly the mixed
+    // inbound the GUI exposes.  A separate `"protocol": "http"` local would
+    // need its own port.
     let mut json = serde_json::json!({
         "server": profile.server,
         "server_port": profile.server_port,
@@ -342,14 +345,9 @@ fn build_shadowsocks_config(
         "method": profile.method,
         "locals": [
             {
-                "local_address": socks_addr,
-                "local_port": socks_port,
+                "local_address": addr,
+                "local_port": port,
                 "protocol": "socks"
-            },
-            {
-                "local_address": http_addr,
-                "local_port": http_port,
-                "protocol": "http"
             }
         ],
         "timeout": profile.timeout
@@ -388,20 +386,19 @@ mod tests {
     }
 
     #[test]
-    fn shadowsocks_config_exposes_socks_and_http_locals() {
+    fn shadowsocks_config_exposes_a_single_mixed_local() {
         let config = build_shadowsocks_config(&AppConfig::default(), &ss_profile()).unwrap();
 
         assert_eq!(config.server.len(), 1);
-        assert_eq!(config.local.len(), 2);
+        assert_eq!(
+            config.local.len(),
+            1,
+            "one mixed inbound, not one per protocol"
+        );
         assert_eq!(config.local[0].config.protocol, ProtocolType::Socks);
-        assert_eq!(config.local[1].config.protocol, ProtocolType::Http);
         assert_eq!(
             config.local[0].config.addr,
             Some("127.0.0.1:1080".parse().unwrap())
-        );
-        assert_eq!(
-            config.local[1].config.addr,
-            Some("127.0.0.1:1081".parse().unwrap())
         );
     }
 
@@ -482,14 +479,18 @@ mod tests {
         assert!(config.allow_insecure);
     }
 
-    /// Exercises the real shadowsocks-service backend: start, restart on the
-    /// same ports (the previous listeners are released asynchronously) and stop.
+    /// Exercises the real shadowsocks-service backend: the mixed inbound
+    /// answers SOCKS5 and HTTP on one port, restarting reuses that port (the
+    /// previous listener is released asynchronously) and stopping frees it.
     #[test]
-    fn shadowsocks_core_starts_restarts_and_stops() {
+    fn shadowsocks_mixed_inbound_serves_socks5_and_http() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
         let app_config = AppConfig {
-            // Use uncommon ports so the test does not clash with a running proxy.
-            socks_listen: "127.0.0.1:38471".to_string(),
-            http_listen: "127.0.0.1:38472".to_string(),
+            // Use an uncommon port so the test does not clash with a running proxy.
+            mixed_listen: "127.0.0.1:38471".to_string(),
             ..Default::default()
         };
         let profile = ss_profile();
@@ -500,10 +501,38 @@ mod tests {
         assert_eq!(manager.current_protocol(), Some(ProxyProtocol::Shadowsocks));
         assert_eq!(manager.current_name(), Some("ss.example.com:8388"));
 
-        // TCP listeners must actually be bound.
-        assert!(std::net::TcpStream::connect("127.0.0.1:38471").is_ok());
-        assert!(std::net::TcpStream::connect("127.0.0.1:38472").is_ok());
+        // SOCKS5 greeting -> "no authentication required".
+        let mut socks = TcpStream::connect("127.0.0.1:38471").unwrap();
+        socks
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socks.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        let mut greeting = [0u8; 2];
+        socks.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [0x05, 0x00]);
 
+        // A proxy request without a target host is rejected by the HTTP handler
+        // with an error response on the very same port.
+        let mut http = TcpStream::connect("127.0.0.1:38471").unwrap();
+        http.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        http.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 64];
+        while response.len() < 16 {
+            let n = http.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..n]);
+        }
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1."),
+            "expected an HTTP response on the mixed port, got {response:?}"
+        );
+
+        // Restarting must succeed even though the previous listener was just
+        // released asynchronously.
         manager.start_profile(&app_config, &profile).unwrap();
         assert!(manager.is_running());
 
