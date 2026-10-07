@@ -34,9 +34,34 @@ pub struct TrayService {
     /// Linux: keeps background ksni thread alive.
     #[cfg(target_os = "linux")]
     _join: Option<std::thread::JoinHandle<()>>,
+    /// Linux: set once the tray icon has been registered with the host.
+    #[cfg(target_os = "linux")]
+    registered: Arc<std::sync::atomic::AtomicBool>,
     /// Windows/macOS: polled on the app's main loop by [`poll`].
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     native: Option<NativeTray>,
+}
+
+impl TrayService {
+    /// Whether a tray icon is actually present. When it is not (no
+    /// StatusNotifierHost, creation failure, unsupported platform) a window
+    /// hidden to the tray could never be reopened.
+    pub fn is_available(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.registered.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            self.native
+                .as_ref()
+                .is_some_and(|n| n.tray.borrow().is_some())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        {
+            false
+        }
+    }
 }
 
 /// Drive the tray from the application's own main loop.
@@ -65,6 +90,8 @@ pub fn poll(
 pub fn start(event_tx: Sender<TrayEvent>, shared: Arc<Mutex<TraySharedState>>) -> TrayService {
     #[cfg(target_os = "linux")]
     {
+        let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registered_thread = Arc::clone(&registered);
         let join = std::thread::spawn(move || {
             use ksni::TrayMethods;
 
@@ -82,12 +109,18 @@ pub fn start(event_tx: Sender<TrayEvent>, shared: Arc<Mutex<TraySharedState>>) -
             rt.block_on(async move {
                 let tray = LinuxTray { event_tx, shared };
                 match tray.spawn().await {
-                    Ok(_handle) => std::future::pending::<()>().await,
+                    Ok(_handle) => {
+                        registered_thread.store(true, std::sync::atomic::Ordering::Relaxed);
+                        std::future::pending::<()>().await
+                    }
                     Err(err) => tracing::warn!("tray spawn failed: {err}"),
                 }
             });
         });
-        TrayService { _join: Some(join) }
+        TrayService {
+            _join: Some(join),
+            registered,
+        }
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]

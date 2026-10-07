@@ -57,6 +57,9 @@ pac_download_failed = "Status: PAC download failed: %{err}"
 pac_updated = "Status: PAC rules updated"
 core_exited = "Status: Core exited (%{code})"
 poll_error = "Status: Poll error: %{err}"
+invalid_fields = "Status: Invalid value: %{fields}"
+incomplete_profile = "Status: Server is incomplete, missing: %{fields}"
+system_proxy_failed = "Status: System proxy failed: %{err}"
 
 [tray]
 title = "Juicity GUI"

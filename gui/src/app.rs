@@ -1,5 +1,6 @@
 use crate::config::{
-    method_to_index, ProxyProfile, ProxyProtocol, RuntimeState, StartupConnectionState, SS_METHODS,
+    method_to_index, ProxyProfile, ProxyProtocol, RuntimeState, StartupConnectionState,
+    SystemProxyMode, SS_METHODS,
 };
 use crate::link;
 use crate::pac;
@@ -9,9 +10,9 @@ use crate::tray::{TrayEvent, TraySharedState};
 use crate::widgets;
 use gpui::prelude::*;
 use gpui::{
-    actions, div, px, rgb, size, App, Bounds, ClickEvent, Context, ElementId, Entity, FontWeight,
-    Global, KeyBinding, SharedString, Timer, WeakEntity, Window, WindowBounds, WindowHandle,
-    WindowOptions,
+    actions, div, point, px, rgb, size, App, Bounds, ClickEvent, Context, ElementId, Entity, FontWeight,
+    Global, KeyBinding, SharedString, Timer, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowHandle, WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
@@ -39,6 +40,43 @@ struct AppRoot {
 }
 
 impl Global for AppRoot {}
+
+/// Invisible window that is never closed.
+///
+/// gpui ends the event loop as soon as the last window is closed (Windows
+/// posts `WM_QUIT`, X11/Wayland stop the loop), which would make "close to
+/// tray" quit the whole app. Keeping this window alive lets the main window
+/// and the dialogs be closed and reopened freely.
+struct AnchorView;
+
+impl Render for AnchorView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+fn open_anchor_window(cx: &mut App) {
+    let options = WindowOptions {
+        // `show: false` is honored on Windows/macOS; elsewhere the window is
+        // simply a 1x1 transparent undecorated surface parked off-screen.
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(-32000.), px(-32000.)),
+            size(px(1.), px(1.)),
+        ))),
+        titlebar: None,
+        focus: false,
+        show: false,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        window_background: WindowBackgroundAppearance::Transparent,
+        app_id: Some("io.juicity.gui".to_string()),
+        ..Default::default()
+    };
+    if let Err(err) = cx.open_window(options, |_window, cx| cx.new(|_| AnchorView)) {
+        tracing::warn!("failed to open the background anchor window: {err}");
+    }
+}
 
 /// Open (or focus) the main window bound to the persistent `AppView` entity.
 fn open_main_window(cx: &mut App) {
@@ -79,7 +117,7 @@ fn open_main_window(cx: &mut App) {
                         .clone();
                     let close_to_tray = view_entity
                         .as_ref()
-                        .map(|v| v.read(cx).gui.runtime.close_to_tray)
+                        .map(|v| v.read(cx).can_hide_to_tray())
                         .unwrap_or(false);
                     {
                         let g = cx.default_global::<AppRoot>();
@@ -87,6 +125,7 @@ fn open_main_window(cx: &mut App) {
                         g.main_window = None;
                         let suppress = g.suppress_quit;
                         g.suppress_quit = false;
+                        tracing::debug!(suppress, close_to_tray, "main window close requested");
                         if !suppress && !close_to_tray {
                             cx.quit();
                         }
@@ -145,7 +184,9 @@ pub struct AppView {
     protocol_changed: bool,
 
     status: String,
-
+    /// Whether the "running" status has already been shown for the current
+    /// core run (see `poll`).
+    announced_running: bool,
     // ── Config hot-reload ───────────────────────────────────────────────
     #[allow(dead_code)]
     config_watcher: Option<notify::RecommendedWatcher>,
@@ -206,6 +247,7 @@ impl AppView {
         let method_options: Vec<SharedString> =
             SS_METHODS.iter().map(|s| SharedString::from(*s)).collect();
 
+        let close_to_tray = gui.runtime.close_to_tray;
         let mut view = Self {
             gui,
             tray_tx,
@@ -232,11 +274,12 @@ impl AppView {
             show_password: false,
             allow_insecure: false,
             need_plugin_arg: false,
-            close_to_tray: false,
+            close_to_tray,
             inputs_inited: false,
             pending_reload: false,
             protocol_changed: false,
             status: t!("status.stopped").to_string(),
+            announced_running: false,
             config_watcher: None,
             config_reload_rx: None,
             last_flush_at: std::time::Instant::now(),
@@ -244,6 +287,13 @@ impl AppView {
 
         // ── Config hot-reload watcher ──
         view.spawn_config_watcher(view.gui.storage.paths().config_dir.clone());
+
+        // Stop the core and restore the system proxy however the app quits.
+        cx.on_app_quit(|view, _cx| {
+            view.shutdown();
+            async {}
+        })
+        .detach();
 
         // ── Periodic poll loop: tray events + PAC + core status ────────────
         cx.spawn(async move |this, cx| {
@@ -318,47 +368,47 @@ impl AppView {
             )
         });
 
-        let owner = cx.weak_entity();
-        let _ = cx.subscribe(&protocol_select, {
-            let owner = owner.clone();
-            move |_view, _state, event, cx| {
-                if let SelectEvent::Confirm(Some(value)) = event {
-                    let _ = owner.update(cx, |view, vcx| {
-                        let new_protocol = view
-                            .protocol_options
-                            .iter()
-                            .position(|o| o == value)
-                            .unwrap_or(0);
-                        // Pass the new protocol index so save_fields writes the
-                        // correct value even though SelectState may not have
-                        // updated yet at Confirm-event time.
-                        view.save_fields_with_protocol(vcx, Some(new_protocol));
-                        let _ = view.gui.flush();
-                        view.protocol = new_protocol;
-                        view.protocol_changed = true;
-                        vcx.notify();
-                    });
+        // The subscription callback already holds the `AppView` lease, so it
+        // must use `view` directly; updating the same entity through a weak
+        // handle here would be a double lease and the change would be lost.
+        cx.subscribe(&protocol_select, |view, _state, event, cx| {
+            if let SelectEvent::Confirm(Some(value)) = event {
+                let new_protocol = view
+                    .protocol_options
+                    .iter()
+                    .position(|o| o == value)
+                    .unwrap_or(0);
+                // Pass the new protocol index so save_fields writes the
+                // correct value even though SelectState may not have
+                // updated yet at Confirm-event time.
+                if view.save_fields_with_protocol(cx, Some(new_protocol)) {
+                    let _ = view.gui.flush();
+                    view.protocol_changed = true;
+                } else if let Some(p) = view.gui.selected_profile_mut() {
+                    // Invalid fields: keep what the user typed and only
+                    // switch the protocol.
+                    p.protocol = ProxyProtocol::from_index(new_protocol as u32);
                 }
+                view.protocol = new_protocol;
+                cx.notify();
             }
-        });
-        let _ = cx.subscribe(&method_select, {
-            let owner = owner.clone();
-            move |_view, _state, event, cx| {
-                if let SelectEvent::Confirm(Some(value)) = event {
-                    let _ = owner.update(cx, |view, vcx| {
-                        view.method = view
-                            .method_options
-                            .iter()
-                            .position(|o| o == value)
-                            .unwrap_or(0);
-                        // Persist the method change immediately.
-                        view.save_fields(vcx);
-                        let _ = view.gui.flush();
-                        vcx.notify();
-                    });
+        })
+        .detach();
+        cx.subscribe(&method_select, |view, _state, event, cx| {
+            if let SelectEvent::Confirm(Some(value)) = event {
+                view.method = view
+                    .method_options
+                    .iter()
+                    .position(|o| o == value)
+                    .unwrap_or(0);
+                // Persist the method change immediately.
+                if view.save_fields(cx) {
+                    let _ = view.gui.flush();
                 }
+                cx.notify();
             }
-        });
+        })
+        .detach();
 
         self.server = Some(server);
         self.port = Some(port);
@@ -449,7 +499,19 @@ impl AppView {
     /// the correct value to the profile even though the `SelectState` widget
     /// may not have updated its internal state yet at the time of the
     /// `Confirm` event.
-    fn save_fields_with_protocol(&mut self, cx: &mut Context<Self>, protocol_override: Option<usize>) {
+    ///
+    /// Returns `false` (leaving the profile untouched) when a numeric field is
+    /// invalid; the status bar then names the offending fields.
+    fn save_fields_with_protocol(
+        &mut self,
+        cx: &mut Context<Self>,
+        protocol_override: Option<usize>,
+    ) -> bool {
+        // The inputs are built lazily on first render; saving before that would
+        // overwrite the profile with empty values.
+        if !self.inputs_inited {
+            return true;
+        }
         let server = self
             .server
             .as_ref()
@@ -523,27 +585,28 @@ impl AppView {
             .and_then(|sel| sel.read(cx).selected_index(cx).map(|ip| ip.row))
             .unwrap_or(self.method);
 
-        let mut invalid: Vec<&str> = Vec::new();
-        let server_port = match port.trim().parse::<u16>() {
-            Ok(v) => v,
-            Err(_) => {
-                invalid.push("server port");
-                443
+        let parse_port = |text: &str| text.trim().parse::<u16>().ok().filter(|p| *p > 0);
+        let server_port = parse_port(&port);
+        let timeout_v = timeout.trim().parse::<u32>().ok();
+        let proxy_port_v = parse_port(&proxy_port);
+        let (Some(server_port), Some(timeout_v), Some(proxy_port_v)) =
+            (server_port, timeout_v, proxy_port_v)
+        else {
+            let mut invalid: Vec<String> = Vec::new();
+            if server_port.is_none() {
+                invalid.push(t!("field.server_port").to_string());
             }
-        };
-        let timeout_v = match timeout.trim().parse::<u32>() {
-            Ok(v) => v,
-            Err(_) => {
-                invalid.push("timeout");
-                5
+            if timeout_v.is_none() {
+                invalid.push(t!("field.timeout").to_string());
             }
-        };
-        let proxy_port_v = match proxy_port.trim().parse::<u16>() {
-            Ok(v) => v,
-            Err(_) => {
-                invalid.push("proxy port");
-                1080
+            if proxy_port_v.is_none() {
+                invalid.push(t!("field.proxy_port").to_string());
             }
+            self.set_status(
+                &t!("status.invalid_fields", fields = invalid.join(", ")),
+                cx,
+            );
+            return false;
         };
         let plugin_args_v = if self.need_plugin_arg {
             non_empty_text(&plugin_args)
@@ -551,6 +614,7 @@ impl AppView {
             None
         };
 
+        let listen_changed;
         {
             let g = &mut self.gui;
             g.normalize_selected_index();
@@ -580,23 +644,43 @@ impl AppView {
                 p.group = non_empty_text(&group);
             }
             let (addr, _) = crate::util::split_host_port(&g.config.socks_listen);
-            g.config.socks_listen = crate::util::format_host_port(addr, proxy_port_v);
+            let new_listen = crate::util::format_host_port(addr, proxy_port_v);
+            listen_changed = new_listen != g.config.socks_listen;
+            g.config.socks_listen = new_listen;
             g.runtime.close_to_tray = self.close_to_tray;
         }
+        if listen_changed {
+            self.apply_listen_change(cx);
+        }
+        true
+    }
 
-        if !invalid.is_empty() {
-            self.set_status(&format!("Status: invalid {}", invalid.join(", ")), cx);
+    /// The local SOCKS/HTTP port changed: regenerate the PAC, re-point the
+    /// system proxy and restart the core so everything uses the new port.
+    fn apply_listen_change(&mut self, cx: &mut Context<Self>) {
+        let _ = self.flush_and_record();
+        let _ = restart_pac_server(&mut self.gui, false);
+        if self.gui.config.system_proxy_mode != SystemProxyMode::Disable {
+            if let Err(err) = self.apply_system_proxy_now() {
+                self.set_status(&t!("status.system_proxy_failed", err = err.to_string()), cx);
+            }
+        }
+        if self.gui.core_manager.is_running() {
+            self.start_core(cx);
         }
     }
 
     /// Convenience wrapper — saves fields without a protocol override.
-    fn save_fields(&mut self, cx: &mut Context<Self>) {
-        self.save_fields_with_protocol(cx, None);
+    fn save_fields(&mut self, cx: &mut Context<Self>) -> bool {
+        self.save_fields_with_protocol(cx, None)
     }
 
     // ── Button handlers ───────────────────────────────────────────────────
 
     fn add_clicked(&mut self, cx: &mut Context<Self>) {
+        if !self.save_fields(cx) {
+            return;
+        }
         let n = self.gui.profiles.profiles.len() + 1;
         let p = ProxyProfile {
             name: t!("misc.new_server", n = n).to_string(),
@@ -621,6 +705,9 @@ impl AppView {
     }
 
     fn duplicate_clicked(&mut self, cx: &mut Context<Self>) {
+        if !self.save_fields(cx) {
+            return;
+        }
         let idx = self.gui.runtime.selected_profile;
         if let Some(p) = self.gui.profiles.profiles.get(idx).cloned() {
             self.gui.profiles.profiles.insert(idx + 1, p);
@@ -632,6 +719,9 @@ impl AppView {
     }
 
     fn move_up_clicked(&mut self, cx: &mut Context<Self>) {
+        if !self.save_fields(cx) {
+            return;
+        }
         let idx = self.gui.runtime.selected_profile;
         if idx > 0 {
             self.gui.profiles.profiles.swap(idx, idx - 1);
@@ -643,6 +733,9 @@ impl AppView {
     }
 
     fn move_down_clicked(&mut self, cx: &mut Context<Self>) {
+        if !self.save_fields(cx) {
+            return;
+        }
         let idx = self.gui.runtime.selected_profile;
         if idx + 1 < self.gui.profiles.profiles.len() {
             self.gui.profiles.profiles.swap(idx, idx + 1);
@@ -651,6 +744,19 @@ impl AppView {
             self.pending_reload = true;
             cx.notify();
         }
+    }
+
+    /// Whether closing the main window may keep the app alive in the tray.
+    /// Without a working tray icon the window could never be reopened.
+    fn can_hide_to_tray(&self) -> bool {
+        self.gui.runtime.close_to_tray && self.tray_available()
+    }
+
+    fn tray_available(&self) -> bool {
+        self.gui
+            ._tray_service
+            .as_ref()
+            .is_some_and(|t| t.is_available())
     }
 
     /// Persist config to disk and record the timestamp so the file-watcher
@@ -662,11 +768,19 @@ impl AppView {
     }
 
     fn start_selected(&mut self, cx: &mut Context<Self>) {
-        self.save_fields(cx);
+        if !self.save_fields(cx) {
+            return;
+        }
         if let Err(err) = self.flush_and_record() {
             self.set_status(&t!("status.save_failed", err = err.to_string()), cx);
             return;
         }
+        self.start_core(cx);
+    }
+
+    /// Start the core for the selected profile (after checking it is complete)
+    /// and update the status bar / tray.
+    fn start_core(&mut self, cx: &mut Context<Self>) {
         let profile = match self.gui.selected_profile().cloned() {
             Some(p) => p,
             None => {
@@ -674,9 +788,18 @@ impl AppView {
                 return;
             }
         };
+        let missing = missing_fields(&profile);
+        if !missing.is_empty() {
+            self.set_status(
+                &t!("status.incomplete_profile", fields = missing.join(", ")),
+                cx,
+            );
+            return;
+        }
         let config_snap = self.gui.config.clone();
         match self.gui.core_manager.start_profile(&config_snap, &profile) {
             Ok(()) => {
+                self.announced_running = true;
                 self.set_status(
                     &t!(
                         "status.running",
@@ -699,6 +822,7 @@ impl AppView {
     fn stop_core(&mut self, cx: &mut Context<Self>) {
         match self.gui.core_manager.stop() {
             Ok(()) => {
+                self.announced_running = false;
                 self.set_status(&t!("status.stopped"), cx);
                 self.gui.runtime.was_running = false;
                 let _ = self.flush_and_record();
@@ -712,14 +836,19 @@ impl AppView {
     }
 
     fn import_link(&mut self, input: &str, cx: &mut Context<Self>) {
+        if !self.save_fields(cx) {
+            return;
+        }
         match link::import_share_link(input.trim()) {
             Ok(imported) => {
-                let idx = self.gui.runtime.selected_profile;
-                if let Some(p) = self.gui.profiles.profiles.get_mut(idx) {
-                    imported.apply_to(p);
-                }
+                // Import as a new server instead of overwriting the selected one.
+                let mut profile = ProxyProfile::default();
+                imported.apply_to(&mut profile);
+                self.gui.profiles.profiles.push(profile);
+                self.gui.runtime.selected_profile = self.gui.profiles.profiles.len() - 1;
                 self.sync_tray_servers();
                 self.pending_reload = true;
+                let _ = self.flush_and_record();
                 self.set_status(&t!("status.imported"), cx);
             }
             Err(err) => self.set_status(&t!("status.import_failed", err = err.to_string()), cx),
@@ -744,10 +873,12 @@ impl AppView {
     }
 
     fn ok_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_fields(cx);
+        if !self.save_fields(cx) {
+            return;
+        }
         match self.flush_and_record() {
             Ok(()) => {
-                Self::suppress_quit(cx, true);
+                Self::suppress_quit(cx, self.tray_available());
                 window.remove_window();
             }
             Err(err) => self.set_status(&t!("status.save_failed", err = err.to_string()), cx),
@@ -756,7 +887,7 @@ impl AppView {
 
     fn cancel_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_reload = true;
-        Self::suppress_quit(cx, true);
+        Self::suppress_quit(cx, self.tray_available());
         window.remove_window();
     }
 
@@ -806,14 +937,46 @@ impl AppView {
     }
 
     fn apply_clicked(&mut self, cx: &mut Context<Self>) {
-        self.save_fields(cx);
+        if !self.save_fields(cx) {
+            return;
+        }
         match self.flush_and_record() {
-            Ok(()) => {
-                let _ = system_proxy::apply_system_proxy(&self.gui.config);
-                self.set_status(&t!("status.saved"), cx);
-            }
+            Ok(()) => match self.apply_system_proxy_now() {
+                Ok(()) => self.set_status(&t!("status.saved"), cx),
+                Err(err) => {
+                    self.set_status(&t!("status.system_proxy_failed", err = err.to_string()), cx)
+                }
+            },
             Err(err) => self.set_status(&t!("status.save_failed", err = err.to_string()), cx),
         }
+    }
+
+    /// Protocol whose local proxy ports the system proxy should point at:
+    /// the running core if any, otherwise the selected profile.
+    fn system_proxy_protocol(&self) -> ProxyProtocol {
+        self.gui
+            .core_manager
+            .current_protocol()
+            .or_else(|| self.gui.selected_profile().map(|p| p.protocol))
+            .unwrap_or_default()
+    }
+
+    fn apply_system_proxy_now(&self) -> anyhow::Result<()> {
+        system_proxy::apply_system_proxy(&self.gui.config, self.system_proxy_protocol())
+    }
+
+    /// Stop the core and restore the OS proxy settings so quitting never
+    /// leaves the machine pointing at a dead local proxy.
+    fn shutdown(&mut self) {
+        self.gui.core_manager.stop_and_wait();
+        if self.gui.config.system_proxy_mode != SystemProxyMode::Disable {
+            let mut cfg = self.gui.config.clone();
+            cfg.system_proxy_mode = SystemProxyMode::Disable;
+            if let Err(err) = system_proxy::apply_system_proxy(&cfg, self.system_proxy_protocol()) {
+                tracing::warn!("failed to restore system proxy on exit: {err}");
+            }
+        }
+        let _ = self.flush_and_record();
     }
 
     fn suppress_quit(cx: &mut Context<Self>, val: bool) {
@@ -850,6 +1013,10 @@ impl AppView {
     }
 
     fn select_server(&mut self, idx: usize, cx: &mut Context<Self>) {
+        // Commit pending edits to the current server before switching away.
+        if idx != self.gui.runtime.selected_profile && !self.save_fields(cx) {
+            return;
+        }
         if idx < self.gui.profiles.profiles.len() {
             self.gui.runtime.selected_profile = idx;
         }
@@ -897,30 +1064,12 @@ impl AppView {
             StartupConnectionState::Off => false,
         };
         if should_start {
-            if let Some(profile) = self.gui.selected_profile().cloned() {
-                let config = self.gui.config.clone();
-                match self.gui.core_manager.start_profile(&config, &profile) {
-                    Ok(()) => {
-                        let name = profile.display_name();
-                        self.set_status(
-                            &t!(
-                                "status.running",
-                                proto = profile.protocol.label(),
-                                name = name.clone()
-                            ),
-                            cx,
-                        );
-                        self.gui.runtime.was_running = true;
-                        let _ = self.flush_and_record();
-                        if let Ok(mut ts) = self.tray_shared.lock() {
-                            ts.is_running = true;
-                            ts.active_server_name = name;
-                        }
-                    }
-                    Err(err) => {
-                        self.set_status(&t!("status.start_failed", err = err.to_string()), cx);
-                    }
-                }
+            self.start_core(cx);
+        }
+        // Re-apply the saved system proxy mode; it is reset to "disabled" on exit.
+        if self.gui.config.system_proxy_mode != SystemProxyMode::Disable {
+            if let Err(err) = self.apply_system_proxy_now() {
+                tracing::warn!("failed to apply system proxy at startup: {err}");
             }
         }
         cx.notify();
@@ -953,12 +1102,14 @@ impl AppView {
             TrayEvent::SetSystemProxy(mode) => {
                 self.gui.config.system_proxy_mode = mode;
                 let _ = self.flush_and_record();
-                let snap = self.gui.config.clone();
-                let _ = system_proxy::apply_system_proxy(&snap);
                 if let Ok(mut ts) = self.tray_shared.lock() {
                     ts.system_proxy_mode = mode;
                 }
-                self.set_status(&t!("status.system_proxy", mode = mode.label()), cx);
+                match self.apply_system_proxy_now() {
+                    Ok(()) => self.set_status(&t!("status.system_proxy", mode = mode.label()), cx),
+                    Err(err) => self
+                        .set_status(&t!("status.system_proxy_failed", err = err.to_string()), cx),
+                }
             }
             TrayEvent::SetPacRuleMode(mode) => {
                 self.gui.config.pac_rule_mode = mode;
@@ -974,6 +1125,13 @@ impl AppView {
             }
             TrayEvent::SelectServer(idx) => {
                 self.select_server(idx, cx);
+                // Like Shadowsocks-Windows: picking a server while connected
+                // switches the connection to it.
+                if self.gui.core_manager.is_running()
+                    && self.gui.runtime.selected_profile == idx
+                {
+                    self.start_core(cx);
+                }
             }
             TrayEvent::ImportFromClipboard => {
                 cx.spawn(async move |_this, cx| {
@@ -989,7 +1147,7 @@ impl AppView {
                 }
             }
             TrayEvent::QuitApp => {
-                let _ = self.gui.core_manager.stop();
+                // Core and system proxy are cleaned up by the app-quit hook.
                 cx.spawn(async move |_this, cx| {
                     let _ = cx.update(|app| app.quit());
                 })
@@ -1100,6 +1258,7 @@ impl AppView {
         // Poll the core process status.
         match self.gui.core_manager.poll() {
             Ok(Some(exit)) => {
+                self.announced_running = false;
                 self.set_status(&t!("status.core_exited", code = exit.to_string()), cx);
                 if let Ok(mut ts) = self.tray_shared.lock() {
                     ts.is_running = false;
@@ -1115,10 +1274,16 @@ impl AppView {
                     .label();
                 let name = self
                     .gui
-                    .selected_profile()
-                    .map(|p| p.display_name())
-                    .unwrap_or_default();
-                self.set_status(&t!("status.running", proto = proto, name = name), cx);
+                    .core_manager
+                    .current_name()
+                    .unwrap_or_default()
+                    .to_string();
+                // Announce once; re-setting it every tick would wipe transient
+                // messages (validation errors, "URL copied", ...) within 300 ms.
+                if !self.announced_running {
+                    self.announced_running = true;
+                    self.set_status(&t!("status.running", proto = proto, name = name.clone()), cx);
+                }
                 if let Ok(mut ts) = self.tray_shared.lock() {
                     ts.is_running = true;
                     ts.active_server_name = name;
@@ -1265,12 +1430,12 @@ impl Render for AppView {
                                         {
                                             let this = this.clone();
                                             move |_e, _w, cx| {
-                                                if let Some(text) =
-                                                    cx.read_from_clipboard().and_then(|item| item.text())
-                                                {
-                                                    this.update(cx, |view, cx| view.import_link(&text, cx))
-                                                        .ok();
-                                                }
+                                                let text = cx
+                                                    .read_from_clipboard()
+                                                    .and_then(|item| item.text())
+                                                    .unwrap_or_default();
+                                                this.update(cx, |view, cx| view.import_link(&text, cx))
+                                                    .ok();
                                             }
                                         },
                                     ))
@@ -1523,6 +1688,31 @@ impl Render for AppView {
     }
 }
 
+/// Localized names of the mandatory fields the profile is still missing.
+fn missing_fields(profile: &ProxyProfile) -> Vec<String> {
+    let mut missing = Vec::new();
+    if profile.server.trim().is_empty() {
+        missing.push(t!("field.server_ip").to_string());
+    }
+    match profile.protocol {
+        ProxyProtocol::Juicity => {
+            if profile.uuid.trim().is_empty() {
+                missing.push(t!("field.uuid").to_string());
+            }
+            if profile.password.is_empty() {
+                missing.push(t!("field.password").to_string());
+            }
+        }
+        ProxyProtocol::Shadowsocks => {
+            if profile.password.is_empty() && !matches!(profile.method.as_str(), "none" | "plain")
+            {
+                missing.push(t!("field.password").to_string());
+            }
+        }
+    }
+    missing
+}
+
 /// Build a click handler that routes to a `&mut self` view method.
 fn with_view<F>(
     this: &WeakEntity<AppView>,
@@ -1622,6 +1812,8 @@ pub fn run() -> anyhow::Result<()> {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
+        open_anchor_window(cx);
+
         let view = cx.new(AppView::new);
         cx.default_global::<AppRoot>().view = Some(view.clone());
 
@@ -1637,7 +1829,7 @@ pub fn run() -> anyhow::Result<()> {
                     return;
                 }
                 let close_to_tray = view
-                    .update(cx, |v, _| v.gui.runtime.close_to_tray)
+                    .update(cx, |v, _| v.can_hide_to_tray())
                     .unwrap_or(false);
                 let g = cx.default_global::<AppRoot>();
                 g.main_window_closed = true;
@@ -1656,6 +1848,22 @@ pub fn run() -> anyhow::Result<()> {
             // Treat the never-shown main window as already closed so that
             // dialog windows (opened from the tray) can be closed freely.
             cx.default_global::<AppRoot>().main_window_closed = true;
+            // The tray registers asynchronously; if it never shows up the user
+            // would have no way to reach the app, so show the window instead.
+            let view = view.downgrade();
+            cx.spawn(async move |cx| {
+                Timer::after(Duration::from_secs(5)).await;
+                let _ = cx.update(|app| {
+                    let available = view
+                        .update(app, |v, _| v.tray_available())
+                        .unwrap_or(true);
+                    if !available {
+                        tracing::warn!("tray icon unavailable; showing the main window");
+                        open_main_window(app);
+                    }
+                });
+            })
+            .detach();
         } else {
             open_main_window(cx);
         }
@@ -1664,4 +1872,30 @@ pub fn run() -> anyhow::Result<()> {
         cx.activate(true);
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_fields_reports_incomplete_juicity_profile() {
+        let mut p = ProxyProfile::default();
+        assert_eq!(missing_fields(&p).len(), 3);
+        p.server = "example.com".into();
+        p.uuid = "id".into();
+        p.password = "pw".into();
+        assert!(missing_fields(&p).is_empty());
+    }
+
+    #[test]
+    fn missing_fields_allows_passwordless_ss_none() {
+        let p = ProxyProfile {
+            protocol: ProxyProtocol::Shadowsocks,
+            server: "example.com".into(),
+            method: "none".into(),
+            ..Default::default()
+        };
+        assert!(missing_fields(&p).is_empty());
+    }
 }
