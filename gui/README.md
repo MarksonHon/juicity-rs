@@ -40,6 +40,11 @@ and HTTP proxy traffic, dispatched per connection by inspecting the first byte.
 The system proxy settings and the PAC file both point at that single address, so
 there is no separate HTTP port to configure.
 
+HTTP proxying covers both `CONNECT` tunnels and plain absolute-form requests
+(`GET http://host/path`). The latter are rewritten to origin-form and the
+upstream connection is asked to close after the response, so plain HTTP traffic
+does not reuse a keep-alive connection through the proxy.
+
 Supported Shadowsocks ciphers follow shadowsocks-rust: AEAD-2022, AEAD and the
 deprecated stream ciphers. SIP003 plugins (`plugin`, `plugin_opts`,
 `plugin_args`) are passed through to the library unchanged.

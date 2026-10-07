@@ -8,14 +8,18 @@ use std::time::Instant;
 use bytes::Bytes;
 use juicity_common::consts;
 use juicity_common::protocol;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::JuicityClient;
 
-/// Local proxy server that handles SOCKS5 and HTTP proxy
+/// Local proxy server that handles SOCKS5 and HTTP proxy.
+///
+/// Both protocols are served on the same address: the first byte of every
+/// connection selects the handler (see [`handle_connection`]), so a single
+/// port acts as a mixed inbound.
 pub struct LocalServer {
     bind_addr: String,
     client: JuicityClient,
@@ -84,6 +88,8 @@ async fn handle_connection(
     let mut buf = [0u8; 1];
     stream.peek(&mut buf).await?;
 
+    // Mixed inbound: SOCKS5 always starts with the version byte 0x05, while
+    // HTTP requests start with an ASCII method name (GET, CONNECT, ...).
     match buf[0] {
         0x05 => handle_socks5(stream, local_addr, peer_addr, client).await,
         _ => handle_http_proxy(stream, client).await,
@@ -611,77 +617,244 @@ fn build_socks5_udp_packet(addr: &str, port: u16, payload: &[u8]) -> Vec<u8> {
     packet
 }
 
-/// Handle HTTP CONNECT proxy
-async fn handle_http_proxy(mut stream: TcpStream, client: JuicityClient) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+/// Handle an HTTP proxy connection.
+///
+/// Two request forms are supported, so the listener behaves as a real mixed
+/// inbound next to SOCKS5:
+///
+/// * `CONNECT host:port` — used by HTTPS clients, which then tunnel raw bytes.
+/// * absolute-form requests (`GET http://host/path HTTP/1.1`) — plain HTTP
+///   proxying. The target is rewritten to origin-form and the upstream
+///   connection is asked to close after the response, which gives the relay a
+///   well-defined end even for close-delimited bodies.
+async fn handle_http_proxy(stream: TcpStream, client: JuicityClient) -> anyhow::Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = tokio::io::BufReader::with_capacity(8 * 1024, read_half);
 
-    let (reader, mut writer) = stream.split();
-    let mut buf_reader = BufReader::new(reader);
+    // ── Request line ──
     let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await?;
-
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 3 {
-        anyhow::bail!("invalid HTTP request: {}", request_line.trim());
+    if reader.read_line(&mut request_line).await? == 0 {
+        anyhow::bail!("empty HTTP request");
     }
 
-    let method = parts[0];
-    let target = parts[1];
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+    else {
+        write_half
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .await?;
+        anyhow::bail!("invalid HTTP request line: {}", request_line.trim());
+    };
+    let (method, target, version) = (method.to_string(), target.to_string(), version.to_string());
 
-    match method {
-        "CONNECT" => {
-            // Parse host:port from the CONNECT target, properly handling IPv6 addresses like [::1]:443.
-            let (host, port) = match juicity_common::link::parse_host_port(target) {
-                Ok((host, port)) => (host, port),
-                Err(_) => (target.to_string(), 443u16),
-            };
-
-            tracing::info!(
-                target_addr = %host,
-                target_port = %port,
-                "HTTP CONNECT"
-            );
-
-            loop {
-                let mut line = String::new();
-                buf_reader.read_line(&mut line).await?;
-                if line.trim().is_empty() {
-                    break;
-                }
-            }
-
-            writer
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await?;
-
-            let mut stream =
-                tokio::io::BufReader::with_capacity(16 * 1024, buf_reader.into_inner());
-            let (mut quic_send, quic_recv) = client.open_tcp_stream(&host, port).await?;
-
-            let mut quic_recv = tokio::io::BufReader::with_capacity(16 * 1024, quic_recv);
-
-            let (r1, r2) = tokio::join!(
-                tokio::io::copy_buf(&mut stream, &mut quic_send),
-                tokio::io::copy_buf(&mut quic_recv, &mut writer),
-            );
-            if let Err(e) = r1 {
-                tracing::info!(error = %e, direction = "local->quic", protocol = "http", "HTTP CONNECT copy error");
-            }
-            if let Err(e) = r2 {
-                tracing::info!(error = %e, direction = "quic->local", protocol = "http", "HTTP CONNECT copy error");
-            }
-            // Gracefully finish the send direction so quinn can clean up the stream
-            // state immediately instead of holding it until a timeout or stream reset.
-            let _ = quic_send.finish();
+    // ── Headers ──
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            break;
         }
-        _ => {
-            writer
-                .write_all(b"HTTP/1.1 501 Not Implemented\r\n\r\n")
-                .await?;
+        if line.trim().is_empty() {
+            break;
         }
+        headers.push(line);
     }
+
+    if method == "CONNECT" {
+        return handle_http_connect(reader, write_half, &target, client).await;
+    }
+
+    handle_http_forward(
+        reader, write_half, &method, &target, &version, &headers, client,
+    )
+    .await
+}
+
+/// Handle an HTTP `CONNECT` tunnel.
+async fn handle_http_connect(
+    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    target: &str,
+    client: JuicityClient,
+) -> anyhow::Result<()> {
+    // Parse host:port from the CONNECT target, properly handling IPv6 addresses like [::1]:443.
+    let (host, port) = match juicity_common::link::parse_host_port(target) {
+        Ok((host, port)) => (host, port),
+        Err(_) => (target.to_string(), 443u16),
+    };
+
+    tracing::info!(
+        target_addr = %host,
+        target_port = %port,
+        "HTTP CONNECT"
+    );
+
+    // Bytes read past the request headers already belong to the tunnel (e.g.
+    // the TLS ClientHello), so they must be forwarded before the raw copy.
+    let leftover = reader.buffer().to_vec();
+
+    let (mut quic_send, quic_recv) = client.open_tcp_stream(&host, port).await?;
+
+    write_half
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+
+    if !leftover.is_empty() {
+        quic_send.write_all(&leftover).await?;
+    }
+
+    let mut local_rx = tokio::io::BufReader::with_capacity(16 * 1024, reader.into_inner());
+    let mut quic_recv = tokio::io::BufReader::with_capacity(16 * 1024, quic_recv);
+
+    let (r1, r2) = tokio::join!(
+        tokio::io::copy_buf(&mut local_rx, &mut quic_send),
+        tokio::io::copy_buf(&mut quic_recv, &mut write_half),
+    );
+    if let Err(e) = r1 {
+        tracing::info!(error = %e, direction = "local->quic", protocol = "http", "HTTP CONNECT copy error");
+    }
+    if let Err(e) = r2 {
+        tracing::info!(error = %e, direction = "quic->local", protocol = "http", "HTTP CONNECT copy error");
+    }
+    // Gracefully finish the send direction so quinn can clean up the stream
+    // state immediately instead of holding it until a timeout or stream reset.
+    let _ = quic_send.finish();
 
     Ok(())
+}
+
+/// Handle a plain HTTP proxy request (absolute-form request target).
+async fn handle_http_forward(
+    mut reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut write_half: tokio::net::tcp::OwnedWriteHalf,
+    method: &str,
+    target: &str,
+    version: &str,
+    headers: &[String],
+    client: JuicityClient,
+) -> anyhow::Result<()> {
+    let Some((host, port, path)) = split_proxy_target(target, headers) else {
+        write_half
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .await?;
+        anyhow::bail!("unsupported HTTP request target: {target}");
+    };
+
+    tracing::info!(
+        target_addr = %host,
+        target_port = %port,
+        method = %method,
+        "HTTP proxy request"
+    );
+
+    let request = build_origin_request(method, &path, version, headers, &host, port);
+
+    let (mut quic_send, quic_recv) = client.open_tcp_stream(&host, port).await?;
+    quic_send.write_all(request.as_bytes()).await?;
+
+    // Whatever is left on the client connection is the request body. Relay it
+    // and the response concurrently, but finish as soon as the response is
+    // complete so the client sees the end of the (possibly close-delimited)
+    // body instead of waiting for us to close first.
+    let body_relay = tokio::spawn(async move {
+        let _ = tokio::io::copy_buf(&mut reader, &mut quic_send).await;
+        let _ = quic_send.finish();
+    });
+
+    let mut quic_recv = tokio::io::BufReader::with_capacity(16 * 1024, quic_recv);
+    if let Err(e) = tokio::io::copy_buf(&mut quic_recv, &mut write_half).await {
+        tracing::info!(error = %e, direction = "quic->local", protocol = "http", "HTTP relay error");
+    }
+    // Signal the end of the response to the client, then stop relaying.
+    let _ = write_half.shutdown().await;
+    body_relay.abort();
+
+    Ok(())
+}
+
+/// Extract `(host, port, path)` from a proxy request target.
+///
+/// Handles absolute-form targets (`http://host/path`) and, as a fallback,
+/// origin-form targets whose host comes from the `Host` header.
+fn split_proxy_target(target: &str, headers: &[String]) -> Option<(String, u16, String)> {
+    if let Some(rest) = target.strip_prefix("http://") {
+        let (authority, path) = match rest.find('/') {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, "/"),
+        };
+        // Drop any userinfo part (`user:pass@host`).
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        if authority.is_empty() {
+            return None;
+        }
+        let (host, port) = juicity_common::link::parse_host_port(authority)
+            .unwrap_or_else(|_| (authority.to_string(), 80));
+        return Some((host, port, path.to_string()));
+    }
+
+    // Origin-form target: the authority has to come from the Host header.
+    let authority = headers.iter().find_map(|header| {
+        let (name, value) = header.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("host")
+            .then(|| value.trim().to_string())
+    })?;
+    if authority.is_empty() {
+        return None;
+    }
+
+    let (host, port) = juicity_common::link::parse_host_port(&authority)
+        .unwrap_or_else(|_| (authority.clone(), 80));
+    Some((host, port, target.to_string()))
+}
+
+/// Rewrite a proxy request into an origin-form request for the target server.
+///
+/// Hop-by-hop proxy headers are dropped and `Connection: close` is forced so
+/// the response relay finishes on upstream EOF.
+fn build_origin_request(
+    method: &str,
+    path: &str,
+    version: &str,
+    headers: &[String],
+    host: &str,
+    port: u16,
+) -> String {
+    let mut request = String::with_capacity(256);
+    request.push_str(method);
+    request.push(' ');
+    request.push_str(path);
+    request.push(' ');
+    request.push_str(version);
+    request.push_str("\r\n");
+
+    let mut has_host = false;
+    for header in headers {
+        let name = header.split(':').next().unwrap_or_default().trim();
+        if name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+            || name.eq_ignore_ascii_case("connection")
+        {
+            continue;
+        }
+        has_host |= name.eq_ignore_ascii_case("host");
+        request.push_str(header.trim_end_matches(['\r', '\n']));
+        request.push_str("\r\n");
+    }
+
+    if !has_host {
+        let authority = if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        request.push_str("Host: ");
+        request.push_str(&authority);
+        request.push_str("\r\n");
+    }
+
+    request.push_str("Connection: close\r\n\r\n");
+    request
 }
 
 /// Build a SOCKS5 response, automatically detecting the address type from the host string.
@@ -704,4 +877,85 @@ fn build_socks5_response(reply: u8, host: &str, port: u16) -> Vec<u8> {
     response.extend_from_slice(&addr_bytes);
     response.extend_from_slice(&port.to_be_bytes());
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(line: &str) -> String {
+        format!("{line}\r\n")
+    }
+
+    #[test]
+    fn proxy_target_parses_absolute_form() {
+        assert_eq!(
+            split_proxy_target("http://www.google.com/", &[]),
+            Some(("www.google.com".to_string(), 80, "/".to_string()))
+        );
+        assert_eq!(
+            split_proxy_target("http://example.com:8080/a/b?c=d", &[]),
+            Some(("example.com".to_string(), 8080, "/a/b?c=d".to_string()))
+        );
+        // No path -> "/".
+        assert_eq!(
+            split_proxy_target("http://example.com", &[]),
+            Some(("example.com".to_string(), 80, "/".to_string()))
+        );
+        // IPv6 authority and credentials are handled.
+        assert_eq!(
+            split_proxy_target("http://user:pw@[::1]:8080/x", &[]),
+            Some(("::1".to_string(), 8080, "/x".to_string()))
+        );
+        assert_eq!(split_proxy_target("http://", &[]), None);
+    }
+
+    #[test]
+    fn proxy_target_falls_back_to_host_header() {
+        let headers = vec![header("Host: example.com")];
+        assert_eq!(
+            split_proxy_target("/index.html", &headers),
+            Some(("example.com".to_string(), 80, "/index.html".to_string()))
+        );
+
+        let headers = vec![header("host: example.com:8443")];
+        assert_eq!(
+            split_proxy_target("/", &headers),
+            Some(("example.com".to_string(), 8443, "/".to_string()))
+        );
+
+        // No Host header and no absolute URI -> unusable.
+        assert_eq!(split_proxy_target("/", &[]), None);
+    }
+
+    #[test]
+    fn origin_request_rewrites_target_and_drops_proxy_headers() {
+        let headers = vec![
+            header("Host: www.google.com"),
+            header("User-Agent: curl/8.21.0"),
+            header("Proxy-Connection: Keep-Alive"),
+            header("Connection: keep-alive"),
+            header("Proxy-Authorization: Basic Zm9v"),
+        ];
+
+        let request = build_origin_request("GET", "/", "HTTP/1.1", &headers, "www.google.com", 80);
+
+        assert!(request.starts_with("GET / HTTP/1.1\r\n"));
+        assert!(request.contains("\r\nHost: www.google.com\r\n"));
+        assert!(request.contains("\r\nUser-Agent: curl/8.21.0\r\n"));
+        assert!(!request.to_lowercase().contains("proxy-connection"));
+        assert!(!request.to_lowercase().contains("proxy-authorization"));
+        // The client's Connection header is replaced by our own.
+        assert_eq!(request.to_lowercase().matches("connection:").count(), 1);
+        assert!(request.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn origin_request_synthesizes_missing_host_header() {
+        let request = build_origin_request("GET", "/x", "HTTP/1.1", &[], "example.com", 8080);
+        assert!(request.contains("\r\nHost: example.com:8080\r\n"));
+
+        let request = build_origin_request("GET", "/x", "HTTP/1.1", &[], "::1", 80);
+        assert!(request.contains("\r\nHost: [::1]:80\r\n"));
+    }
 }
