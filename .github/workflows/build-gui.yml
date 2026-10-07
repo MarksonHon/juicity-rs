@@ -4,7 +4,7 @@
 # Called via workflow_call from test-gui.yml / release.yml.
 # The caller is responsible for running build-package.yml first
 # (this workflow consumes the juicity-offline-source artifact).
-# Builds the juicity-gui (GPUI) app for Linux / Windows / macOS.
+# Builds the juicity-gui (GPUI) app for Linux / Windows (gnullvm + MSVC) / macOS.
 # ============================================
 
 name: Build GUI (reusable)
@@ -55,15 +55,27 @@ jobs:
           - name: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-gnullvm
+            toolchain: gnullvm
             ss_suffix: x86_64-pc-windows-msvc.zip
             msystem: CLANG64
             msystem_arch: clang-x86_64
             os: windows
 
+          # Static MSVC build: same toolchain as the bundled shadowsocks-rust
+          # binaries and no MSYS2 runtime DLLs to ship alongside.
+          - name: windows-x86_64-msvc
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            toolchain: msvc
+            ss_suffix: x86_64-pc-windows-msvc.zip
+            os: windows
+
           # windows-aarch64 disabled: shadowsocks-rust has no aarch64-pc-windows binary yet
+          # (affects both the gnullvm and the MSVC toolchain)
           # - name: windows-aarch64
           #   runner: windows-11-arm
           #   target: aarch64-pc-windows-gnullvm
+          #   toolchain: gnullvm
           #   ss_suffix: aarch64-pc-windows-msvc.zip
           #   msystem: CLANGARM64
           #   msystem_arch: clang-aarch64
@@ -114,8 +126,15 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Setup MSYS2 (Windows)
-        if: matrix.os == 'windows'
+      - name: Install Rust toolchain (Windows MSVC)
+        if: matrix.toolchain == 'msvc'
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Setup MSYS2 (Windows gnullvm)
+        if: matrix.toolchain == 'gnullvm'
         uses: msys2/setup-msys2@v2.31.1
         with:
           msystem: ${{ matrix.msystem }}
@@ -132,9 +151,20 @@ jobs:
         if: matrix.os != 'windows'
         run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-server
 
-      - name: Build (Windows)
-        if: matrix.os == 'windows'
+      - name: Build (Windows gnullvm)
+        if: matrix.toolchain == 'gnullvm'
         shell: msys2 {0}
+        run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-server
+
+      - name: Build (Windows MSVC)
+        if: matrix.toolchain == 'msvc'
+        env:
+          # -C target-feature=+crt-static links the static MSVC CRT (/MT), so
+          # no VC++ runtime DLLs are needed at run time.
+          RUSTFLAGS: -C target-feature=+crt-static
+          # x86_64 assembly in aws-lc-sys is assembled with NASM, which the
+          # runners do not ship; use the NASM objects bundled with the crate.
+          AWS_LC_SYS_PREBUILT_NASM: '1'
         run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-server
 
       # ── Test ────────────────────────────────────────────────────────────
@@ -143,12 +173,19 @@ jobs:
         if: matrix.os != 'windows'
         run: cargo test --locked --frozen --offline  -p juicity-gui --target ${{ matrix.target }}
 
-      - name: Run tests (Windows, clear POSIX env vars to validate i18n fallback)
-        if: matrix.os == 'windows'
+      - name: Run tests (Windows gnullvm, clear POSIX env vars to validate i18n fallback)
+        if: matrix.toolchain == 'gnullvm'
         shell: msys2 {0}
         run: |
           unset LANG LC_ALL LC_MESSAGES
           cargo test --locked --frozen --offline  -p juicity-gui --target ${{ matrix.target }}
+
+      - name: Run tests (Windows MSVC)
+        if: matrix.toolchain == 'msvc'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          AWS_LC_SYS_PREBUILT_NASM: '1'
+        run: cargo test --locked --frozen --offline  -p juicity-gui --target ${{ matrix.target }}
 
       # ── Download shadowsocks-rust ─────────────────────────────────────────
 
@@ -220,8 +257,8 @@ jobs:
           # Rename to include target name for artifact naming
           mv dist/Juicity.app "dist/juicity-gui-${{ matrix.name }}.app"
 
-      - name: Prepare package + collect DLLs (Windows)
-        if: matrix.os == 'windows'
+      - name: Prepare package + collect DLLs (Windows gnullvm)
+        if: matrix.toolchain == 'gnullvm'
         shell: msys2 {0}
         run: |
           PKG_NAME="juicity-gui-${{ matrix.name }}"
@@ -253,6 +290,20 @@ jobs:
               queue+=("${PKG_DIR}/${name}")
             done < <(ldd "$bin" 2>/dev/null | awk '/=> \// {print $3}' | grep -v '/c/[Ww]indows')
           done
+
+      # The MSVC build links the CRT statically, so only the shadowsocks-rust
+      # binaries are shipped next to it.
+      - name: Prepare package (Windows MSVC)
+        if: matrix.toolchain == 'msvc'
+        shell: pwsh
+        run: |
+          $pkg = "juicity-gui-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/juicity-gui.exe"    $pkg
+          Copy-Item "target/${{ matrix.target }}/release/juicity-client.exe" $pkg
+          Copy-Item "$env:SS_DIR\sslocal.exe" $pkg
+          Copy-Item "$env:SS_DIR\ssurl.exe"   $pkg
+          Copy-Item "client/examples/config.json" "$pkg/client-config.json"
 
       # ── Upload artifact ───────────────────────────────────────────────────
 

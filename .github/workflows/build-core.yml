@@ -7,6 +7,7 @@
 # Builds client / server for all supported platforms:
 #   Linux  (zigbuild; ARMv7 glibc via cross): x86_64, aarch64, i686, armv7, riscv64gc, loongarch64
 #   Windows gnullvm (static): x86_64, aarch64  (via MSYS2 CLANG64/CLANGARM64)
+#   Windows MSVC    (static): x86_64, aarch64  (native MSVC toolchain)
 #   macOS        (native)  : x86_64, aarch64
 #   FreeBSD      (cross)   : x86_64
 # ============================================
@@ -201,6 +202,81 @@ jobs:
 
       - name: Prepare package
         shell: msys2 {0}
+        run: |
+          case "${{ matrix.cpu_variant }}" in
+            v1) PKG_NAME="juicity-${{ matrix.target }}" ;;
+            v2) PKG_NAME="juicity-${{ matrix.target }}-v2" ;;
+            v3) PKG_NAME="juicity-${{ matrix.target }}-v3" ;;
+            *)  PKG_NAME="juicity-${{ matrix.target }}" ;;
+          esac
+          mkdir -p "${PKG_NAME}"
+          cp "target/${{ matrix.target }}/release/juicity-client.exe" "${PKG_NAME}/"
+          cp "target/${{ matrix.target }}/release/juicity-server.exe" "${PKG_NAME}/"
+          cp client/examples/config.json "${PKG_NAME}/client-config.json"
+          cp server/examples/config.json "${PKG_NAME}/server-config.json"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          path: juicity-${{ matrix.target }}${{ contains(matrix.target, 'x86_64') && matrix.cpu_variant != 'v1' && format('-{0}', matrix.cpu_variant) || '' }}
+          if-no-files-found: error
+
+  # --------------------------------------------------
+  # Windows MSVC — static CRT via the native MSVC toolchain
+  # --------------------------------------------------
+  windows-msvc:
+    name: Windows MSVC (${{ matrix.target }})${{ contains(matrix.target, 'x86_64') && format(' - {0}', matrix.cpu_variant) || '' }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      JUICITY_BUILD_TAG: ${{ inputs.tag }}
+      JUICITY_BUILD_COMMIT: ${{ inputs.sha }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cpu_variant: v1
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cpu_variant: v2
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cpu_variant: v3
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download offline source
+        uses: actions/download-artifact@v8
+        with:
+          name: juicity-offline-source
+
+      - name: Extract offline source
+        shell: bash
+        run: tar -xzf juicity-offline-source.tar.gz
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        env:
+          # -C target-feature=+crt-static links the static MSVC CRT (/MT), so
+          # no VC++ runtime DLLs are needed at run time.
+          RUSTFLAGS: -C target-feature=+crt-static ${{ matrix.cpu_variant == 'v3' && '-C target-cpu=x86-64-v3' || matrix.cpu_variant == 'v2' && '-C target-cpu=x86-64-v2' || '' }}
+          # x86_64 assembly in aws-lc-sys is assembled with NASM, which the
+          # runners do not ship; use the NASM objects bundled with the crate.
+          AWS_LC_SYS_PREBUILT_NASM: '1'
+        run: cargo build --locked --frozen --offline  --workspace --release --target ${{ matrix.target }} --exclude juicity-gui
+
+      - name: Prepare package
+        shell: bash
         run: |
           case "${{ matrix.cpu_variant }}" in
             v1) PKG_NAME="juicity-${{ matrix.target }}" ;;
