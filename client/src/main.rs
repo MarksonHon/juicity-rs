@@ -161,6 +161,12 @@ async fn run() -> anyhow::Result<()> {
             }
 
             let client = client::JuicityClient::new(&config).await?;
+            let eager_client = client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = eager_client.preconnect().await {
+                    tracing::warn!("Initial connection failed: {:#}", e);
+                }
+            });
 
             // Start forwarder if configured
             if !config.forward.is_empty() {

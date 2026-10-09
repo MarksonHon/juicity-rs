@@ -1,16 +1,72 @@
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use juicity_common::consts;
 use juicity_common::protocol;
 use juicity_common::Config;
 use quinn::{ClientConfig, Connection, Endpoint, EndpointConfig, RecvStream, SendStream, VarInt};
 use uuid::Uuid;
 
-/// A single slot in the connection pool, holding one QUIC connection.
-struct ConnectionSlot {
-    conn: Option<Connection>,
+#[derive(Default)]
+struct ReconnectState {
+    last_failure: Option<(std::time::Instant, Arc<anyhow::Error>)>,
+    attempts: u32,
+}
+
+fn parse_server(server: &str, sni: &str) -> anyhow::Result<(String, u16, String)> {
+    let (host, port) = if let Ok(addr) = server.parse::<SocketAddr>() {
+        (addr.ip().to_string(), addr.port())
+    } else {
+        let (host, port) =
+            juicity_common::link::parse_host_port(server).map_err(anyhow::Error::msg)?;
+        if host.is_empty() || host.contains(':') || server.starts_with('[') {
+            anyhow::bail!("Invalid server address: {}", server);
+        }
+        (host, port)
+    };
+    let sni = if sni.is_empty() {
+        host.clone()
+    } else {
+        sni.to_string()
+    };
+    Ok((host, port, sni))
+}
+
+fn reconnect_delay(attempts: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((1u64 << attempts.min(5)).min(30))
+}
+
+async fn try_addresses<T, F, Fut>(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    mut connect: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let mut error = None;
+    for addr in addresses {
+        match tokio::time::timeout(consts::DEFAULT_DIAL_TIMEOUT, connect(addr)).await {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(e)) => error = Some(e),
+            Err(e) => {
+                error = Some(anyhow::Error::new(e).context("QUIC connection attempt timed out"))
+            }
+        }
+    }
+    Err(error.unwrap_or_else(|| anyhow::anyhow!("No addresses found for server")))
+}
+
+async fn resolve_with_timeout<T>(
+    lookup: impl Future<Output = std::io::Result<T>>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(timeout, lookup)
+        .await
+        .context("DNS lookup timed out")?
+        .context("DNS lookup failed")
 }
 
 fn udp_packet_len(data: &[u8]) -> anyhow::Result<[u8; 2]> {
@@ -19,39 +75,20 @@ fn udp_packet_len(data: &[u8]) -> anyhow::Result<[u8; 2]> {
         .to_be_bytes())
 }
 
-/// A Juicity client that connects to a remote Juicity server.
-///
-/// Maintains a pool of `pool_size` QUIC connections for stream multiplexing
-/// and reduced head-of-line blocking.  Streams are distributed across the pool
-/// in round-robin order.
+/// A Juicity client multiplexing streams over one authenticated QUIC connection.
 #[derive(Clone)]
 pub struct JuicityClient {
     endpoint: Arc<Endpoint>,
-    server_addr: SocketAddr,
+    server_host: String,
+    server_port: u16,
     uuid: Uuid,
     password: zeroize::Zeroizing<String>,
     sni: String,
     quic_config: Arc<ClientConfig>,
-    /// Pool of QUIC connection slots.  Each slot may independently reconnect.
-    pool: Arc<tokio::sync::RwLock<Vec<ConnectionSlot>>>,
-    /// Number of slots in the pool.
-    pool_size: usize,
-    /// Round-robin cursor for selecting the next slot to use.
-    next_slot: Arc<AtomicUsize>,
-    /// Persistent auth unidirectional stream (shared across all pool slots —
-    /// only one auth stream is needed since it's per-client, not per-connection).
-    /// Protected by a Mutex because SendStream is !Clone and we need &mut access.
+    connection: Arc<tokio::sync::RwLock<Option<Connection>>>,
+    /// Keep the authentication stream open for underlay authentication messages.
     auth_uni_stream: Arc<tokio::sync::Mutex<Option<SendStream>>>,
-    /// Serialises reconnection: only one task may execute the slow reconnect
-    /// path at a time (across all slots).
-    reconnect_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Notifies waiting tasks when a reconnection attempt completes.
-    reconnect_notify: Arc<tokio::sync::Notify>,
-    /// Tracks the last reconnection failure time for exponential backoff.
-    last_reconnect_failure: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
-    /// Counts consecutive reconnection failures for exponential backoff.
-    /// Reset to 0 on successful reconnection.
-    reconnect_attempts: Arc<tokio::sync::Mutex<u32>>,
+    reconnect_lock: Arc<tokio::sync::Mutex<ReconnectState>>,
 }
 
 impl JuicityClient {
@@ -183,14 +220,11 @@ impl JuicityClient {
         Ok(quic_config)
     }
 
+    /// Create a client without connecting. Resolve the server on each reconnect.
+    /// An empty SNI uses the server hostname, or the canonical IP for literals.
     pub async fn new(config: &Config) -> anyhow::Result<Self> {
         let uuid = Uuid::parse_str(&config.uuid)?;
-        let server_addr: SocketAddr = config.server.parse()?;
-        let sni = if config.sni.is_empty() {
-            server_addr.ip().to_string()
-        } else {
-            config.sni.clone()
-        };
+        let (server_host, server_port, sni) = parse_server(&config.server, &config.sni)?;
 
         let pinned_hash = if config.pinned_certchain_sha256.is_empty() {
             Vec::new()
@@ -248,13 +282,6 @@ impl JuicityClient {
         };
         let endpoint = Arc::new(endpoint);
 
-        // Determine pool size.  Default to min(available_parallelism, hardware_concurrency).
-        // A pool of 2-4 connections provides meaningful multi-stream concurrency without
-        // excessive resource usage.
-        let pool_size = std::thread::available_parallelism()
-            .map(|n| n.get().min(4).max(2))
-            .unwrap_or(2);
-
         // Build and cache the QUIC client config once.
         let allow_insecure = config.allow_insecure;
         let pinned_hash_for_config = pinned_hash.clone();
@@ -277,184 +304,121 @@ impl JuicityClient {
         .await??;
         let quic_config = Arc::new(quic_config);
 
-        // Pre-allocate the pool with empty slots.
-        let pool: Vec<ConnectionSlot> = (0..pool_size)
-            .map(|_| ConnectionSlot { conn: None })
-            .collect();
-
         Ok(Self {
             endpoint,
-            server_addr,
+            server_host,
+            server_port,
             uuid,
             password: zeroize::Zeroizing::new(config.password.clone()),
             sni,
             quic_config,
-            pool: Arc::new(tokio::sync::RwLock::new(pool)),
-            pool_size,
-            next_slot: Arc::new(AtomicUsize::new(0)),
+            connection: Arc::new(tokio::sync::RwLock::new(None)),
             auth_uni_stream: Arc::new(tokio::sync::Mutex::new(None)),
-            reconnect_lock: Arc::new(tokio::sync::Mutex::new(())),
-            reconnect_notify: Arc::new(tokio::sync::Notify::new()),
-            last_reconnect_failure: Arc::new(tokio::sync::Mutex::new(None)),
-            reconnect_attempts: Arc::new(tokio::sync::Mutex::new(0)),
+            reconnect_lock: Arc::new(tokio::sync::Mutex::new(ReconnectState::default())),
         })
     }
 
-    /// Pick a live QUIC connection from the pool using round-robin selection.
-    ///
-    /// If no live connection is found, one task is elected to perform a
-    /// reconnection while others wait efficiently on a [`Notify`].
-    ///
-    /// Returns a live, authenticated [`quinn::Connection`] ready for opening streams.
+    /// Return the shared connection, reconnecting if necessary.
+    /// Failures are shared with queued callers until the backoff window expires.
     pub async fn connect(&self) -> anyhow::Result<Connection> {
-        loop {
-            // ── Fast path: try each pool slot in round-robin order ──
-            {
-                let guard = self.pool.read().await;
-                let start = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.pool_size;
-                for offset in 0..self.pool_size {
-                    let idx = (start + offset) % self.pool_size;
-                    if let Some(ref conn) = guard[idx].conn {
-                        if conn.close_reason().is_none() {
-                            return Ok(conn.clone());
-                        }
-                    }
-                }
+        self.connect_inner(true).await
+    }
+
+    /// Warm up the shared connection without recording a failure in backoff.
+    pub async fn preconnect(&self) -> anyhow::Result<Connection> {
+        self.connect_inner(false).await
+    }
+
+    async fn connect_inner(&self, record_failure: bool) -> anyhow::Result<Connection> {
+        {
+            let guard = self.connection.read().await;
+            if let Some(conn) = guard.as_ref().filter(|conn| conn.close_reason().is_none()) {
+                return Ok(conn.clone());
             }
-
-            // ── Try to become the designated reconnector ──
-            let reconnect_guard = match self.reconnect_lock.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    self.reconnect_notify.notified().await;
-                    continue;
-                }
-            };
-
-            // ── Apply exponential backoff ──
-            {
-                let last_failure = self.last_reconnect_failure.lock().await;
-                let attempts = self.reconnect_attempts.lock().await;
-                if let Some(last) = *last_failure {
-                    let base_delay = std::time::Duration::from_secs(1);
-                    let delay = base_delay * 2u32.pow(*attempts);
-                    let max_delay = std::time::Duration::from_secs(30);
-                    let delay = delay.min(max_delay);
-                    let elapsed = last.elapsed();
-                    if elapsed < delay {
-                        tokio::time::sleep(delay - elapsed).await;
-                    }
-                }
-            }
-
-            // ── Double-check: another task may have reconnected while we waited ──
-            {
-                let guard = self.pool.read().await;
-                for slot in guard.iter() {
-                    if let Some(ref conn) = slot.conn {
-                        if conn.close_reason().is_none() {
-                            drop(reconnect_guard);
-                            self.reconnect_notify.notify_waiters();
-                            return Ok(conn.clone());
-                        }
-                    }
-                }
-            }
-
-            // ── Find the first dead/empty slot and reconnect it ──
-            let slot_idx = {
-                let guard = self.pool.read().await;
-                guard
-                    .iter()
-                    .position(|s| s.conn.as_ref().map_or(true, |c| c.close_reason().is_some()))
-                    .unwrap_or(0) // fallback to slot 0 if all live (unlikely but safe)
-            };
-
-            // Clear the slot's stale state.
-            {
-                let mut guard = self.pool.write().await;
-                guard[slot_idx].conn = None;
-            }
-            {
-                let mut auth_guard = self.auth_uni_stream.lock().await;
-                *auth_guard = None;
-            }
-
-            tracing::info!(
-                "Connecting to Juicity server at {} (slot {}/{})",
-                self.server_addr,
-                slot_idx + 1,
-                self.pool_size
-            );
-
-            // ── Perform QUIC connection + authentication ──
-            let connect_result = (async {
-                let addr = SocketAddr::new(self.server_addr.ip(), self.server_addr.port());
-                let quinn_conn = self
-                    .endpoint
-                    .connect_with((*self.quic_config).clone(), addr, &self.sni)?
-                    .await?;
-
-                let mut uni = quinn_conn.open_uni().await?;
-
-                let conn_for_token = quinn_conn.clone();
-                let uuid_for_token = self.uuid;
-                let password_for_token = (*self.password).clone();
-                let token = tokio::task::spawn_blocking(move || {
-                    protocol::gen_token_via_connection(
-                        &conn_for_token,
-                        &uuid_for_token,
-                        &password_for_token,
-                    )
-                })
-                .await??;
-
-                let mut auth_buf = [0u8; 50];
-                auth_buf[0] = protocol::PROTOCOL_VERSION;
-                auth_buf[1] = protocol::AUTHENTICATE_TYPE;
-                auth_buf[2..18].copy_from_slice(self.uuid.as_bytes());
-                auth_buf[18..50].copy_from_slice(&token);
-                uni.write_all(&auth_buf).await?;
-
-                anyhow::Ok((quinn_conn, uni))
-            })
-            .await;
-
-            let (quinn_conn, uni) = match connect_result {
-                Ok(pair) => pair,
-                Err(e) => {
-                    *self.last_reconnect_failure.lock().await = Some(std::time::Instant::now());
-                    *self.reconnect_attempts.lock().await += 1;
-                    drop(reconnect_guard);
-                    self.reconnect_notify.notify_waiters();
-                    return Err(e);
-                }
-            };
-
-            tracing::info!(
-                "Authenticated as user {} (slot {}/{})",
-                self.uuid,
-                slot_idx + 1,
-                self.pool_size
-            );
-
-            // Store the new connection and auth stream.
-            {
-                let mut guard = self.pool.write().await;
-                guard[slot_idx].conn = Some(quinn_conn.clone());
-            }
-            {
-                let mut auth_guard = self.auth_uni_stream.lock().await;
-                *auth_guard = Some(uni);
-            }
-
-            *self.reconnect_attempts.lock().await = 0;
-
-            drop(reconnect_guard);
-            self.reconnect_notify.notify_waiters();
-
-            return Ok(quinn_conn);
         }
+
+        let mut reconnect = self.reconnect_lock.lock().await;
+        {
+            let guard = self.connection.read().await;
+            if let Some(conn) = guard.as_ref().filter(|conn| conn.close_reason().is_none()) {
+                return Ok(conn.clone());
+            }
+        }
+
+        if let Some((last, error)) = &reconnect.last_failure {
+            if last.elapsed() < reconnect_delay(reconnect.attempts) {
+                return Err(anyhow::anyhow!("{error:#}"));
+            }
+        }
+
+        *self.connection.write().await = None;
+        *self.auth_uni_stream.lock().await = None;
+
+        tracing::info!(
+            "Connecting to Juicity server at {}:{}",
+            self.server_host,
+            self.server_port
+        );
+
+        let connect_result = (async {
+            let addresses = resolve_with_timeout(
+                tokio::net::lookup_host((self.server_host.as_str(), self.server_port)),
+                consts::DNS_QUERY_TIMEOUT,
+            )
+            .await?;
+            try_addresses(addresses, |addr| self.connect_to_address(addr)).await
+        })
+        .await;
+
+        let (quinn_conn, uni) = match connect_result {
+            Ok(pair) => pair,
+            Err(error) => {
+                if record_failure {
+                    reconnect.last_failure =
+                        Some((std::time::Instant::now(), Arc::new(anyhow::anyhow!("{error:#}"))));
+                    reconnect.attempts = reconnect.attempts.saturating_add(1);
+                }
+                return Err(error);
+            }
+        };
+
+        tracing::info!("Authenticated as user {}", self.uuid);
+
+        // Publish only after the auth stream is available to concurrent callers.
+        *self.auth_uni_stream.lock().await = Some(uni);
+        *self.connection.write().await = Some(quinn_conn.clone());
+        *reconnect = ReconnectState::default();
+
+        Ok(quinn_conn)
+    }
+
+    async fn connect_to_address(&self, addr: SocketAddr) -> anyhow::Result<(Connection, SendStream)> {
+        let quinn_conn = self
+            .endpoint
+            .connect_with((*self.quic_config).clone(), addr, &self.sni)?
+            .await
+            .context("QUIC handshake failed")?;
+        let mut uni = quinn_conn.open_uni().await?;
+
+        let conn_for_token = quinn_conn.clone();
+        let uuid_for_token = self.uuid;
+        let password_for_token = (*self.password).clone();
+        let token = tokio::task::spawn_blocking(move || {
+            protocol::gen_token_via_connection(
+                &conn_for_token,
+                &uuid_for_token,
+                &password_for_token,
+            )
+        })
+        .await??;
+
+        let mut auth_buf = [0u8; 50];
+        auth_buf[0] = protocol::PROTOCOL_VERSION;
+        auth_buf[1] = protocol::AUTHENTICATE_TYPE;
+        auth_buf[2..18].copy_from_slice(self.uuid.as_bytes());
+        auth_buf[18..50].copy_from_slice(&token);
+        uni.write_all(&auth_buf).await?;
+        Ok((quinn_conn, uni))
     }
 
     /// Send one underlay authentication message on the persistent auth uni stream.
@@ -700,6 +664,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_addresses_try_failure_then_success() {
+        let unavailable = tokio::net::TcpSocket::new_v4().unwrap();
+        unavailable.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable = listener.local_addr().unwrap();
+        let stream = try_addresses(
+            [unavailable.local_addr().unwrap(), reachable],
+            |addr| async move { Ok(tokio::net::TcpStream::connect(addr).await?) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), reachable);
+    }
+
+    #[tokio::test]
+    async fn shared_error_keeps_quic_cause_text() {
+        let client = test_client().await;
+        client.reconnect_lock.lock().await.last_failure = Some((
+            std::time::Instant::now(),
+            Arc::new(anyhow::Error::new(quinn::ConnectionError::TimedOut)
+                .context("QUIC handshake failed")),
+        ));
+        let error = client.connect().await.unwrap_err();
+        assert_eq!(format!("{error:#}"), "QUIC handshake failed: timed out");
+    }
+
+    #[tokio::test]
+    async fn eager_failure_does_not_back_off_real_requests() {
+        let client = test_client().await;
+        assert!(client.preconnect().await.is_err());
+        {
+            let reconnect = client.reconnect_lock.lock().await;
+            assert!(reconnect.last_failure.is_none());
+            assert_eq!(reconnect.attempts, 0);
+        }
+        assert!(client.connect().await.is_err());
+        let reconnect = client.reconnect_lock.lock().await;
+        assert!(reconnect.last_failure.is_some());
+        assert_eq!(reconnect.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_dns_lookup_times_out() {
+        let error = resolve_with_timeout(
+            std::future::pending::<std::io::Result<()>>(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("DNS lookup timed out"));
+    }
+
+    #[tokio::test]
     async fn udp_payload_length_boundary_and_early_rejection() {
         let data = vec![0; u16::MAX as usize + 1];
         assert_eq!(udp_packet_len(&[]).unwrap(), [0, 0]);
@@ -708,5 +725,94 @@ mod tests {
         let client = test_client().await;
         let error = client.open_udp_stream("127.0.0.1", 53, &data).await.unwrap_err();
         assert_eq!(error.to_string(), "UDP payload exceeds 65535 bytes");
+        assert_eq!(client.reconnect_lock.lock().await.attempts, 0);
+    }
+
+    #[test]
+    fn server_address_and_sni() {
+        for (server, override_sni, host, port, sni) in [
+            ("proxy.example:443", "", "proxy.example", 443, "proxy.example"),
+            (
+                "proxy.example:8443",
+                "tls.example",
+                "proxy.example",
+                8443,
+                "tls.example",
+            ),
+            ("127.0.0.1:443", "", "127.0.0.1", 443, "127.0.0.1"),
+            ("127.0.0.1:443", "tls.example", "127.0.0.1", 443, "tls.example"),
+            ("[2001:db8::1]:443", "", "2001:db8::1", 443, "2001:db8::1"),
+            ("[::1]:8443", "tls.example", "::1", 8443, "tls.example"),
+        ] {
+            assert_eq!(
+                parse_server(server, override_sni).unwrap(),
+                (host.to_string(), port, sni.to_string())
+            );
+        }
+        for server in [
+            "proxy.example",
+            "proxy.example:",
+            "proxy.example:65536",
+            "proxy.example:abc",
+            ":443",
+            "[::1]",
+            "::1:443",
+            "[localhost]:443",
+        ] {
+            assert!(parse_server(server, "").is_err(), "accepted {server}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_failure_is_shared_until_backoff_expires() {
+        let config = Config {
+            server: "127.0.0.1:443".to_string(),
+            sni: "invalid sni".to_string(),
+            uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
+            password: "test-password".to_string(),
+            allow_insecure: true,
+            ..Config::default()
+        };
+        let client = JuicityClient::new(&config).await.unwrap();
+        let guard = client.reconnect_lock.lock().await;
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let client = client.clone();
+            callers.spawn(async move { client.connect().await.unwrap_err().to_string() });
+        }
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let error = callers.join_next().await.unwrap().unwrap();
+            assert!(error.contains("invalid"), "{error}");
+            while let Some(result) = callers.join_next().await {
+                assert_eq!(result.unwrap(), error);
+            }
+        })
+        .await
+        .expect("queued callers must not sleep through backoff");
+        let mut reconnect = client.reconnect_lock.lock().await;
+        assert_eq!(reconnect.attempts, 1);
+
+        reconnect.attempts = u32::MAX;
+        assert_eq!(
+            reconnect_delay(reconnect.attempts),
+            std::time::Duration::from_secs(30)
+        );
+        reconnect.last_failure.as_mut().unwrap().0 =
+            std::time::Instant::now() - std::time::Duration::from_secs(31);
+        drop(reconnect);
+        assert!(client
+            .connect()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("invalid"));
+        let reconnect = client.reconnect_lock.lock().await;
+        assert_eq!(reconnect.attempts, u32::MAX);
+        assert!(
+            reconnect.last_failure.as_ref().unwrap().0.elapsed() < std::time::Duration::from_secs(1)
+        );
     }
 }
