@@ -335,6 +335,10 @@ async fn handle_socks5(
                         result = bind_socket_clone.recv_from(&mut buf) => {
                             match result {
                                 Ok((n, src)) => {
+                                    if src.ip() != peer_addr.ip() {
+                                        tracing::debug!(source = %src, "Dropping SOCKS5 UDP datagram from another IP");
+                                        continue;
+                                    }
                                     // Reset the NAT timeout on each received datagram.
                                     nat_timer.as_mut().reset(
                                         tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT,
