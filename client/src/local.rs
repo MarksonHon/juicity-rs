@@ -66,7 +66,15 @@ impl LocalServer {
             // Acquire a permit before accepting; this blocks new accepts when the
             // limit is reached, providing back-pressure at the OS TCP accept queue.
             let permit = sem.clone().acquire_owned().await?;
-            let (stream, addr) = listener.accept().await?;
+            let (stream, addr) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Local TCP accept error");
+                    drop(permit);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let client = self.client.clone();
 
             tokio::spawn(async move {

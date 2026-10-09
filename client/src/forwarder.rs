@@ -170,7 +170,15 @@ async fn start_tcp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
         // Acquire a permit before accepting; this blocks new accepts when the
         // limit is reached, providing back-pressure at the OS TCP accept queue.
         let permit = sem.clone().acquire_owned().await?;
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::warn!(error = %e, "Forward TCP accept error");
+                drop(permit);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let client = client.clone();
         let target = entry.target.clone();
 
