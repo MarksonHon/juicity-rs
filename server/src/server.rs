@@ -1302,56 +1302,10 @@ async fn handle_udp_relay(
     Ok(())
 }
 
-/// Resolve a UDP target address (hostname or IP) with DNS caching.
+/// Resolve a UDP target with a bounded TTL cache and per-key single-flight.
 ///
-/// If `host` is already a valid [`IpAddr`], it is returned directly
-/// without DNS resolution.  Otherwise, the function performs an async DNS
-/// lookup via [`tokio::net::lookup_host`] and caches the first result in
-/// the provided `dns_cache` to avoid repeated queries for the same
-/// host/port pair within the [`consts::UDP_DNS_CACHE_TTL`] window.
-///
-/// The cache is behind a [`tokio::sync::Mutex`] so it can be shared across
-/// multiple UDP relay streams within the same QUIC connection.  The lock is
-/// held only briefly for cache lookups and inserts; the DNS lookup itself
-/// runs outside the critical section to avoid blocking other streams.
-///
-/// # Arguments
-///
-/// * `host` - The target hostname or IP address string.
-/// * `port` - The target UDP port.
-/// * `dns_cache` - A shared [`tokio::sync::Mutex`] wrapping an [`IndexMap`]
-///   that serves as a bounded DNS cache with TTL-based expiry.  When the
-///   cache reaches [`consts::MAX_UDP_DNS_CACHE`] entries, the oldest entry
-///   is evicted.
-///
-/// # Returns
-///
-/// A resolved [`SocketAddr`] suitable for use with `send_to`.
-///
-/// # Errors
-///
-/// Returns an error if DNS resolution fails (e.g. NXDOMAIN) or returns
-/// zero addresses.
-/// Resolve a UDP target address (hostname or IP) with DNS caching and
-/// per-key resolution locking to prevent duplicate concurrent lookups.
-///
-/// If `host` is already a valid [`IpAddr`], it is returned directly
-/// without DNS resolution.  Otherwise, the function performs an async DNS
-/// lookup via [`tokio::net::lookup_host`] and caches the first result in
-/// the provided `dns_cache` to avoid repeated queries for the same
-/// host/port pair within the [`consts::UDP_DNS_CACHE_TTL`] window.
-///
-/// The cache uses [`std::sync::Mutex`] (not tokio's async Mutex) because
-/// all critical sections are sub-microsecond lookups/inserts with no
-/// `.await` held under the lock.
-///
-/// # Concurrency guard
-///
-/// When a cache miss occurs, the first task marks the key as "resolving"
-/// in `dns_resolving`, performs the DNS lookup, then caches the result.
-/// Subsequent tasks for the same key wait on a per-key [`Notify`] and
-/// retry the cache — preventing N concurrent DNS queries for the same
-/// domain during cache-cold bursts.
+/// Failed or cancelled lookups release the key and wake all waiters. The
+/// entire lookup, including time spent waiting, is bounded by DNS_QUERY_TIMEOUT.
 async fn resolve_udp_target(
     host: &str,
     port: u16,
@@ -1362,91 +1316,73 @@ async fn resolve_udp_target(
         return Ok(SocketAddr::new(ip, port));
     }
 
-    // Use a loop instead of recursion to avoid infinitely sized futures
-    // (Rust does not allow recursive async fn calls without boxing).
+    struct ResolutionGuard<'a> {
+        key: (Arc<str>, u16),
+        resolving: &'a StdMutex<HashMap<(Arc<str>, u16), Arc<tokio::sync::Notify>>>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for ResolutionGuard<'_> {
+        fn drop(&mut self) {
+            self.resolving
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.key);
+            self.notify.notify_waiters();
+        }
+    }
+
+    let key = (Arc::from(host), port);
+    let deadline = tokio::time::Instant::now() + consts::DNS_QUERY_TIMEOUT;
     loop {
-        let key = (Arc::from(host), port);
-
-        // ── Check cache with TTL expiry (brief lock, no .await) ──
-        {
-            let mut cache = dns_cache.lock().unwrap();
-            if let Some((mapped, timestamp)) = cache.get(&key) {
-                if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
-                    return Ok(*mapped);
-                }
-                // TTL expired — evict the stale entry.
-                cache.swap_remove(&key);
-            }
-        }
-
-        // ── Per-key resolution guard ──
-        // Try to become the designated resolver for this key.
-        let notify = Arc::new(tokio::sync::Notify::new());
-
-        let is_designated = {
-            let mut resolving = dns_resolving.lock().unwrap();
-            if resolving.contains_key(&key) {
-                false
-            } else {
-                resolving.insert(key.clone(), notify.clone());
-                true
-            }
-        };
-
-        if !is_designated {
-            // Wait for the designated resolver to finish.
-            let wait_notify = {
-                let resolving = dns_resolving.lock().unwrap();
-                resolving.get(&key).cloned()
-            };
-            if let Some(n) = wait_notify {
-                n.notified().await;
-            }
-            // Retry cache.
+        let resolution = {
+            let mut resolving = dns_resolving.lock().unwrap_or_else(|e| e.into_inner());
             {
-                let cache = dns_cache.lock().unwrap();
-                if let Some((mapped, _)) = cache.get(&key) {
-                    return Ok(*mapped);
+                let mut cache = dns_cache.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((mapped, timestamp)) = cache.get(&key) {
+                    if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
+                        return Ok(*mapped);
+                    }
+                    cache.swap_remove(&key);
                 }
             }
-            // Cache miss — retry from the top (creates a new resolving entry).
-            continue;
-        }
 
-        // ── We are the designated resolver ──
-        // Perform DNS lookup (no lock held during async I/O)
-        let result = tokio::time::timeout(
-            consts::DNS_QUERY_TIMEOUT,
-            tokio::net::lookup_host((host, port)),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("DNS query timeout for {}:{}", host, port))?;
-
-        let resolved = match result?.next() {
-            Some(addr) => addr,
-            None => {
-                // Remove the resolving marker and notify waiters.
-                dns_resolving.lock().unwrap().remove(&key);
-                notify.notify_waiters();
-                return Err(anyhow::anyhow!("no DNS result for {}:{}", host, port));
+            if let Some(notify) = resolving.get(&key) {
+                // Capture notify_waiters' generation before releasing the lock.
+                Err(notify.clone().notified_owned())
+            } else {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                resolving.insert(key.clone(), notify.clone());
+                Ok(ResolutionGuard {
+                    key: key.clone(),
+                    resolving: dns_resolving,
+                    notify,
+                })
+            }
+        };
+        let _guard = match resolution {
+            Ok(guard) => guard,
+            Err(wait) => {
+                tokio::time::timeout_at(deadline, wait)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("DNS query timeout for {}:{}", host, port))?;
+                continue;
             }
         };
 
-        // Insert into cache (brief lock, no .await)
-        {
-            let mut cache = dns_cache.lock().unwrap();
-            if cache.len() >= consts::MAX_UDP_DNS_CACHE {
-                if let Some(oldest_key) = cache.keys().next().cloned() {
-                    cache.swap_remove(&oldest_key);
-                }
+        let resolved = tokio::time::timeout_at(deadline, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| anyhow::anyhow!("DNS query timeout for {}:{}", host, port))??
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no DNS result for {}:{}", host, port))?;
+
+        let mut cache = dns_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= consts::MAX_UDP_DNS_CACHE {
+            if let Some(oldest_key) = cache.keys().next().cloned() {
+                cache.swap_remove(&oldest_key);
             }
-            cache.insert(key.clone(), (resolved, Instant::now()));
         }
-
-        // Remove the resolving marker and notify all waiters.
-        dns_resolving.lock().unwrap().remove(&key);
-        notify.notify_waiters();
-
+        cache.insert(key.clone(), (resolved, Instant::now()));
         return Ok(resolved);
     }
 }
@@ -1523,3 +1459,6 @@ fn load_private_key(path: &str) -> anyhow::Result<rustls::pki_types::PrivateKeyD
 
     Ok(key)
 }
+
+#[cfg(test)]
+mod tests;
