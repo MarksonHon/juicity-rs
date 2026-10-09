@@ -18,6 +18,7 @@ mod pac_dialog;
 mod startup_dialog;
 mod state;
 mod system_proxy;
+mod system_theme;
 mod tray;
 mod util;
 mod widgets;

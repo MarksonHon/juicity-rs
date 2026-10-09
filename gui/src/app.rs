@@ -6,19 +6,20 @@ use crate::link;
 use crate::pac;
 use crate::state::{extract_port, non_empty_text, restart_pac_server, GuiState};
 use crate::system_proxy;
+use crate::system_theme;
 use crate::tray::{TrayEvent, TraySharedState};
 use crate::widgets;
-use gpui::prelude::*;
-use gpui::{
-    actions, div, point, px, rgb, size, App, Bounds, ClickEvent, Context, ElementId, Entity, FontWeight,
-    Global, KeyBinding, SharedString, Timer, WeakEntity, Window, WindowBackgroundAppearance,
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::IndexPath;
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    actions, div, point, px, size, App, Bounds, ClickEvent, Context, ElementId, Entity, FontWeight,
+    Global, KeyBinding, SharedString, WeakEntity, Window, WindowBackgroundAppearance,
     WindowBounds, WindowHandle, WindowOptions,
 };
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputState};
-use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::IndexPath;
 use rust_i18n::t;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,7 +30,7 @@ actions!(app, [Quit]);
 #[derive(Default)]
 struct AppRoot {
     view: Option<Entity<AppView>>,
-    main_window: Option<WindowHandle<gpui_component::Root>>,
+    main_window: Option<WindowHandle<gpui_kit::base::Root>>,
     /// Set right before the main window is closed via OK/Cancel so the
     /// `on_window_closed` handler keeps the app alive in the tray.
     suppress_quit: bool,
@@ -73,7 +74,13 @@ fn open_anchor_window(cx: &mut App) {
         app_id: Some("io.juicity.gui".to_string()),
         ..Default::default()
     };
-    if let Err(err) = cx.open_window(options, |_window, cx| cx.new(|_| AnchorView)) {
+    if let Err(err) = cx.open_window(options, |window, cx| {
+        // Follow the system light/dark preference, including later changes.
+        window
+            .observe_window_appearance(|window, cx| crate::system_theme::sync(window, cx))
+            .detach();
+        cx.new(|_| AnchorView)
+    }) {
         tracing::warn!("failed to open the background anchor window: {err}");
     }
 }
@@ -133,7 +140,7 @@ fn open_main_window(cx: &mut App) {
                     true
                 });
 
-                cx.new(|cx| gpui_component::Root::new(view, window, cx))
+                cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
             },
         )
         .ok();
@@ -150,7 +157,7 @@ pub struct AppView {
     tray_rx: std::sync::mpsc::Receiver<TrayEvent>,
     tray_shared: Arc<Mutex<TraySharedState>>,
 
-    // ── Editor text fields (gpui-component InputState; built lazily on first render) ──
+    // ── Editor text fields (gpui-kit InputState; built lazily on first render) ──
     server: Option<Entity<InputState>>,
     port: Option<Entity<InputState>>,
     password: Option<Entity<InputState>>,
@@ -297,13 +304,13 @@ impl AppView {
 
         // ── Periodic poll loop: tray events + PAC + core status ────────────
         cx.spawn(async move |this, cx| {
-            let mut timer = Timer::after(Duration::from_millis(300));
+            let mut timer = cx.background_executor().timer(Duration::from_millis(300));
             loop {
                 timer.await;
                 if this.update(cx, |view, cx| view.poll(cx)).is_err() {
                     break;
                 }
-                timer = Timer::after(Duration::from_millis(300));
+                timer = cx.background_executor().timer(Duration::from_millis(300));
             }
         })
         .detach();
@@ -866,7 +873,7 @@ impl AppView {
         };
         match url {
             Ok(url) => {
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url));
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(url));
                 self.set_status(&t!("status.url_copied"), cx);
             }
             Err(err) => self.set_status(&t!("status.export_failed", err = err.to_string()), cx),
@@ -1310,6 +1317,7 @@ impl Render for AppView {
         }
 
         let this = cx.weak_entity();
+        let colors = widgets::palette(cx);
         let is_juicity = self.protocol == 0;
 
         let selected_profile = self.gui.runtime.selected_profile;
@@ -1325,12 +1333,14 @@ impl Render for AppView {
                     .py_1()
                     .text_sm()
                     .cursor_pointer()
-                    .when(selected, |s| s.bg(rgb(0xddf4ff)).text_color(rgb(0x0969da)))
+                    .when(selected, |s| {
+                        s.bg(colors.list_active).text_color(colors.link)
+                    })
                     .hover(|s| {
                         s.bg(if selected {
-                            rgb(0xddf4ff)
+                            colors.list_active
                         } else {
-                            rgb(0xf0f3f6)
+                            colors.list_hover
                         })
                     })
                     .on_click(move |_e, _w, cx| {
@@ -1344,7 +1354,7 @@ impl Render for AppView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0xf6f8fa))
+            .bg(colors.panel)
             .child(
                 div()
                     .flex()
@@ -1358,13 +1368,13 @@ impl Render for AppView {
                             .w(px(210.))
                             .flex_none()
                             .h_full()
-                            .bg(rgb(0xffffff))
+                            .bg(colors.background)
                             .border_r_1()
-                            .border_color(rgb(0xd0d7de))
+                            .border_color(colors.border)
                             .child(
                                 div()
                                     .id("server-list")
-                                    .flex_grow()
+                                    .flex_grow(1.)
                                     .overflow_y_scroll()
                                     .children(server_rows),
                             )
@@ -1448,7 +1458,7 @@ impl Render for AppView {
                     .child(
                         div()
                             .id("editor-scroll")
-                            .flex_grow()
+                            .flex_grow(1.)
                             .h_full()
                             .overflow_y_scroll()
                             .p_3()
@@ -1463,14 +1473,17 @@ impl Render for AppView {
                                     .child(t!("field.server_hdr").to_string()),
                             )
                             .child(widgets::field_row(
+                                colors,
                                 t!("field.protocol").to_string(),
                                 Select::new(self.protocol_select.as_ref().unwrap()),
                             ))
                             .child(widgets::field_row(
+                                colors,
                                 t!("field.server_ip").to_string(),
                                 Input::new(self.server.as_ref().unwrap()),
                             ))
                             .child(widgets::field_row(
+                                colors,
                                 t!("field.server_port").to_string(),
                                 Input::new(self.port.as_ref().unwrap()),
                             ))
@@ -1486,7 +1499,7 @@ impl Render for AppView {
                                             .w(px(130.))
                                             .flex_none()
                                             .text_right()
-                                            .text_color(rgb(0x57606a))
+                                            .text_color(colors.muted_foreground)
                                             .child(t!("field.password").to_string()),
                                     )
                                     .child(Input::new(self.password.as_ref().unwrap()))
@@ -1505,12 +1518,14 @@ impl Render for AppView {
                                     )),
                             )
                             .when(is_juicity, |el| {
-                                el.child(separator())
+                                el.child(separator(colors))
                                     .child(widgets::field_row(
+                                        colors,
                                         t!("field.uuid").to_string(),
                                         Input::new(self.uuid.as_ref().unwrap()),
                                     ))
                                     .child(widgets::field_row(
+                                        colors,
                                         t!("field.sni").to_string(),
                                         Input::new(self.sni.as_ref().unwrap()),
                                     ))
@@ -1529,16 +1544,19 @@ impl Render for AppView {
                                     )))
                             })
                             .when(!is_juicity, |el| {
-                                el.child(separator())
+                                el.child(separator(colors))
                                     .child(widgets::field_row(
+                                        colors,
                                         t!("field.encryption").to_string(),
                                         Select::new(self.method_select.as_ref().unwrap()),
                                     ))
                                     .child(widgets::field_row(
+                                        colors,
                                         t!("field.plugin_program").to_string(),
                                         Input::new(self.plugin.as_ref().unwrap()),
                                     ))
                                     .child(widgets::field_row(
+                                        colors,
                                         t!("field.plugin_options").to_string(),
                                         Input::new(self.plugin_opts.as_ref().unwrap()),
                                     ))
@@ -1557,21 +1575,25 @@ impl Render for AppView {
                                     )))
                                     .when(self.need_plugin_arg, |el| {
                                         el.child(widgets::field_row(
+                                            colors,
                                             t!("field.plugin_args").to_string(),
                                             Input::new(self.plugin_args.as_ref().unwrap()),
                                         ))
                                     })
                             })
-                            .child(separator())
+                            .child(separator(colors))
                             .child(widgets::field_row(
+                                colors,
                                 t!("field.remarks").to_string(),
                                 Input::new(self.remarks.as_ref().unwrap()),
                             ))
                             .child(widgets::field_row(
+                                colors,
                                 t!("field.timeout").to_string(),
                                 Input::new(self.timeout.as_ref().unwrap()),
                             ))
                             .child(widgets::field_row(
+                                colors,
                                 t!("field.group").to_string(),
                                 Input::new(self.group.as_ref().unwrap()),
                             )),
@@ -1587,13 +1609,13 @@ impl Render for AppView {
                     .px_2()
                     .py_1()
                     .border_t_1()
-                    .border_color(rgb(0xd0d7de))
-                    .bg(rgb(0xffffff))
+                    .border_color(colors.border)
+                    .bg(colors.background)
                     .child(
                         div()
-                            .flex_grow()
+                            .flex_grow(1.)
                             .text_sm()
-                            .text_color(rgb(0x57606a))
+                            .text_color(colors.muted_foreground)
                             .child(self.status.clone()),
                     )
                     .child(btn(
@@ -1619,12 +1641,12 @@ impl Render for AppView {
                     .px_2()
                     .py_1()
                     .border_t_1()
-                    .border_color(rgb(0xd0d7de))
-                    .bg(rgb(0xffffff))
+                    .border_color(colors.border)
+                    .bg(colors.background)
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x57606a))
+                            .text_color(colors.muted_foreground)
                             .child(t!("field.proxy_port").to_string()),
                     )
                     .child(div().w(px(90.)).child(Input::new(self.proxy_port.as_ref().unwrap())))
@@ -1650,7 +1672,7 @@ impl Render for AppView {
                             }
                         },
                     ))
-                    .child(div().flex_grow())
+                    .child(div().flex_grow(1.))
                     .child(btn(
                         "ok-btn",
                         t!("btn.ok").to_string(),
@@ -1724,7 +1746,7 @@ where
     }
 }
 
-/// Build a gpui-component `Button`.
+/// Build a gpui-kit `Button`.
 fn btn(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -1736,10 +1758,10 @@ fn btn(
     b.on_click(on_click)
 }
 
-/// Build a gpui-component `Checkbox`.
+/// Build a gpui-kit `Checkbox`.
 fn chk(
     id: impl Into<ElementId>,
-    label: impl Into<gpui_component::text::Text>,
+    label: impl Into<gpui_kit::component::text::Text>,
     checked: bool,
     on_click: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> Checkbox {
@@ -1747,8 +1769,8 @@ fn chk(
 }
 
 /// Thin horizontal separator line.
-fn separator() -> impl IntoElement {
-    div().h(px(1.)).w_full().bg(rgb(0xe0e0e0)).my_1()
+fn separator(colors: widgets::Palette) -> impl IntoElement {
+    div().h(px(1.)).w_full().bg(colors.border).my_1()
 }
 
 /// Apply or remove system auto-start for the application.
@@ -1805,10 +1827,13 @@ fn apply_autostart(state: &RuntimeState) -> anyhow::Result<()> {
 pub fn run() -> anyhow::Result<()> {
     // The embedded icon doubles as the asset source, so `svg()`/`img()` can
     // resolve it without a file next to the executable.
-    let app = gpui::Application::new().with_assets(crate::icon::Assets);
+    let app = gpui_kit::application().with_assets(crate::icon::Assets);
     app.run(|cx: &mut App| {
         crate::icon::install();
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
+        // Match the desktop's own accent colour for primary controls and
+        // selection highlights.
+        system_theme::apply(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
 
@@ -1819,7 +1844,7 @@ pub fn run() -> anyhow::Result<()> {
 
         let _ = cx.on_window_closed({
             let view = view.downgrade();
-            move |cx| {
+            move |cx, _window_id| {
                 // Main-window close is handled by `on_window_should_close` in
                 // `open_main_window`.  This observer is a safety net: if the
                 // flag was NOT set (e.g. the window was removed programmatically
@@ -1852,7 +1877,7 @@ pub fn run() -> anyhow::Result<()> {
             // would have no way to reach the app, so show the window instead.
             let view = view.downgrade();
             cx.spawn(async move |cx| {
-                Timer::after(Duration::from_secs(5)).await;
+                cx.background_executor().timer(Duration::from_secs(5)).await;
                 let _ = cx.update(|app| {
                     let available = view
                         .update(app, |v, _| v.tray_available())
