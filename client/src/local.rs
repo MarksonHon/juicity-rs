@@ -184,10 +184,15 @@ async fn handle_socks5(
                 protocol = "socks5",
                 "New connection"
             );
+            let (mut quic_send, quic_recv) = match client.open_tcp_stream(&host, port).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    stream.write_all(&build_socks5_response(0x01, "0.0.0.0", 0)).await?;
+                    return Err(e);
+                }
+            };
             let response = build_socks5_response(0x00, &host, port);
             stream.write_all(&response).await?;
-
-            let (mut quic_send, quic_recv) = client.open_tcp_stream(&host, port).await?;
 
             let (local_rx, mut local_tx) = stream.split();
 
