@@ -273,17 +273,17 @@ impl UdpSession {
         self.last_used_epoch_ms.store(now, Ordering::Relaxed);
     }
 
-    fn last_used(&self) -> Instant {
+    fn last_used(&self) -> Option<Instant> {
         let ms = self.last_used_epoch_ms.load(Ordering::Relaxed);
         // Convert epoch millis back to Instant via UNIX_EPOCH.
         // This is approximate but sufficient for idle detection.
-        Instant::now() - std::time::Duration::from_millis(
+        Instant::now().checked_sub(std::time::Duration::from_millis(
             (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64)
                 .saturating_sub(ms),
-        )
+        ))
     }
 }
 
@@ -320,8 +320,12 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
                     tokio::time::interval(consts::CLIENT_UDP_SESSION_CLEANUP_INTERVAL);
                 loop {
                     interval.tick().await;
-                    let idle_cutoff = Instant::now() - consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT;
-                    sessions.retain(|_, s| !s.tx.is_closed() && s.last_used() > idle_cutoff);
+                    let idle_cutoff = Instant::now().checked_sub(consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT);
+                    sessions.retain(|_, s| {
+                        !s.tx.is_closed() && idle_cutoff.is_none_or(|cutoff| {
+                            s.last_used().is_some_and(|last_used| last_used > cutoff)
+                        })
+                    });
                 }
             }
         })

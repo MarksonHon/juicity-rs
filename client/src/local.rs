@@ -300,10 +300,10 @@ async fn handle_socks5(
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            let idle_cutoff = Instant::now() - consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT;
+                            let idle_cutoff = Instant::now().checked_sub(consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT);
                             let mut guard = sessions_cleanup.lock().await;
                             let before = guard.len();
-                            guard.retain(|_, s| !s.tx.is_closed() && s.last_used > idle_cutoff);
+                            guard.retain(|_, s| !s.tx.is_closed() && idle_cutoff.is_none_or(|cutoff| s.last_used > cutoff));
                             let after = guard.len();
                             drop(guard);
                             if before != after {
