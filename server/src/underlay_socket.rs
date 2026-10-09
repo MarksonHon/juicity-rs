@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::io::IoSliceMut;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -42,20 +41,6 @@ const MAX_DEMUX_BATCHES_PER_POLL: usize = 8;
 /// `MAX_DEMUX_BATCHES_PER_POLL × MAX_IDLE_POLL_BEFORE_YIELD` (32) non-QUIC recv
 /// batches before yielding.
 const MAX_IDLE_POLL_BEFORE_YIELD: usize = 4;
-
-// Thread-local pre-allocated buffer for UDP packet payloads.
-//
-// Instead of calling `.to_vec()` (which allocates a new `Vec` from scratch
-// for every non-QUIC packet), we reuse this fixed-capacity buffer to
-// amortise allocation overhead.  The buffer is initialised with 65535 bytes
-// of capacity (maximum UDP datagram size), so `extend_from_slice` never
-// triggers a reallocation after the first call on each thread.
-//
-// We use `RefCell` because this is accessed from `poll_recv()` which is
-// not async and runs on a single thread at a time.
-thread_local! {
-    static UDP_PACKET_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(65535));
-}
 
 /// Counts dropped non-QUIC packets when underlay channel is full.
 /// Used to rate-limit warning logs under burst traffic.
@@ -173,25 +158,8 @@ impl AsyncUdpSocket for DemuxUdpSocket {
                 let stride = meta[i].stride.max(1);
                 while offset < meta[i].len {
                     let end = (offset + stride).min(meta[i].len);
-                    // Use a thread-local pre-allocated buffer to avoid per-packet
-                    // heap allocation overhead.  The buffer is initialised with
-                    // 65535 bytes capacity (max UDP datagram), so extend_from_slice
-                    // never triggers a reallocation after the first call.
-                    //
-                    // We swap the buffer out, fill it, clone the result for the
-                    // channel, then put the (still-capacitive) buffer back — this
-                    // amortises the allocation cost across all packets on this thread.
-                    // Zero-copy: swap the filled buffer with a fresh pre-capacitive
-                    // Vec, avoiding the per-packet heap allocation that clone() would
-                    // require.  The thread-local buffer retains its 65535 capacity.
-                    let payload = UDP_PACKET_BUF.with(|buf| {
-                        let mut buf_ref = buf.borrow_mut();
-                        buf_ref.clear();
-                        buf_ref.extend_from_slice(&bufs[i][offset..end]);
-                        // Replace with a fresh 65535-capacity Vec, taking ownership
-                        // of the filled buffer — this is O(1), no heap allocation.
-                        std::mem::replace(&mut *buf_ref, Vec::with_capacity(65535))
-                    });
+                    // Queue only packet-sized storage, not a maximum-size receive buffer.
+                    let payload = bufs[i][offset..end].to_vec();
                     if self
                         .underlay_tx
                         .try_send(UnderlayPacket {
@@ -260,5 +228,41 @@ impl AsyncUdpSocket for DemuxUdpSocket {
 
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quinn::Runtime;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn queued_underlay_packet_uses_packet_sized_storage() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let inner = quinn::TokioRuntime.wrap_udp_socket(socket).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let demux = DemuxUdpSocket::new(inner, tx);
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.send_to(&[0; 32], addr).await.unwrap();
+        sender.send_to(&[0x40; 32], addr).await.unwrap();
+        let mut storage = [0u8; 65535];
+        let mut buffers = [IoSliceMut::new(&mut storage)];
+        let mut meta = [RecvMeta::default()];
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| demux.poll_recv(cx, &mut buffers, &mut meta)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&buffers[0][..meta[0].len], &[0x40; 32]);
+        let packet = rx.try_recv().unwrap();
+        assert_eq!(packet.peer, sender.local_addr().unwrap());
+        assert_eq!(packet.payload, [0; 32]);
+        assert_eq!(packet.payload.capacity(), 32);
     }
 }
