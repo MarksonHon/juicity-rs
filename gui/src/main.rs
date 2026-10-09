@@ -6,6 +6,7 @@
     windows_subsystem = "windows"
 )]
 
+mod about_dialog;
 mod app;
 mod config;
 mod core;

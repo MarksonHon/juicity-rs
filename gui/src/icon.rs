@@ -1,6 +1,14 @@
 /// Application icon name as registered in the icon theme.
 pub const ICON_NAME: &str = "io.juicity.gui";
 
+/// Asset paths of the embedded icon, as resolved by [`Assets`].
+pub const SVG_ASSET: &str = "icon.svg";
+pub const PNG_ASSET: &str = "icon.png";
+
+/// `gui/icon.svg` embedded verbatim, so the binary carries the source artwork
+/// in addition to the rasterized variants below.
+pub const SVG: &[u8] = include_bytes!("../icon.svg");
+
 // PNG bytes at standard sizes, generated from icon.svg by build.rs.
 const ICON_16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/16.png"));
 const ICON_32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/32.png"));
@@ -8,6 +16,32 @@ const ICON_48: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/48.png"));
 const ICON_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/64.png"));
 const ICON_128: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/128.png"));
 const ICON_256: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/256.png"));
+
+/// Asset source serving the icon embedded in the binary.
+///
+/// GPUI resolves `svg()` and `img()` paths through the application's asset
+/// source, so exposing the icon here keeps it usable without shipping a file
+/// next to the executable.
+pub struct Assets;
+
+impl gpui::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        let bytes = match path {
+            SVG_ASSET => SVG,
+            PNG_ASSET => ICON_256,
+            _ => return Ok(None),
+        };
+        Ok(Some(std::borrow::Cow::Borrowed(bytes)))
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
+        Ok(if path.is_empty() {
+            vec![SVG_ASSET.into(), PNG_ASSET.into()]
+        } else {
+            Vec::new()
+        })
+    }
+}
 
 /// Install application icons into the user-local icon theme.
 ///

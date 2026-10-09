@@ -9,6 +9,7 @@ pub enum TrayEvent {
     ShowEditServers,
     ShowPacSettings,
     ShowStartupSettings,
+    ShowAbout,
     SetSystemProxy(SystemProxyMode),
     SetPacRuleMode(PacRuleMode),
     UpdatePacRules,
@@ -420,6 +421,14 @@ impl ksni::Tray for LinuxTray {
                 ..Default::default()
             }
             .into(),
+            StandardItem {
+                label: t!("tray.about").to_string(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.event_tx.send(TrayEvent::ShowAbout);
+                }),
+                ..Default::default()
+            }
+            .into(),
             MenuItem::Separator,
             StandardItem {
                 label: t!("tray.quit").to_string(),
@@ -682,6 +691,10 @@ fn build_native_menu(
         TrayEvent::ShowStartupSettings,
     );
 
+    // ── About ─────────────────────────────────────────────────────────────
+    let about = MenuItem::new(&t!("tray.about").to_string(), true, None);
+    ids.insert(about.id().clone(), TrayEvent::ShowAbout);
+
     // ── Quit ─────────────────────────────────────────────────────────────
     let quit = MenuItem::new(&t!("tray.quit").to_string(), true, None);
     ids.insert(quit.id().clone(), TrayEvent::QuitApp);
@@ -697,6 +710,7 @@ fn build_native_menu(
         &servers_sub,
         &PredefinedMenuItem::separator(),
         &startup_settings,
+        &about,
         &PredefinedMenuItem::separator(),
         &quit,
     ])

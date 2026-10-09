@@ -37,6 +37,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [build-dependencies]
 resvg = "0.44"
+# Compiles the generated `icon.ico` into the Windows executable's resources.
+embed-resource = "3"
 
 # Enables `#[gpui::test]` + `TestAppContext` for headless UI/state tests.
 # The feature only affects test builds; it never reaches a release binary.

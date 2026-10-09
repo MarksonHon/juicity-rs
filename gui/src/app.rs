@@ -1090,6 +1090,12 @@ impl AppView {
                 })
                 .detach();
             }
+            TrayEvent::ShowAbout => {
+                cx.spawn(async move |_this, cx| {
+                    let _ = cx.update(|app| crate::about_dialog::open(app));
+                })
+                .detach();
+            }
             TrayEvent::SetSystemProxy(mode) => {
                 self.gui.config.system_proxy_mode = mode;
                 let _ = self.flush_and_record();
@@ -1797,7 +1803,10 @@ fn apply_autostart(state: &RuntimeState) -> anyhow::Result<()> {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    gpui::Application::new().run(|cx: &mut App| {
+    // The embedded icon doubles as the asset source, so `svg()`/`img()` can
+    // resolve it without a file next to the executable.
+    let app = gpui::Application::new().with_assets(crate::icon::Assets);
+    app.run(|cx: &mut App| {
         crate::icon::install();
         gpui_component::init(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

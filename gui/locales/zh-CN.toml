@@ -76,6 +76,7 @@ stop_proxy = "停止代理"
 status_running = "▶ 运行中 — %{name}"
 status_stopped = "■ 已停止"
 startup_settings = "启动设置..."
+about = "关于 Juicity GUI..."
 
 [proxy]
 disable = "禁用"
@@ -116,6 +117,14 @@ autostart_desc = "系统启动时自动运行本程序"
 yes = "是"
 no = "否"
 save = "保存"
+
+[about_dialog]
+title = "关于 Juicity GUI"
+app_name = "Juicity GUI"
+label_version = "版本"
+label_build = "构建"
+label_shadowsocks = "Shadowsocks-Rust"
+label_juicity = "Juicity-RS"
 
 [protocol]
 juicity = "Juicity"

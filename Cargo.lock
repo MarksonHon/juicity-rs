@@ -4133,6 +4133,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "directories",
+ "embed-resource",
  "gpui",
  "gpui-component",
  "image",
