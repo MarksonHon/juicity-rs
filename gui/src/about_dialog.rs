@@ -6,12 +6,13 @@
 //! Juicity-RS backend (`juicity-client`).
 
 use crate::icon;
-use gpui::prelude::*;
-use gpui::{
-    div, px, rgb, size, svg, App, Bounds, ClickEvent, Context, ElementId, FontWeight, SharedString,
+use crate::widgets;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::prelude::*;
+use gpui_kit::{
+    div, img, px, size, App, Bounds, ClickEvent, Context, ElementId, FontWeight, SharedString,
     Window, WindowBounds, WindowOptions,
 };
-use gpui_component::button::{Button, ButtonVariants};
 use rust_i18n::t;
 
 /// Versions reported by the dialog.  The dependency versions are injected by
@@ -68,7 +69,7 @@ pub fn open(cx: &mut App) {
                 window.set_window_title(&t!("about_dialog.title"));
                 window.set_app_id("io.juicity.gui");
                 let dialog = cx.new(|_cx| AboutDialog);
-                cx.new(|cx| gpui_component::Root::new(dialog, window, cx))
+                cx.new(|cx| gpui_kit::base::Root::new(dialog, window, cx))
             },
         )
         .ok();
@@ -92,16 +93,17 @@ impl AboutDialog {
 impl Render for AboutDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.weak_entity();
+        let colors = widgets::palette(cx);
         let versions = Versions::current();
 
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0xffffff))
+            .bg(colors.background)
             .child(
                 div()
-                    .flex_grow()
+                    .flex_grow(1.)
                     .flex()
                     .flex_col()
                     .items_center()
@@ -110,17 +112,18 @@ impl Render for AboutDialog {
                     .px_6()
                     .py_5()
                     .child(
-                        svg()
-                            .path(icon::SVG_ASSET)
+                        // `svg()` only paints a monochrome alpha mask, which would
+                        // flatten the logo's gradients; the embedded PNG keeps the
+                        // full-colour artwork intact.
+                        img(icon::PNG_ASSET)
                             .w(px(112.))
-                            .h(px(112.))
-                            .text_color(rgb(0x0ea5e9)),
+                            .h(px(112.)),
                     )
                     .child(
                         div()
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x24292f))
+                            .text_color(colors.foreground)
                             .child(t!("about_dialog.app_name").to_string()),
                     )
                     .child(
@@ -130,18 +133,22 @@ impl Render for AboutDialog {
                             .flex_col()
                             .gap_2()
                             .child(row(
+                                colors,
                                 t!("about_dialog.label_version").to_string(),
                                 versions.app.to_string(),
                             ))
                             .child(row(
+                                colors,
                                 t!("about_dialog.label_build").to_string(),
                                 versions.build(),
                             ))
                             .child(row(
+                                colors,
                                 t!("about_dialog.label_shadowsocks").to_string(),
                                 versions.shadowsocks.to_string(),
                             ))
                             .child(row(
+                                colors,
                                 t!("about_dialog.label_juicity").to_string(),
                                 versions.juicity.to_string(),
                             )),
@@ -155,9 +162,9 @@ impl Render for AboutDialog {
                     .px_3()
                     .py_2()
                     .border_t_1()
-                    .border_color(rgb(0xd0d7de))
-                    .bg(rgb(0xf6f8fa))
-                    .child(div().flex_grow())
+                    .border_color(colors.border)
+                    .bg(colors.panel)
+                    .child(div().flex_grow(1.))
                     .child(btn(
                         "about-ok",
                         t!("btn.ok").to_string(),
@@ -171,7 +178,7 @@ impl Render for AboutDialog {
 }
 
 /// One left-aligned `label: value` row for the About dialog details block.
-fn row(label: String, value: String) -> impl IntoElement {
+fn row(colors: widgets::Palette, label: String, value: String) -> impl IntoElement {
     div()
         .w_full()
         .flex()
@@ -183,20 +190,20 @@ fn row(label: String, value: String) -> impl IntoElement {
                 .w(px(160.))
                 .text_left()
                 .text_sm()
-                .text_color(rgb(0x57606a))
+                .text_color(colors.muted_foreground)
                 .child(label),
         )
         .child(
             div()
-                .flex_grow()
+                .flex_grow(1.)
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(0x24292f))
+                .text_color(colors.foreground)
                 .child(value),
         )
 }
 
-/// Build a gpui-component `Button`.
+/// Build a gpui-kit `Button`.
 fn btn(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,

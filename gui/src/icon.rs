@@ -17,29 +17,33 @@ const ICON_64: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/64.png"));
 const ICON_128: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/128.png"));
 const ICON_256: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/256.png"));
 
-/// Asset source serving the icon embedded in the binary.
+/// Asset source serving the application icon plus the bundled gpui-kit assets.
 ///
 /// GPUI resolves `svg()` and `img()` paths through the application's asset
 /// source, so exposing the icon here keeps it usable without shipping a file
-/// next to the executable.
+/// next to the executable. Every other path — notably the Lucide icon set used
+/// by gpui-kit components, such as the Select chevron — is delegated to the
+/// bundled gpui-kit assets.
 pub struct Assets;
 
-impl gpui::AssetSource for Assets {
-    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+impl gpui_kit::AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
         let bytes = match path {
             SVG_ASSET => SVG,
             PNG_ASSET => ICON_256,
-            _ => return Ok(None),
+            _ => return gpui_kit::AssetSource::load(&gpui_kit::assets::Assets, path),
         };
         Ok(Some(std::borrow::Cow::Borrowed(bytes)))
     }
 
-    fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
-        Ok(if path.is_empty() {
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<gpui_kit::SharedString>> {
+        let mut names = if path.is_empty() {
             vec![SVG_ASSET.into(), PNG_ASSET.into()]
         } else {
             Vec::new()
-        })
+        };
+        names.extend(gpui_kit::AssetSource::list(&gpui_kit::assets::Assets, path)?);
+        Ok(names)
     }
 }
 
