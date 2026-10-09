@@ -723,11 +723,29 @@ async fn handle_non_quic_underlay_packet(
     // ── New session: auth, decrypt, create endpoint+relay, then insert ──
     let mut salt = [0u8; consts::UNDERLAY_SALT_LEN];
     salt.copy_from_slice(&payload[..consts::UNDERLAY_SALT_LEN]);
-    let auth = match in_flight.evict(&salt).await {
-        Some(auth) => auth,
+    let (auth, cipher) = match in_flight
+        .evict(&salt, |auth| {
+            // Keep auth available until a packet proves possession of its PSK.
+            let subkey = juicity_underlay::derive_subkey(&auth.psk, &salt)
+                .expect("derive_subkey failed: invalid PSK length");
+            let cipher = UnderlayCipher::from_subkey(&subkey);
+            if let Err(e) = cipher.decrypt_in_place(&mut payload) {
+                tracing::debug!(
+                    "drop first underlay packet from {} for target {}: {:?}",
+                    source,
+                    auth.metadata.target_addr(),
+                    e
+                );
+                return None;
+            }
+            Some(cipher)
+        })
+        .await
+    {
+        Some(verified) => verified,
         None => {
             tracing::debug!(
-                "drop non-QUIC packet from {}: missing in-flight underlay auth",
+                "drop non-QUIC packet from {}: missing or invalid in-flight underlay auth",
                 source
             );
             return Ok(());
@@ -739,23 +757,7 @@ async fn handle_non_quic_underlay_packet(
         return Ok(());
     }
 
-    // Derive subkey directly via HKDF-SHA1.
-    // Salt is random per UDP packet, so caching (PSK, salt) → subkey would
-    // have near-zero hit rate.  Skip the cache and derive each time.
-    let subkey = juicity_underlay::derive_subkey(&auth.psk, &salt)
-        .expect("derive_subkey failed: invalid PSK length");
-    let cipher = Arc::new(UnderlayCipher::from_subkey(&subkey));
-
-    // In-place decrypt (plaintext at &payload[SALT_LEN..])
-    if let Err(e) = cipher.decrypt_in_place(&mut payload) {
-        tracing::debug!(
-            "drop first underlay packet from {} for target {}: {:?}",
-            source,
-            auth.metadata.target_addr(),
-            e
-        );
-        return Ok(());
-    }
+    let cipher = Arc::new(cipher);
     let target = auth.metadata.target_addr();
 
     // ── Create UDP endpoint and spawn relay-back task BEFORE inserting session ──

@@ -20,6 +20,64 @@ async fn failing_dns_lookup_does_not_block_next_lookup() {
         .is_empty());
 }
 
+#[tokio::test]
+async fn invalid_underlay_packet_does_not_consume_auth() {
+    use crate::underlay_socket::UnderlayPacket;
+
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    let server_socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+    let salt = [0u8; 32];
+    let psk = vec![0x42; 32];
+    let in_flight = Arc::new(crate::inflight::InFlightUnderlayKey::new(
+        Duration::from_secs(1),
+        Duration::from_millis(100),
+    ));
+    in_flight.store(
+        salt,
+        protocol::UnderlayAuth {
+            iv: salt,
+            psk: psk.clone(),
+            metadata: protocol::ProxyMetadata {
+                network: protocol::Network::Udp,
+                hostname: "127.0.0.1".to_owned(),
+                port: target_addr.port(),
+                uuid: Uuid::nil(),
+            },
+            uuid: Uuid::nil(),
+        },
+    );
+    let pool = Arc::new(crate::udp::UdpEndpointPool::new(16));
+    let sessions = Arc::new(Cache::new(16));
+    let valid = juicity_underlay::encrypt_udp(&psk, b"authenticated payload", &salt).unwrap();
+    let mut invalid = valid.clone();
+    *invalid.last_mut().unwrap() ^= 1;
+    for payload in [invalid, valid] {
+        handle_non_quic_underlay_packet(
+            UnderlayPacket { peer, payload },
+            in_flight.clone(),
+            pool.clone(),
+            sessions.clone(),
+            server_socket.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    let mut buf = [0u8; 128];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), target.recv_from(&mut buf))
+        .await
+        .expect("valid packet must still be relayed after a forged packet")
+        .unwrap();
+    assert_eq!(&buf[..n], b"authenticated payload");
+    if let Some(session) = sessions.get(&peer) {
+        if let Some(abort) = session.relay_abort {
+            abort.abort();
+        }
+    }
+}
+
 #[test]
 fn cancelled_and_timed_out_dns_lookups_release_key_and_wake_waiter() {
     use std::task::Poll;
