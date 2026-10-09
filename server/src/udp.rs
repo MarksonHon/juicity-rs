@@ -15,8 +15,8 @@ pub(crate) async fn relay_responses<W: AsyncWrite + Unpin>(
     remote: &tokio::net::UdpSocket,
     writer: &mut W,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; consts::ETHERNET_MTU];
-    let mut frame = Vec::with_capacity(264 + consts::ETHERNET_MTU);
+    let mut buf = vec![0u8; 65535];
+    let mut frame = Vec::with_capacity(264 + buf.len());
 
     loop {
         match tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, remote.recv_from(&mut buf)).await {
