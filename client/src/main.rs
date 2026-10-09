@@ -1,7 +1,3 @@
-pub mod client;
-pub mod forwarder;
-pub mod local;
-
 // Use Jemalloc for glibc/macOS; fall back to mimalloc for musl targets where
 // jemalloc has known compatibility issues with musl's TLS and libc internals.
 // On Windows, use the system allocator (no custom #[global_allocator]).
@@ -14,6 +10,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Parser, Subcommand};
+use juicity_client::{client, forwarder, local};
 use juicity_common::config::Config;
 use juicity_common::link;
 use juicity_common::BuildInfo;
@@ -81,9 +78,7 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     // Install the default rustls CryptoProvider (aws-lc-rs)
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install default rustls CryptoProvider");
+    juicity_client::install_default_crypto_provider();
 
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get())

@@ -31,7 +31,7 @@ gui/                  # Optional GUI front-end (desktop tray app)
 | Crate | Key types |
 |-------|-----------|
 | [`juicity-common`](common/src/lib.rs) | `Config`, `protocol` (wire format), `crypto` (AES-GCM, ChaCha20-Poly1305, cert chain hash), `consts`, `link` |
-| [`juicity-client`](client/src/main.rs) | `JuicityClient` (QUIC+auth), `LocalServer` (SOCKS5/HTTP), `Forwarder` (TCP/UDP) |
+| [`juicity-client`](client/src/lib.rs) | `JuicityClient` (QUIC+auth), `LocalServer` (SOCKS5/HTTP), `Forwarder` (TCP/UDP) |
 | [`juicity-server`](server/src/lib.rs) | `JuicityServer` (listener+relay), `Dialer`, `InFlightUnderlayKey`, `UdpEndpointPool`, `DemuxUdpSocket` |
 
 Docker server packaging, Compose usage, and release publication: [Docker guide](docker/README.md).

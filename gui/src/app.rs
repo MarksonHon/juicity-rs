@@ -475,7 +475,7 @@ impl AppView {
                 f.update(cx, |s, scx| s.set_value(p.group.unwrap_or_default(), window, scx));
             }
         }
-        let port = extract_port(&self.gui.config.socks_listen);
+        let port = extract_port(&self.gui.config.mixed_listen);
         if let Some(f) = &self.proxy_port {
             f.update(cx, |s, scx| s.set_value(port.to_string(), window, scx));
         }
@@ -643,10 +643,10 @@ impl AppView {
                 p.timeout = timeout_v;
                 p.group = non_empty_text(&group);
             }
-            let (addr, _) = crate::util::split_host_port(&g.config.socks_listen);
+            let (addr, _) = crate::util::split_host_port(&g.config.mixed_listen);
             let new_listen = crate::util::format_host_port(addr, proxy_port_v);
-            listen_changed = new_listen != g.config.socks_listen;
-            g.config.socks_listen = new_listen;
+            listen_changed = new_listen != g.config.mixed_listen;
+            g.config.mixed_listen = new_listen;
             g.runtime.close_to_tray = self.close_to_tray;
         }
         if listen_changed {
@@ -655,8 +655,9 @@ impl AppView {
         true
     }
 
-    /// The local SOCKS/HTTP port changed: regenerate the PAC, re-point the
-    /// system proxy and restart the core so everything uses the new port.
+    /// The local mixed (SOCKS5 + HTTP) port changed: regenerate the PAC,
+    /// re-point the system proxy and restart the core so everything uses the
+    /// new port.
     fn apply_listen_change(&mut self, cx: &mut Context<Self>) {
         let _ = self.flush_and_record();
         let _ = restart_pac_server(&mut self.gui, false);
@@ -951,18 +952,8 @@ impl AppView {
         }
     }
 
-    /// Protocol whose local proxy ports the system proxy should point at:
-    /// the running core if any, otherwise the selected profile.
-    fn system_proxy_protocol(&self) -> ProxyProtocol {
-        self.gui
-            .core_manager
-            .current_protocol()
-            .or_else(|| self.gui.selected_profile().map(|p| p.protocol))
-            .unwrap_or_default()
-    }
-
     fn apply_system_proxy_now(&self) -> anyhow::Result<()> {
-        system_proxy::apply_system_proxy(&self.gui.config, self.system_proxy_protocol())
+        system_proxy::apply_system_proxy(&self.gui.config)
     }
 
     /// Stop the core and restore the OS proxy settings so quitting never
@@ -972,7 +963,7 @@ impl AppView {
         if self.gui.config.system_proxy_mode != SystemProxyMode::Disable {
             let mut cfg = self.gui.config.clone();
             cfg.system_proxy_mode = SystemProxyMode::Disable;
-            if let Err(err) = system_proxy::apply_system_proxy(&cfg, self.system_proxy_protocol()) {
+            if let Err(err) = system_proxy::apply_system_proxy(&cfg) {
                 tracing::warn!("failed to restore system proxy on exit: {err}");
             }
         }
@@ -1255,11 +1246,11 @@ impl AppView {
             }
         }
 
-        // Poll the core process status.
+        // Poll the embedded core status.
         match self.gui.core_manager.poll() {
-            Ok(Some(exit)) => {
+            Ok(Some(reason)) => {
                 self.announced_running = false;
-                self.set_status(&t!("status.core_exited", code = exit.to_string()), cx);
+                self.set_status(&t!("status.core_exited", reason = reason), cx);
                 if let Ok(mut ts) = self.tray_shared.lock() {
                     ts.is_running = false;
                     ts.active_server_name = String::new();

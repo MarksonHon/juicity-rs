@@ -104,7 +104,7 @@ pub fn restart_pac_server(state: &mut GuiState, force_restart: bool) -> anyhow::
     let (direct, proxy) = pac::load_rules(&state.storage.paths().config_dir);
     let content = pac::generate_pac(
         state.config.pac_rule_mode,
-        &state.config.socks_listen,
+        &state.config.mixed_listen,
         &direct,
         &proxy,
     );

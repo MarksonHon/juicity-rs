@@ -194,10 +194,16 @@ impl Default for ProxyProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    pub juicity_client_path: Option<PathBuf>,
-    pub ss_local_path: Option<PathBuf>,
-    pub socks_listen: String,
-    pub http_listen: String,
+    /// Single local inbound shared by every protocol.
+    ///
+    /// It speaks both SOCKS5 and HTTP proxy on the same port (a "mixed"
+    /// inbound) by inspecting the first byte of each connection, so the OS
+    /// proxy settings, PAC and the core all point at one address.
+    ///
+    /// The `socks_listen` alias keeps configs written before the mixed
+    /// inbound existed loading unchanged.
+    #[serde(alias = "socks_listen")]
+    pub mixed_listen: String,
     pub system_proxy_mode: SystemProxyMode,
     pub pac_mode: PacMode,
     pub pac_rule_mode: PacRuleMode,
@@ -212,26 +218,10 @@ pub struct AppConfig {
     pub pac_auto_update_hours: u32,
 }
 
-impl AppConfig {
-    /// Address of the local HTTP proxy for the given core.
-    ///
-    /// juicity-client serves SOCKS5 and HTTP on the same port, so it reuses
-    /// `socks_listen`; the Shadowsocks core gets a dedicated HTTP listener.
-    pub fn http_proxy_addr(&self, protocol: ProxyProtocol) -> &str {
-        match protocol {
-            ProxyProtocol::Juicity => &self.socks_listen,
-            ProxyProtocol::Shadowsocks => &self.http_listen,
-        }
-    }
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            juicity_client_path: None,
-            ss_local_path: None,
-            socks_listen: "127.0.0.1:1080".to_string(),
-            http_listen: "127.0.0.1:1081".to_string(),
+            mixed_listen: "127.0.0.1:1080".to_string(),
             system_proxy_mode: SystemProxyMode::Disable,
             pac_mode: PacMode::Local,
             pac_rule_mode: PacRuleMode::BypassChina,
@@ -431,9 +421,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_proxy_addr_follows_protocol() {
-        let cfg = AppConfig::default();
-        assert_eq!(cfg.http_proxy_addr(ProxyProtocol::Juicity), cfg.socks_listen);
-        assert_eq!(cfg.http_proxy_addr(ProxyProtocol::Shadowsocks), cfg.http_listen);
+    fn mixed_listen_defaults_to_1080() {
+        assert_eq!(AppConfig::default().mixed_listen, "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn legacy_socks_listen_field_is_still_accepted() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"socks_listen":"127.0.0.1:2080"}"#).unwrap();
+        assert_eq!(cfg.mixed_listen, "127.0.0.1:2080");
+    }
+
+    #[test]
+    fn legacy_http_listen_field_is_ignored() {
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"socks_listen":"127.0.0.1:2080","http_listen":"127.0.0.1:2081"}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mixed_listen, "127.0.0.1:2080");
     }
 }
