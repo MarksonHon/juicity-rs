@@ -22,7 +22,10 @@ pub(crate) async fn relay_responses<W: AsyncWrite + Unpin>(
         match tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, remote.recv_from(&mut buf)).await {
             Ok(Ok((n, addr))) => {
                 frame.clear();
-                let response_addr = protocol::CachedAddr::from_socket_addr(addr);
+                let response_addr = protocol::CachedAddr::from_socket_addr(SocketAddr::new(
+                    addr.ip().to_canonical(),
+                    addr.port(),
+                ));
                 protocol::build_trojanc_addr_cached(&mut frame, &response_addr)?;
                 frame.extend_from_slice(&(n as u16).to_be_bytes());
                 frame.extend_from_slice(&buf[..n]);
@@ -333,5 +336,42 @@ mod tests {
         assert!(result
             .expect_err("aborted relay task should be cancelled")
             .is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn relay_responses_preserves_large_ipv4_replies_on_dual_stack() {
+        use crate::dialer::{DefaultDialer, Dialer};
+
+        let relay = DefaultDialer.dial_udp("127.0.0.1:1").await.unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let (mut reader, mut writer) = tokio::io::duplex(65536);
+        let relay_task = tokio::spawn(async move { relay_responses(&relay, &mut writer).await });
+
+        let payload = vec![0xa5; 65507];
+        source
+            .send_to(&payload, ("127.0.0.1", relay_port))
+            .await
+            .unwrap();
+        let (host, port, actual) =
+            tokio::time::timeout(Duration::from_secs(1), read_response(&mut reader))
+                .await
+                .unwrap();
+        assert_eq!(actual, payload);
+        assert_eq!(host, source_addr.ip().to_string());
+        assert_eq!(port, source_addr.port());
+        let source_v6 = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let source_v6_addr = source_v6.local_addr().unwrap();
+        source_v6.send_to(b"native IPv6", ("::1", relay_port)).await.unwrap();
+        let (host, port, actual) =
+            tokio::time::timeout(Duration::from_secs(1), read_response(&mut reader))
+                .await
+                .unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, source_v6_addr.port());
+        assert_eq!(actual, b"native IPv6");
+        relay_task.abort();
+        let _ = relay_task.await;
     }
 }
