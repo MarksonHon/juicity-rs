@@ -351,7 +351,7 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
         }
 
         // ── Slow path: create a new session (low frequency) ──
-        let (mut send, mut recv) = match client.open_udp_stream(&host, port, &data[..]).await {
+        let (send, mut recv) = match client.open_udp_stream(&host, port, &data[..]).await {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::info!(
@@ -365,23 +365,6 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
         let session_id = session_seq.fetch_add(1, Ordering::Relaxed);
-
-        // Send the first datagram directly on the send stream (already opened above).
-        // Reuse the scratch buffer approach from the old writer task.
-        {
-            let mut addr_buf = Vec::with_capacity(32);
-            if let Err(e) =
-                JuicityClient::send_udp_datagram(&mut send, &host, port, &data[..], &mut addr_buf)
-                    .await
-            {
-                tracing::info!(
-                    error = %e,
-                    protocol = "udp",
-                    "UDP forward first datagram send error"
-                );
-                continue;
-            }
-        }
 
         sessions.insert(
             src_addr,
