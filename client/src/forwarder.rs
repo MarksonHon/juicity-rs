@@ -327,11 +327,15 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
     let cancel = CancellationToken::new();
     let _cancel_guard = cancel.clone().drop_guard();
 
-    let mut buf = vec![0u8; consts::ETHERNET_MTU];
+    let mut buf = vec![0u8; consts::MAX_UDP_PAYLOAD];
 
     // ── Single-task event loop: no per-packet spawn ──
     loop {
         let (n, src_addr) = socket.recv_from(&mut buf).await?;
+        if n > consts::MAX_UDP_PAYLOAD {
+            tracing::warn!(len = n, "Dropping oversized UDP payload");
+            continue;
+        }
         let data = Bytes::copy_from_slice(&buf[..n]);
 
         // ── Fast path: session exists, try_send (non-blocking) ──

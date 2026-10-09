@@ -278,7 +278,7 @@ async fn handle_socks5(
                 // When this task exits (any path), cancel_guard fires and cancels all
                 // session supervisors, releasing their Arc references promptly.
                 let _cancel_guard = cancel_guard;
-                let mut buf = vec![0u8; consts::ETHERNET_MTU];
+                let mut buf = vec![0u8; consts::MAX_UDP_PAYLOAD];
                 // Use a persistent sleep_until so the timer is only created once and
                 // can be reset on each received datagram without recreating the future.
                 let nat_deadline = tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT;
@@ -298,6 +298,10 @@ async fn handle_socks5(
                                         Some(v) => v,
                                         None => continue,
                                     };
+                                    if datagram.payload.len() > consts::MAX_UDP_PAYLOAD {
+                                        tracing::warn!(len = datagram.payload.len(), "Dropping oversized UDP payload");
+                                        continue;
+                                    }
 
                                     let existing = {
                                         let guard = sessions.lock().await;

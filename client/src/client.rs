@@ -13,6 +13,12 @@ struct ConnectionSlot {
     conn: Option<Connection>,
 }
 
+fn udp_packet_len(data: &[u8]) -> anyhow::Result<[u8; 2]> {
+    Ok(u16::try_from(data.len())
+        .map_err(|_| anyhow::anyhow!("UDP payload exceeds 65535 bytes"))?
+        .to_be_bytes())
+}
+
 /// A Juicity client that connects to a remote Juicity server.
 ///
 /// Maintains a pool of `pool_size` QUIC connections for stream multiplexing
@@ -484,6 +490,7 @@ impl JuicityClient {
     }
 
     /// Open a UDP stream with first datagram.
+    /// Reject payloads above 65535 bytes before connecting or writing.
     ///
     /// Wire format (upstream-compatible):
     ///   stream header:   [network=3][trojanc_addr]
@@ -494,6 +501,7 @@ impl JuicityClient {
         port: u16,
         first_packet: &[u8],
     ) -> anyhow::Result<(SendStream, RecvStream)> {
+        let pkt_len = udp_packet_len(first_packet)?;
         let conn = self.connect().await?;
         let (mut send, recv) = conn.open_bi().await?;
 
@@ -502,7 +510,6 @@ impl JuicityClient {
         //   first datagram: [trojanc_addr][len(2)][payload]
         let stream_header = protocol::build_proxy_header(protocol::NETWORK_UDP, addr, port)?;
         let dgram_addr = protocol::build_trojanc_addr(addr, port)?;
-        let pkt_len = (first_packet.len() as u16).to_be_bytes();
         let mut buf =
             Vec::with_capacity(stream_header.len() + dgram_addr.len() + 2 + first_packet.len());
         buf.extend_from_slice(&stream_header);
@@ -529,6 +536,7 @@ impl JuicityClient {
     /// The `addr_buf` is a reusable scratch buffer to avoid per-packet heap
     /// allocation. All three wire segments are batched into a single
     /// `write_all` call to minimise QUIC stream lock acquisitions.
+    /// Reject payloads above 65535 bytes without writing or changing `addr_buf`.
     pub async fn send_udp_datagram(
         send: &mut SendStream,
         addr: &str,
@@ -536,12 +544,12 @@ impl JuicityClient {
         data: &[u8],
         addr_buf: &mut Vec<u8>,
     ) -> anyhow::Result<()> {
+        let len = udp_packet_len(data)?;
         let cached = protocol::CachedAddr::from_host_port(addr, port);
         addr_buf.clear();
         protocol::build_trojanc_addr_cached(addr_buf, &cached)?;
         // Batch address header + length + payload into a single write_all
         // to reduce QUIC stream lock acquisitions from 3 to 1.
-        let len = (data.len() as u16).to_be_bytes();
         let total_len = addr_buf.len() + 2 + data.len();
         addr_buf.reserve(total_len - addr_buf.len());
         addr_buf.extend_from_slice(&len);
@@ -671,5 +679,34 @@ impl rustls::client::danger::ServerCertVerifier for PinVerify {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_client() -> JuicityClient {
+        JuicityClient::new(&Config {
+            server: "127.0.0.1:443".to_string(),
+            sni: "invalid sni".to_string(),
+            uuid: "12345678-1234-1234-1234-123456789abc".to_string(),
+            password: "test-password".to_string(),
+            allow_insecure: true,
+            ..Config::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn udp_payload_length_boundary_and_early_rejection() {
+        let data = vec![0; u16::MAX as usize + 1];
+        assert_eq!(udp_packet_len(&[]).unwrap(), [0, 0]);
+        assert_eq!(udp_packet_len(&data[..u16::MAX as usize]).unwrap(), [255, 255]);
+        assert!(udp_packet_len(&data).is_err());
+        let client = test_client().await;
+        let error = client.open_udp_stream("127.0.0.1", 53, &data).await.unwrap_err();
+        assert_eq!(error.to_string(), "UDP payload exceeds 65535 bytes");
     }
 }
