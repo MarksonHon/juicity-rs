@@ -15,6 +15,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::JuicityClient;
 
+pub(crate) async fn copy_direction<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let copied = tokio::io::copy_buf(reader, writer).await?;
+    writer.shutdown().await?;
+    Ok(copied)
+}
+
 /// Local proxy server that handles SOCKS5 and HTTP proxy.
 ///
 /// Both protocols are served on the same address: the first byte of every
@@ -202,8 +212,8 @@ async fn handle_socks5(
             let mut quic_recv = tokio::io::BufReader::with_capacity(16 * 1024, quic_recv);
 
             let (r1, r2) = tokio::join!(
-                tokio::io::copy_buf(&mut local_rx, &mut quic_send),
-                tokio::io::copy_buf(&mut quic_recv, &mut local_tx),
+                copy_direction(&mut local_rx, &mut quic_send),
+                copy_direction(&mut quic_recv, &mut local_tx),
             );
             if let Err(e) = r1 {
                 tracing::info!(error = %e, direction = "local->quic", protocol = "socks5", "SOCKS5 copy error");
@@ -211,9 +221,6 @@ async fn handle_socks5(
             if let Err(e) = r2 {
                 tracing::info!(error = %e, direction = "quic->local", protocol = "socks5", "SOCKS5 copy error");
             }
-            // Gracefully finish the send direction so quinn can clean up the stream
-            // state immediately instead of holding it until a timeout or stream reset.
-            let _ = quic_send.finish();
         }
         0x03 => {
             // UDP ASSOCIATE
@@ -724,8 +731,8 @@ async fn handle_http_connect(
     let mut quic_recv = tokio::io::BufReader::with_capacity(16 * 1024, quic_recv);
 
     let (r1, r2) = tokio::join!(
-        tokio::io::copy_buf(&mut local_rx, &mut quic_send),
-        tokio::io::copy_buf(&mut quic_recv, &mut write_half),
+        copy_direction(&mut local_rx, &mut quic_send),
+        copy_direction(&mut quic_recv, &mut write_half),
     );
     if let Err(e) = r1 {
         tracing::info!(error = %e, direction = "local->quic", protocol = "http", "HTTP CONNECT copy error");
@@ -733,9 +740,6 @@ async fn handle_http_connect(
     if let Err(e) = r2 {
         tracing::info!(error = %e, direction = "quic->local", protocol = "http", "HTTP CONNECT copy error");
     }
-    // Gracefully finish the send direction so quinn can clean up the stream
-    // state immediately instead of holding it until a timeout or stream reset.
-    let _ = quic_send.finish();
 
     Ok(())
 }
@@ -899,6 +903,41 @@ fn build_socks5_response(reply: u8, host: &str, port: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn relay_preserves_reply_after_client_half_close() {
+        let (mut client, local) = tokio::io::duplex(64);
+        let (remote, mut upstream) = tokio::io::duplex(64);
+        let relay = tokio::spawn(async move {
+            let (local_rx, mut local_tx) = tokio::io::split(local);
+            let (remote_rx, mut remote_tx) = tokio::io::split(remote);
+            let mut local_rx = tokio::io::BufReader::new(local_rx);
+            let mut remote_rx = tokio::io::BufReader::new(remote_rx);
+            tokio::try_join!(
+                copy_direction(&mut local_rx, &mut remote_tx),
+                copy_direction(&mut remote_rx, &mut local_tx),
+            ).unwrap();
+        });
+        let reply = vec![42; 4096];
+        let expected = reply.clone();
+        let exchange = async {
+            let server = tokio::spawn(async move {
+                let mut request = Vec::new();
+                upstream.read_to_end(&mut request).await.unwrap();
+                assert_eq!(request, b"request");
+                upstream.write_all(&reply).await.unwrap();
+                upstream.shutdown().await.unwrap();
+            });
+            client.write_all(b"request").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, expected);
+            server.await.unwrap();
+            relay.await.unwrap();
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), exchange).await.unwrap();
+    }
 
     fn header(line: &str) -> String {
         format!("{line}\r\n")

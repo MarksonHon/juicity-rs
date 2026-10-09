@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::JuicityClient;
+use crate::local::copy_direction;
 
 /// RAII guard: aborts the wrapped task when this guard is dropped.
 struct AbortOnDrop(tokio::task::AbortHandle);
@@ -223,8 +224,8 @@ async fn forward_tcp_connection(
     let mut quic_recv = tokio::io::BufReader::with_capacity(16 * 1024, quic_recv);
 
     let (r1, r2) = tokio::join!(
-        tokio::io::copy_buf(&mut local_rx, &mut quic_send),
-        tokio::io::copy_buf(&mut quic_recv, &mut local_tx),
+        copy_direction(&mut local_rx, &mut quic_send),
+        copy_direction(&mut quic_recv, &mut local_tx),
     );
     if let Err(e) = r1 {
         tracing::info!(
@@ -242,10 +243,6 @@ async fn forward_tcp_connection(
             "TCP forward quic->local error"
         );
     }
-
-    // Gracefully finish the send direction so quinn can clean up the stream
-    // state immediately instead of holding it until a timeout or stream reset.
-    let _ = quic_send.finish();
 
     Ok(())
 }
