@@ -15,6 +15,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::JuicityClient;
 
+const INBOUND_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_HTTP_LINE_LEN: usize = 8 * 1024;
+const MAX_HTTP_HEADERS: usize = 100;
+
 pub(crate) async fn copy_direction<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<u64>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -23,6 +27,19 @@ where
     let copied = tokio::io::copy_buf(reader, writer).await?;
     writer.shutdown().await?;
     Ok(copied)
+}
+
+async fn read_http_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> anyhow::Result<String> {
+    let mut line = String::new();
+    reader
+        .take((MAX_HTTP_LINE_LEN + 1) as u64)
+        .read_line(&mut line)
+        .await?;
+    anyhow::ensure!(line.len() <= MAX_HTTP_LINE_LEN, "HTTP header line too long");
+    anyhow::ensure!(line.ends_with('\n'), "incomplete HTTP request head");
+    Ok(line)
 }
 
 /// Local proxy server that handles SOCKS5 and HTTP proxy.
@@ -102,15 +119,18 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     client: JuicityClient,
 ) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + INBOUND_HEAD_TIMEOUT;
     let local_addr = stream.local_addr()?;
     let mut buf = [0u8; 1];
-    stream.peek(&mut buf).await?;
+    tokio::time::timeout_at(deadline, stream.peek(&mut buf))
+        .await
+        .map_err(|_| anyhow::anyhow!("inbound handshake timed out"))??;
 
     // Mixed inbound: SOCKS5 always starts with the version byte 0x05, while
     // HTTP requests start with an ASCII method name (GET, CONNECT, ...).
     match buf[0] {
-        0x05 => handle_socks5(stream, local_addr, peer_addr, client).await,
-        _ => handle_http_proxy(stream, client).await,
+        0x05 => handle_socks5(stream, local_addr, peer_addr, client, deadline).await,
+        _ => handle_http_proxy(stream, client, deadline).await,
     }
 }
 
@@ -120,64 +140,70 @@ async fn handle_socks5(
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
     client: JuicityClient,
+    deadline: tokio::time::Instant,
 ) -> anyhow::Result<()> {
-    // Handshake: read methods
-    let mut buf = [0u8; 2];
-    stream.read_exact(&mut buf).await?;
-    let n_methods = buf[1] as usize;
-    // Stack-allocate the methods buffer (max 255 bytes per SOCKS5 spec)
-    // instead of a Vec heap allocation for each connection.
-    let mut methods = [0u8; 255];
-    stream.read_exact(&mut methods[..n_methods]).await?;
-    // Accept no-auth
-    stream.write_all(&[0x05, 0x00]).await?;
+    let (cmd, host, port) = tokio::time::timeout_at(deadline, async {
+        // Handshake: read methods
+        let mut buf = [0u8; 2];
+        stream.read_exact(&mut buf).await?;
+        let n_methods = buf[1] as usize;
+        // Stack-allocate the methods buffer (max 255 bytes per SOCKS5 spec)
+        // instead of a Vec heap allocation for each connection.
+        let mut methods = [0u8; 255];
+        stream.read_exact(&mut methods[..n_methods]).await?;
+        // Accept no-auth
+        stream.write_all(&[0x05, 0x00]).await?;
 
-    // Read request
-    let mut req = [0u8; 4];
-    stream.read_exact(&mut req).await?;
-    let _ver = req[0];
-    let cmd = req[1]; // 1=CONNECT, 3=UDP ASSOCIATE
-    let _rsv = req[2];
-    let addr_type = req[3];
+        // Read request
+        let mut req = [0u8; 4];
+        stream.read_exact(&mut req).await?;
+        let _ver = req[0];
+        let cmd = req[1]; // 1=CONNECT, 3=UDP ASSOCIATE
+        let _rsv = req[2];
+        let addr_type = req[3];
 
-    let (host, port) = match addr_type {
-        0x01 => {
-            let mut ip = [0u8; 4];
-            stream.read_exact(&mut ip).await?;
-            let mut port_buf = [0u8; 2];
-            stream.read_exact(&mut port_buf).await?;
-            (
-                std::net::Ipv4Addr::from(ip).to_string(),
-                u16::from_be_bytes(port_buf),
-            )
-        }
-        0x03 => {
-            let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf).await?;
-            let len = len_buf[0] as usize;
-            // Stack-allocate the domain buffer (max 255 bytes per SOCKS5 spec)
-            // instead of a Vec heap allocation for each domain lookup.
-            let mut domain = [0u8; 255];
-            stream.read_exact(&mut domain[..len]).await?;
-            let mut port_buf = [0u8; 2];
-            stream.read_exact(&mut port_buf).await?;
-            (
-                String::from_utf8(domain[..len].to_vec())?,
-                u16::from_be_bytes(port_buf),
-            )
-        }
-        0x04 => {
-            let mut ip = [0u8; 16];
-            stream.read_exact(&mut ip).await?;
-            let mut port_buf = [0u8; 2];
-            stream.read_exact(&mut port_buf).await?;
-            (
-                std::net::Ipv6Addr::from(ip).to_string(),
-                u16::from_be_bytes(port_buf),
-            )
-        }
-        _ => anyhow::bail!("unsupported address type: {}", addr_type),
-    };
+        let (host, port) = match addr_type {
+            0x01 => {
+                let mut ip = [0u8; 4];
+                stream.read_exact(&mut ip).await?;
+                let mut port_buf = [0u8; 2];
+                stream.read_exact(&mut port_buf).await?;
+                (
+                    std::net::Ipv4Addr::from(ip).to_string(),
+                    u16::from_be_bytes(port_buf),
+                )
+            }
+            0x03 => {
+                let mut len_buf = [0u8; 1];
+                stream.read_exact(&mut len_buf).await?;
+                let len = len_buf[0] as usize;
+                // Stack-allocate the domain buffer (max 255 bytes per SOCKS5 spec)
+                // instead of a Vec heap allocation for each domain lookup.
+                let mut domain = [0u8; 255];
+                stream.read_exact(&mut domain[..len]).await?;
+                let mut port_buf = [0u8; 2];
+                stream.read_exact(&mut port_buf).await?;
+                (
+                    String::from_utf8(domain[..len].to_vec())?,
+                    u16::from_be_bytes(port_buf),
+                )
+            }
+            0x04 => {
+                let mut ip = [0u8; 16];
+                stream.read_exact(&mut ip).await?;
+                let mut port_buf = [0u8; 2];
+                stream.read_exact(&mut port_buf).await?;
+                (
+                    std::net::Ipv6Addr::from(ip).to_string(),
+                    u16::from_be_bytes(port_buf),
+                )
+            }
+            _ => anyhow::bail!("unsupported address type: {}", addr_type),
+        };
+        Ok::<_, anyhow::Error>((cmd, host, port))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out"))??;
 
     match cmd {
         0x01 => {
@@ -651,38 +677,42 @@ fn build_socks5_udp_packet(addr: &str, port: u16, payload: &[u8]) -> Vec<u8> {
 ///   proxying. The target is rewritten to origin-form and the upstream
 ///   connection is asked to close after the response, which gives the relay a
 ///   well-defined end even for close-delimited bodies.
-async fn handle_http_proxy(stream: TcpStream, client: JuicityClient) -> anyhow::Result<()> {
+async fn handle_http_proxy(
+    stream: TcpStream,
+    client: JuicityClient,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::with_capacity(8 * 1024, read_half);
 
-    // ── Request line ──
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).await? == 0 {
-        anyhow::bail!("empty HTTP request");
-    }
+    let (method, target, version, headers) = tokio::time::timeout_at(deadline, async {
+        // ── Request line ──
+        let request_line = read_http_line(&mut reader).await?;
 
-    let mut parts = request_line.split_whitespace();
-    let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
-    else {
-        write_half
-            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-            .await?;
-        anyhow::bail!("invalid HTTP request line: {}", request_line.trim());
-    };
-    let (method, target, version) = (method.to_string(), target.to_string(), version.to_string());
+        let mut parts = request_line.split_whitespace();
+        let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next())
+        else {
+            write_half
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await?;
+            anyhow::bail!("invalid HTTP request line: {}", request_line.trim());
+        };
+        let (method, target, version) = (method.to_string(), target.to_string(), version.to_string());
 
-    // ── Headers ──
-    let mut headers = Vec::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
-            break;
+        // ── Headers ──
+        let mut headers = Vec::new();
+        loop {
+            let line = read_http_line(&mut reader).await?;
+            if line.trim().is_empty() {
+                break;
+            }
+            anyhow::ensure!(headers.len() < MAX_HTTP_HEADERS, "too many HTTP headers");
+            headers.push(line);
         }
-        if line.trim().is_empty() {
-            break;
-        }
-        headers.push(line);
-    }
+        Ok::<_, anyhow::Error>((method, target, version, headers))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("HTTP request head timed out"))??;
 
     if method == "CONNECT" {
         return handle_http_connect(reader, write_half, &target, client).await;
@@ -937,6 +967,16 @@ mod tests {
             relay.await.unwrap();
         };
         tokio::time::timeout(std::time::Duration::from_secs(2), exchange).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_line_limit_bounds_unterminated_input() {
+        let at_limit = format!("{}\r\n", "a".repeat(MAX_HTTP_LINE_LEN - 2));
+        assert_eq!(read_http_line(&mut at_limit.as_bytes()).await.unwrap(), at_limit);
+        let over_limit = format!("{}\r\n", "a".repeat(MAX_HTTP_LINE_LEN - 1));
+        assert!(read_http_line(&mut over_limit.as_bytes()).await.is_err());
+        let unterminated = "a".repeat(MAX_HTTP_LINE_LEN + 1);
+        assert!(read_http_line(&mut unterminated.as_bytes()).await.is_err());
     }
 
     fn header(line: &str) -> String {
