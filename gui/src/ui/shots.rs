@@ -95,10 +95,10 @@ fn fixture(window: &MainWindow) {
     settings.set_update_hours(24);
     settings.set_pac_listen("127.0.0.1:1090".into());
     settings.set_versions(Versions {
-        gui: "1.0.3".into(),
-        juicity: "1.0.3".into(),
+        gui: "1.1.0".into(),
+        juicity: "1.1.0".into(),
         shadowsocks: "1.24.0".into(),
-        tag: "v1.0.3".into(),
+        tag: "v1.1.0".into(),
         commit: "4c4f9f0".into(),
     });
     logs_fixture(window);
@@ -114,7 +114,7 @@ fn logs_fixture(window: &MainWindow) {
         message: message.into(),
     };
     let lines = vec![
-        line("00:00:00", Level::INFO, "juicity_gui", "juicity-gui 1.0.3 starting"),
+        line("00:00:00", Level::INFO, "juicity_gui", "juicity-gui 1.1.0 starting"),
         line("00:00:00", Level::INFO, "juicity_gui::pac", "PAC server listening on 127.0.0.1:1090"),
         line("00:00:01", Level::INFO, "juicity_gui::core", "starting in-process Juicity core for profile Tokyo 01"),
         line("00:00:01", Level::INFO, "juicity_client", "listening on 127.0.0.1:1080 (SOCKS5 / HTTP)"),
