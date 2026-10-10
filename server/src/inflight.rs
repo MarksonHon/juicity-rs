@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use juicity_common::consts;
@@ -10,31 +9,19 @@ use tokio::sync::Notify;
 /// In-flight key type (32 bytes salt)
 pub type InFlightKey = [u8; 32];
 
-/// Manages underlay authentication keys that are in-flight (waiting for their
-/// corresponding UDP packets).
-///
-/// Each key has its own [`Notify`] so that [`store`](Self::store) only wakes
-/// tasks waiting for the exact key that was inserted — avoiding the thundering
-/// herd problem of a single shared Notify.
-///
-/// # Lock design
-///
-/// This implementation uses [`std::sync::Mutex<HashMap>`] internally. The lock
-/// is only held briefly for lookups, inserts, and removes — no `.await` point
-/// is ever held under the lock. The per-key [`Notify`] mechanism handles the
-/// actual blocking, so concurrent accesses to different keys do not contend.
+/// Matches UDP packets to auth received on the authenticated QUIC stream.
+/// Packets can arrive first, so bounded per-key waiters have separate capacity
+/// from authenticated entries. No lock is held across an await.
 pub struct InFlightUnderlayKey {
     ttl: Duration,
     evict_timeout: Duration,
-    map: Mutex<HashMap<InFlightKey, InFlightEntry>>,
+    map: Mutex<InFlightState>,
 }
 
-/// Single-map entry combining auth data, insertion timestamp and a per-key
-/// [`Notify`] for cache locality.
-struct InFlightEntry {
-    auth: Option<UnderlayAuth>,
-    inserted_at: Instant,
-    notify: Arc<Notify>,
+#[derive(Default)]
+struct InFlightState {
+    auth: HashMap<InFlightKey, (UnderlayAuth, Instant)>,
+    waiting: HashMap<InFlightKey, (Arc<Notify>, Instant)>,
 }
 
 impl InFlightUnderlayKey {
@@ -43,154 +30,94 @@ impl InFlightUnderlayKey {
         Self {
             ttl,
             evict_timeout,
-            map: Mutex::new(HashMap::new()),
+            map: Mutex::new(InFlightState::default()),
         }
     }
 
-    /// Store an authentication for later retrieval.
-    ///
-    /// If a task is already waiting for this key (via `evict`), its per-key
-    /// [`Notify`] is fired so it can wake up and consume the value immediately.
-    ///
-    /// If the number of in-flight entries already equals
-    /// `MAX_IN_FLIGHT_UNDERLAY_ENTRIES`, expired entries are evicted first.
-    /// If the map is still full after eviction, the new entry is silently
-    /// dropped to prevent unbounded memory growth during a burst of forged or
-    /// unanswered underlay auth packets.
+    /// Store auth and wake packets waiting for this salt. Expired auth is
+    /// reclaimed at capacity; unauthenticated waiters cannot exhaust this cap.
     pub fn store(&self, key: InFlightKey, auth: UnderlayAuth) {
-        let mut map = match self.map.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        // Fast path: key already exists — atomically update and notify.
-        if let Some(entry) = map.get_mut(&key) {
-            entry.auth = Some(auth);
-            entry.notify.notify_waiters();
-            return;
-        }
-
-        // New entry: enforce capacity limit (approximate check).
-        if map.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
-            let now = Instant::now();
-            let ttl = self.ttl;
-            map.retain(|_, e| now.duration_since(e.inserted_at) <= ttl);
-            if map.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
+        let now = Instant::now();
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if !map.auth.contains_key(&key) && map.auth.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES
+        {
+            map.auth
+                .retain(|_, (_, inserted_at)| now.duration_since(*inserted_at) <= self.ttl);
+            if map.auth.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
                 tracing::warn!(
                     "in-flight underlay auth table is full ({} entries); dropping new entry",
-                    map.len()
+                    map.auth.len()
                 );
                 return;
             }
         }
-
-        // Insert the new entry.
-        use std::collections::hash_map::Entry;
-        match map.entry(key) {
-            Entry::Occupied(mut entry) => {
-                entry.get_mut().auth = Some(auth);
-                entry.get().notify.notify_waiters();
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(InFlightEntry {
-                    notify: Arc::new(Notify::new()),
-                    auth: Some(auth),
-                    inserted_at: Instant::now(),
-                });
-            }
+        map.auth.insert(key, (auth, now));
+        if let Some((notify, _)) = map.waiting.remove(&key) {
+            notify.notify_waiters();
         }
     }
 
-    /// Evict and retrieve an authentication using a per-key [`Notify`] for
-    /// zero-latency wakeup.
-    ///
-    /// If the key is already present, it is removed and returned immediately.
-    /// Otherwise a placeholder entry with a dedicated [`Notify`] is inserted,
-    /// and the caller waits for that Notify.  When [`store`](Self::store)
-    /// eventually fills in the value, only the task(s) waiting for this
-    /// *exact* key are woken — eliminating the thundering herd.
-    pub async fn evict(&self, key: &InFlightKey) -> Option<UnderlayAuth> {
-        // Obtain (or create) the per-key Notify while holding the lock,
-        // then drop the lock before any `.await` to avoid deadlock.
-        let notify = {
-            let mut map = match self.map.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-
-            match map.get_mut(key) {
-                Some(entry) => {
-                    if let Some(auth) = entry.auth.take() {
-                        // Value already present — consume immediately.
-                        // The mutable reference is implicitly dropped before remove.
-                        map.remove(key);
-                        return Some(auth);
-                    }
-                    // Entry exists but value not yet stored — clone its Notify
-                    // and wait (the mutex lock is released when the guard drops).
-                    entry.notify.clone()
-                }
-                None => {
-                    // No entry yet — create a placeholder and wait.
-                    let notify = Arc::new(Notify::new());
-                    map.insert(
-                        *key,
-                        InFlightEntry {
-                            notify: notify.clone(),
-                            auth: None,
-                            inserted_at: Instant::now(),
-                        },
-                    );
-                    notify
-                }
-            }
-        };
-
-        // Wait for notification with a short timeout to handle keys that are
-        // never stored (e.g. a forged salt that no corresponding UDP packet
-        // will complete).
-        let deadline = Instant::now() + self.evict_timeout;
+    /// Wait for auth, then consume it only if `authenticate` succeeds.
+    /// The callback runs under the lock so concurrent packets cannot reuse auth.
+    /// It must not block or re-enter this table.
+    pub async fn evict<T>(
+        &self,
+        key: &InFlightKey,
+        authenticate: impl FnOnce(&UnderlayAuth) -> Option<T>,
+    ) -> Option<(UnderlayAuth, T)> {
+        let deadline = tokio::time::Instant::now() + self.evict_timeout;
         loop {
-            tokio::select! {
-                _ = notify.notified() => {
-                    let mut map = match self.map.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    if let Some(entry) = map.get_mut(key) {
-                        if let Some(auth) = entry.auth.take() {
-                            map.remove(key);
-                            return Some(auth);
+            let wait = {
+                let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((auth, _)) = map.auth.get(key) {
+                    let verified = authenticate(auth)?;
+                    let (auth, _) = map.auth.remove(key).unwrap();
+                    return Some((auth, verified));
+                }
+                if !map.waiting.contains_key(key)
+                    && map.waiting.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES
+                {
+                    let now = Instant::now();
+                    map.waiting.retain(|_, (notify, inserted_at)| {
+                        let keep = now.duration_since(*inserted_at) <= self.evict_timeout;
+                        if !keep {
+                            notify.notify_waiters();
                         }
-                    }
-                    if Instant::now() >= deadline {
+                        keep
+                    });
+                    if map.waiting.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES {
                         return None;
                     }
                 }
-                _ = tokio::time::sleep_until(deadline.into()) => {
-                    let mut map = match self.map.lock() {
-                        Ok(guard) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    if let Some(entry) = map.remove(key) {
-                        return entry.auth;
-                    }
-                    return None;
-                }
+                let (notify, _) = map
+                    .waiting
+                    .entry(*key)
+                    .or_insert_with(|| (Arc::new(Notify::new()), Instant::now()));
+                // Register before store can notify, even if this future is not polled yet.
+                notify.clone().notified_owned()
+            };
+            if tokio::time::timeout_at(deadline, wait).await.is_err() {
+                // Other packets may still share this waiter; cleanup reclaims it.
+                return None;
             }
         }
     }
 
-    /// Clean up expired in-flight underlay auth entries.
-    ///
-    /// Iterates all entries of the internal map and removes entries whose TTL
-    /// (time-to-live) has elapsed since insertion.  This is intended to be run
-    /// as a **background cleanup task**.
+    /// Remove expired auth and waiters, including abandoned packet tasks.
     pub fn cleanup(&self) {
         let now = Instant::now();
-        let ttl = self.ttl;
-        if let Ok(mut map) = self.map.lock() {
-            map.retain(|_, e| now.duration_since(e.inserted_at) <= ttl);
-        }
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        map.auth
+            .retain(|_, (_, inserted_at)| now.duration_since(*inserted_at) <= self.ttl);
+        map.waiting.retain(|_, (notify, inserted_at)| {
+            let keep = now.duration_since(*inserted_at) <= self.evict_timeout;
+            if !keep {
+                notify.notify_waiters();
+            }
+            keep
+        });
     }
 }
+
+#[cfg(test)]
+mod tests;
