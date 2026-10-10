@@ -138,6 +138,13 @@ follow = "自动滚动"
 dropped = "已丢弃 %{n} 行早期日志"
 no_traffic = "暂无流量数据"
 
+[save_prompt]
+title = "未保存的更改"
+message = "有尚未保存的更改，是否保存？"
+save = "保存"
+discard = "不保存"
+cancel = "取消"
+
 [protocol]
 juicity = "Juicity"
 shadowsocks = "Shadowsocks"

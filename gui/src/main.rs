@@ -17,6 +17,7 @@ mod log_dialog;
 mod logging;
 mod pac;
 mod pac_dialog;
+mod save_prompt;
 mod startup_dialog;
 mod state;
 mod system_proxy;

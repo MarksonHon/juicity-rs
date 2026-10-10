@@ -138,6 +138,13 @@ follow = "Follow"
 dropped = "%{n} earlier lines dropped"
 no_traffic = "No traffic yet"
 
+[save_prompt]
+title = "Unsaved Changes"
+message = "You have unsaved changes. Do you want to save them?"
+save = "Save"
+discard = "Don't Save"
+cancel = "Cancel"
+
 [protocol]
 juicity = "Juicity"
 shadowsocks = "Shadowsocks"

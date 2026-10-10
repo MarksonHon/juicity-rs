@@ -1,6 +1,6 @@
 use crate::config::{
-    method_to_index, ProxyProfile, ProxyProtocol, RuntimeState, StartupConnectionState,
-    SystemProxyMode, SS_METHODS,
+    method_to_index, AppConfig, ProfileStore, ProxyProfile, ProxyProtocol, RuntimeState,
+    StartupConnectionState, SystemProxyMode, SS_METHODS,
 };
 use crate::link;
 use crate::pac;
@@ -25,6 +25,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 actions!(app, [Quit]);
+
+/// The user's answer to the unsaved-changes prompt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SaveChoice {
+    /// Save the pending edits.
+    Save,
+    /// Throw the pending edits away.
+    Discard,
+    /// Keep editing.
+    Cancel,
+}
+
+/// What to do once the unsaved-changes prompt has been answered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PendingClose {
+    /// Close the main window, which may simply hide it to the tray.
+    Window,
+    /// Quit the application.
+    Quit,
+}
 
 /// App-wide registry that survives the main window being closed to the tray.
 #[derive(Default)]
@@ -117,6 +137,27 @@ fn open_main_window(cx: &mut App) {
                 // window map, so that `on_window_closed` can distinguish the
                 // main window from dialog windows.
                 window.on_window_should_close(cx, |_window, cx| {
+                    let view_entity = cx.default_global::<AppRoot>().view.clone();
+
+                    // Unsaved edits: ask before the window goes away, then
+                    // close again once the prompt is answered.
+                    let unsaved = view_entity
+                        .as_ref()
+                        .is_some_and(|v| v.read(cx).has_unsaved_changes());
+                    if unsaved {
+                        if let Some(view) = view_entity {
+                            cx.spawn(async move |cx| {
+                                let _ = cx.update(|app| {
+                                    let _ = view.update(app, |view, cx| {
+                                        view.request_close(PendingClose::Window, cx)
+                                    });
+                                });
+                            })
+                            .detach();
+                        }
+                        return false;
+                    }
+
                     // Read close_to_tray before mutating the global.
                     let view_entity = cx
                         .default_global::<AppRoot>()
@@ -201,6 +242,14 @@ pub struct AppView {
     /// Timestamp of the last `flush()` call – used to ignore self-inflicted
     /// watcher events that would otherwise cause an infinite reload loop.
     last_flush_at: std::time::Instant,
+    /// Settings as of the last save.  Compared against the live state to tell
+    /// whether the editor holds changes the user has not saved yet.
+    saved_profiles: ProfileStore,
+    saved_config: AppConfig,
+    saved_close_to_tray: bool,
+    /// What to do after the unsaved-changes prompt is answered; `Some` only
+    /// while that prompt is open.
+    pending_close: Option<PendingClose>,
 }
 
 impl AppView {
@@ -255,6 +304,8 @@ impl AppView {
             SS_METHODS.iter().map(|s| SharedString::from(*s)).collect();
 
         let close_to_tray = gui.runtime.close_to_tray;
+        let saved_profiles = gui.profiles.clone();
+        let saved_config = gui.config.clone();
         let mut view = Self {
             gui,
             tray_tx,
@@ -290,6 +341,10 @@ impl AppView {
             config_watcher: None,
             config_reload_rx: None,
             last_flush_at: std::time::Instant::now(),
+            saved_profiles,
+            saved_config,
+            saved_close_to_tray: close_to_tray,
+            pending_close: None,
         };
 
         // ── Config hot-reload watcher ──
@@ -389,7 +444,7 @@ impl AppView {
                 // correct value even though SelectState may not have
                 // updated yet at Confirm-event time.
                 if view.save_fields_with_protocol(cx, Some(new_protocol)) {
-                    let _ = view.gui.flush();
+                    // In-memory edit only; the user still has to save.
                     view.protocol_changed = true;
                 } else if let Some(p) = view.gui.selected_profile_mut() {
                     // Invalid fields: keep what the user typed and only
@@ -408,10 +463,8 @@ impl AppView {
                     .iter()
                     .position(|o| o == value)
                     .unwrap_or(0);
-                // Persist the method change immediately.
-                if view.save_fields(cx) {
-                    let _ = view.gui.flush();
-                }
+                // In-memory edit only; the user still has to save.
+                view.save_fields(cx);
                 cx.notify();
             }
         })
@@ -621,7 +674,6 @@ impl AppView {
             None
         };
 
-        let listen_changed;
         {
             let g = &mut self.gui;
             g.normalize_selected_index();
@@ -651,13 +703,8 @@ impl AppView {
                 p.group = non_empty_text(&group);
             }
             let (addr, _) = crate::util::split_host_port(&g.config.mixed_listen);
-            let new_listen = crate::util::format_host_port(addr, proxy_port_v);
-            listen_changed = new_listen != g.config.mixed_listen;
-            g.config.mixed_listen = new_listen;
+            g.config.mixed_listen = crate::util::format_host_port(addr, proxy_port_v);
             g.runtime.close_to_tray = self.close_to_tray;
-        }
-        if listen_changed {
-            self.apply_listen_change(cx);
         }
         true
     }
@@ -665,8 +712,10 @@ impl AppView {
     /// The local mixed (SOCKS5 + HTTP) port changed: regenerate the PAC,
     /// re-point the system proxy and restart the core so everything uses the
     /// new port.
-    fn apply_listen_change(&mut self, cx: &mut Context<Self>) {
-        let _ = self.flush_and_record();
+    ///
+    /// Only reached from [`Self::save_and_apply`]: the change must not take
+    /// effect before the user saves it.
+    fn apply_listen_side_effects(&mut self, cx: &mut Context<Self>) {
         let _ = restart_pac_server(&mut self.gui, false);
         if self.gui.config.system_proxy_mode != SystemProxyMode::Disable {
             if let Err(err) = self.apply_system_proxy_now() {
@@ -769,18 +818,55 @@ impl AppView {
 
     /// Persist config to disk and record the timestamp so the file-watcher
     /// debounce can ignore these self-inflicted writes.
+    ///
+    /// A successful flush is a save point: everything currently in memory
+    /// counts as saved afterwards.
     fn flush_and_record(&mut self) -> anyhow::Result<()> {
         let result = self.gui.flush();
         self.last_flush_at = std::time::Instant::now();
+        if result.is_ok() {
+            self.mark_saved();
+        }
         result
     }
 
-    fn start_selected(&mut self, cx: &mut Context<Self>) {
-        if !self.save_fields(cx) {
-            return;
+    /// Persist only the runtime state.  Starting or stopping the proxy must
+    /// not write edits the user has not saved yet.
+    fn flush_runtime(&mut self) {
+        if self.gui.flush_runtime().is_ok() {
+            self.last_flush_at = std::time::Instant::now();
         }
-        if let Err(err) = self.flush_and_record() {
-            self.set_status(&t!("status.save_failed", err = err.to_string()), cx);
+    }
+
+    /// Whether the editor holds changes that have not been saved yet.
+    fn has_unsaved_changes(&self) -> bool {
+        self.gui.profiles != self.saved_profiles
+            || self.gui.config != self.saved_config
+            || self.gui.runtime.close_to_tray != self.saved_close_to_tray
+    }
+
+    /// Remember the current settings as the saved state.
+    fn mark_saved(&mut self) {
+        self.saved_profiles = self.gui.profiles.clone();
+        self.saved_config = self.gui.config.clone();
+        self.saved_close_to_tray = self.gui.runtime.close_to_tray;
+    }
+
+    /// Throw away every edit made since the last save.
+    fn discard_changes(&mut self) {
+        self.gui.profiles = self.saved_profiles.clone();
+        self.gui.config = self.saved_config.clone();
+        self.gui.runtime.close_to_tray = self.saved_close_to_tray;
+        self.close_to_tray = self.saved_close_to_tray;
+        self.gui.normalize_selected_index();
+        self.sync_tray_servers();
+        self.pending_reload = true;
+    }
+
+    fn start_selected(&mut self, cx: &mut Context<Self>) {
+        // Starting uses what the editor currently shows, but must not persist
+        // it: only OK and Apply save.
+        if !self.save_fields(cx) {
             return;
         }
         self.start_core(cx);
@@ -819,7 +905,7 @@ impl AppView {
                     cx,
                 );
                 self.gui.runtime.was_running = true;
-                let _ = self.flush_and_record();
+                self.flush_runtime();
                 if let Ok(mut ts) = self.tray_shared.lock() {
                     ts.is_running = true;
                     ts.active_server_name = profile.display_name();
@@ -836,7 +922,7 @@ impl AppView {
                 self.announced_running = false;
                 self.set_status(&t!("status.stopped"), cx);
                 self.gui.runtime.was_running = false;
-                let _ = self.flush_and_record();
+                self.flush_runtime();
                 if let Ok(mut ts) = self.tray_shared.lock() {
                     ts.is_running = false;
                     ts.active_server_name = String::new();
@@ -859,7 +945,6 @@ impl AppView {
                 self.gui.runtime.selected_profile = self.gui.profiles.profiles.len() - 1;
                 self.sync_tray_servers();
                 self.pending_reload = true;
-                let _ = self.flush_and_record();
                 self.set_status(&t!("status.imported"), cx);
             }
             Err(err) => self.set_status(&t!("status.import_failed", err = err.to_string()), cx),
@@ -884,19 +969,18 @@ impl AppView {
     }
 
     fn ok_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.save_fields(cx) {
+        if !self.save_and_apply(cx) {
             return;
         }
-        match self.flush_and_record() {
-            Ok(()) => {
-                Self::suppress_quit(cx, self.tray_available());
-                window.remove_window();
-            }
-            Err(err) => self.set_status(&t!("status.save_failed", err = err.to_string()), cx),
-        }
+        Self::suppress_quit(cx, self.tray_available());
+        window.remove_window();
     }
 
     fn cancel_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Closing without saving throws the pending edits away.
+        if self.has_unsaved_changes() {
+            self.discard_changes();
+        }
         self.pending_reload = true;
         Self::suppress_quit(cx, self.tray_available());
         window.remove_window();
@@ -948,18 +1032,69 @@ impl AppView {
     }
 
     fn apply_clicked(&mut self, cx: &mut Context<Self>) {
-        if !self.save_fields(cx) {
+        if !self.save_and_apply(cx) {
             return;
         }
-        match self.flush_and_record() {
-            Ok(()) => match self.apply_system_proxy_now() {
-                Ok(()) => self.set_status(&t!("status.saved"), cx),
-                Err(err) => {
-                    self.set_status(&t!("status.system_proxy_failed", err = err.to_string()), cx)
-                }
-            },
-            Err(err) => self.set_status(&t!("status.save_failed", err = err.to_string()), cx),
+        match self.apply_system_proxy_now() {
+            Ok(()) => self.set_status(&t!("status.saved"), cx),
+            Err(err) => {
+                self.set_status(&t!("status.system_proxy_failed", err = err.to_string()), cx)
+            }
         }
+    }
+
+    /// Validate the editor, keep its changes and persist them.
+    ///
+    /// Shared by the OK/Apply buttons and the unsaved-changes prompt; returns
+    /// `false` (saving nothing) when a field is invalid.
+    fn save_and_apply(&mut self, cx: &mut Context<Self>) -> bool {
+        let previous_listen = self.gui.config.mixed_listen.clone();
+        if !self.save_fields(cx) {
+            return false;
+        }
+        let listen_changed = self.gui.config.mixed_listen != previous_listen;
+        if let Err(err) = self.flush_and_record() {
+            self.set_status(&t!("status.save_failed", err = err.to_string()), cx);
+            return false;
+        }
+        if listen_changed {
+            self.apply_listen_side_effects(cx);
+        }
+        true
+    }
+
+    /// Ask about unsaved changes before doing `next`.
+    fn request_close(&mut self, next: PendingClose, cx: &mut Context<Self>) {
+        if self.pending_close.is_some() {
+            return;
+        }
+        if !self.has_unsaved_changes() {
+            finish_close(next, cx);
+            return;
+        }
+        self.pending_close = Some(next);
+        crate::save_prompt::open(cx.weak_entity(), cx);
+    }
+
+    /// Answer to the unsaved-changes prompt, from the prompt window.
+    pub(crate) fn resolve_unsaved(&mut self, choice: SaveChoice, cx: &mut Context<Self>) {
+        match choice {
+            SaveChoice::Save => {
+                if !self.save_and_apply(cx) {
+                    // Invalid input: keep the editor open so it can be fixed.
+                    self.pending_close = None;
+                    return;
+                }
+            }
+            SaveChoice::Discard => self.discard_changes(),
+            SaveChoice::Cancel => {
+                self.pending_close = None;
+                cx.notify();
+                return;
+            }
+        }
+        let next = self.pending_close.take().unwrap_or(PendingClose::Window);
+        finish_close(next, cx);
     }
 
     fn apply_system_proxy_now(&self) -> anyhow::Result<()> {
@@ -976,6 +1111,10 @@ impl AppView {
             if let Err(err) = system_proxy::apply_system_proxy(&cfg) {
                 tracing::warn!("failed to restore system proxy on exit: {err}");
             }
+        }
+        // Changes the user never confirmed must not be written to disk.
+        if self.has_unsaved_changes() {
+            self.discard_changes();
         }
         let _ = self.flush_and_record();
     }
@@ -1160,11 +1299,16 @@ impl AppView {
                 }
             }
             TrayEvent::QuitApp => {
-                // Core and system proxy are cleaned up by the app-quit hook.
-                cx.spawn(async move |_this, cx| {
-                    let _ = cx.update(|app| app.quit());
-                })
-                .detach();
+                // Ask about unsaved changes first; the core and system proxy
+                // are cleaned up by the app-quit hook.
+                if self.has_unsaved_changes() {
+                    self.request_close(PendingClose::Quit, cx);
+                } else {
+                    cx.spawn(async move |_this, cx| {
+                        let _ = cx.update(|app| app.quit());
+                    })
+                    .detach();
+                }
             }
         }
     }
@@ -1202,6 +1346,10 @@ impl AppView {
                 self.gui.runtime = runtime;
                 self.close_to_tray = self.gui.runtime.close_to_tray;
                 self.gui.normalize_selected_index();
+                // Only the reloaded parts become the new baseline; an unsaved
+                // edit to the config stays unsaved.
+                self.saved_profiles = self.gui.profiles.clone();
+                self.saved_close_to_tray = self.gui.runtime.close_to_tray;
                 self.pending_reload = true;
                 cx.notify();
                 tracing::info!("config reloaded from disk");
@@ -1475,6 +1623,7 @@ impl Render for AppView {
                             .flex_grow(1.)
                             .h_full()
                             .overflow_y_scroll()
+                            .bg(colors.background)
                             .p_3()
                             .flex()
                             .flex_col()
@@ -1624,7 +1773,7 @@ impl Render for AppView {
                     .py_1()
                     .border_t_1()
                     .border_color(colors.border)
-                    .bg(colors.background)
+                    .bg(colors.panel)
                     .child(
                         div()
                             .flex_grow(1.)
@@ -1656,7 +1805,7 @@ impl Render for AppView {
                     .py_1()
                     .border_t_1()
                     .border_color(colors.border)
-                    .bg(colors.background)
+                    .bg(colors.panel)
                     .child(
                         div()
                             .text_sm()
@@ -1718,6 +1867,31 @@ impl Render for AppView {
                         with_view(&this, AppView::apply_clicked),
                     )),
             )
+    }
+}
+
+/// Finish a close request once any unsaved changes have been dealt with.
+fn finish_close(next: PendingClose, cx: &mut App) {
+    match next {
+        PendingClose::Quit => cx.quit(),
+        // Removing a window runs its window-closed observers synchronously, and
+        // the app's observer updates the editor entity.  When this is reached
+        // from inside an update of that entity — which is exactly what happens
+        // when the prompt answers "don't save" — that would re-enter the entity
+        // and panic.  Defer the removal so it runs after the update returns.
+        PendingClose::Window => match cx.default_global::<AppRoot>().main_window {
+            Some(handle) => {
+                cx.spawn(async move |cx| {
+                    cx.update(|app| {
+                        handle
+                            .update(app, |_, window, _| window.remove_window())
+                            .ok();
+                    });
+                })
+                .detach();
+            }
+            None => cx.quit(),
+        },
     }
 }
 
@@ -1849,7 +2023,18 @@ pub fn run() -> anyhow::Result<()> {
         // selection highlights.
         system_theme::apply(cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Quit, cx| {
+            // Do not quit with unsaved edits without asking.
+            let view = cx.default_global::<AppRoot>().view.clone();
+            match view {
+                Some(view) => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.request_close(PendingClose::Quit, cx)
+                    });
+                }
+                None => cx.quit(),
+            }
+        });
 
         open_anchor_window(cx);
 
@@ -1925,6 +2110,7 @@ pub fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::TestAppContext;
 
     #[test]
     fn missing_fields_reports_incomplete_juicity_profile() {
@@ -1945,5 +2131,47 @@ mod tests {
             ..Default::default()
         };
         assert!(missing_fields(&p).is_empty());
+    }
+
+    struct Target;
+
+    impl Render for Target {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// `finish_close` must not remove the window synchronously.
+    ///
+    /// Removal runs the window-closed observers, which update the editor
+    /// entity; doing that from inside an update of that entity panics with
+    /// "cannot update ... while it is already being updated".
+    #[gpui_kit::test]
+    fn finish_close_defers_the_window_removal(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_global(AppRoot::default());
+        });
+
+        let target = cx.update(|cx| cx.new(|_cx| Target));
+        cx.update(|cx| {
+            let target = target.clone();
+            cx.on_window_closed(move |cx, _id| {
+                let _ = target.update(cx, |_view, cx| cx.notify());
+            })
+            .detach();
+        });
+        let window = cx.add_window({
+            let target = target.clone();
+            move |window, cx| gpui_kit::base::Root::new(target, window, cx)
+        });
+        cx.update(|cx| cx.default_global::<AppRoot>().main_window = Some(window));
+
+        // Called the way the prompt does: from inside an update of the entity
+        // the window renders.
+        cx.update(|app| {
+            target.update(app, |_view, cx| finish_close(PendingClose::Window, cx));
+        });
+        cx.run_until_parked();
     }
 }
