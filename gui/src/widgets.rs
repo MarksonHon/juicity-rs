@@ -27,8 +27,10 @@ pub struct Palette {
     pub muted_foreground: Hsla,
     /// Link and accent text colour.
     pub link: Hsla,
-    /// Background of the selected list row.
-    pub list_active: Hsla,
+    /// System accent colour, used as the selected list-row background.
+    pub accent: Hsla,
+    /// Readable foreground on top of [`Palette::accent`].
+    pub accent_foreground: Hsla,
     /// Background of a hovered list row.
     pub list_hover: Hsla,
 }
@@ -43,7 +45,8 @@ pub fn palette(app: &App) -> Palette {
         foreground: theme.foreground,
         muted_foreground: theme.muted_foreground,
         link: theme.link,
-        list_active: theme.list_active,
+        accent: theme.accent,
+        accent_foreground: theme.accent_foreground,
         list_hover: theme.list_hover,
     }
 }

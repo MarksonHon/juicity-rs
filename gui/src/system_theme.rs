@@ -1,30 +1,20 @@
 //! Desktop appearance detection, used to theme the window.
 //!
-//! The application tries to match the colour and text size the user's desktop
-//! already uses, so it blends with the rest of the system:
+//! The application tries to match the colour the user's desktop already uses,
+//! so it blends with the rest of the system:
 //!
-//! * Windows — the DWM accent colour and the accessibility text size, from the
-//!   registry, plus the light/dark preference.
+//! * Windows — the DWM accent colour, from the registry, plus the light/dark
+//!   preference.
 //! * macOS — the accent colour and light/dark preference recorded in
-//!   `NSGlobalDomain`. macOS exposes no global UI font-size setting, so the
-//!   font size is left alone.
-//! * KDE — the accent colour, UI font size and light/dark scheme from
-//!   `kdeglobals`.
-//! * other Linux desktops — the GTK accent colour, font size and light/dark
-//!   preference (`gsettings`, else the active GTK theme).
+//!   `NSGlobalDomain`.
+//! * KDE — the accent colour and light/dark scheme from `kdeglobals`.
+//! * other Linux desktops — the GTK accent colour and light/dark preference
+//!   (`gsettings`, else the active GTK theme).
 //!
 //! Detection is best-effort: when a setting cannot be read the bundled theme
-//! keeps its value.
-//!
-//! Font sizes are applied as a multiplier relative to the platform default, so
-//! a desktop left at its defaults keeps the built-in size.
+//! keeps its value. Font sizes are left to the GPUI defaults.
 
-use gpui_kit::{px, App, Hsla, Window};
-
-/// Bounds for the desktop font multiplier, so an unusual setting cannot make
-/// the interface unreadable.
-const MIN_FONT_SCALE: f32 = 0.5;
-const MAX_FONT_SCALE: f32 = 2.5;
+use gpui_kit::{App, Hsla, Window};
 
 /// A colour sampled from the desktop, as 8-bit sRGB components.
 #[derive(Clone, Copy, Debug)]
@@ -51,7 +41,7 @@ impl Rgb {
     }
 }
 
-/// Match the desktop's light/dark mode, accent colour and base font size.
+/// Match the desktop's light/dark mode and accent colour.
 ///
 /// Does nothing for a setting that cannot be determined.
 pub fn apply(cx: &mut App) {
@@ -69,56 +59,40 @@ fn apply_inner(window: Option<&mut Window>, cx: &mut App) {
     // registered theme, which would overwrite the colours applied below.
     sync_mode(window, cx);
 
-    let accent = accent_color();
-    let scale = font_scale().map(|scale| scale.clamp(MIN_FONT_SCALE, MAX_FONT_SCALE));
-
-    if accent.is_none() && scale.is_none() {
+    let Some(rgb) = accent_color() else {
         tracing::debug!("no desktop appearance settings detected; keeping the built-in theme");
         return;
-    }
-    if let Some(rgb) = accent {
-        tracing::info!(r = rgb.r, g = rgb.g, b = rgb.b, "theming from the desktop accent colour");
-    }
-    if let Some(scale) = scale {
-        tracing::info!(scale, "scaling the base font size from the desktop configuration");
-    }
+    };
+    tracing::info!(r = rgb.r, g = rgb.g, b = rgb.b, "theming from the desktop accent colour");
 
-    let colors = accent.map(|rgb| {
-        let accent = rgb.to_hsla();
-        let foreground: Hsla = if rgb.is_light() {
-            gpui_kit::black()
-        } else {
-            gpui_kit::white()
-        };
-        (accent, shade(accent, 1.12), shade(accent, 0.88), foreground)
-    });
+    let accent = rgb.to_hsla();
+    let foreground: Hsla = if rgb.is_light() {
+        gpui_kit::black()
+    } else {
+        gpui_kit::white()
+    };
+    let hover = shade(accent, 1.12);
+    let active = shade(accent, 0.88);
 
     gpui_kit::component::Theme::update(cx, |theme| {
-        if let Some((accent, hover, active, foreground)) = colors {
-            theme.colors.primary = accent;
-            theme.colors.primary_hover = hover;
-            theme.colors.primary_active = active;
-            theme.colors.primary_foreground = foreground;
+        theme.colors.primary = accent;
+        theme.colors.primary_hover = hover;
+        theme.colors.primary_active = active;
+        theme.colors.primary_foreground = foreground;
 
-            // Primary buttons only fall back to `primary` when the theme file
-            // did not set them, so write the button tokens explicitly.
-            theme.colors.button_primary = accent;
-            theme.colors.button_primary_hover = hover;
-            theme.colors.button_primary_active = active;
-            theme.colors.button_primary_foreground = foreground;
+        // Primary buttons only fall back to `primary` when the theme file
+        // did not set them, so write the button tokens explicitly.
+        theme.colors.button_primary = accent;
+        theme.colors.button_primary_hover = hover;
+        theme.colors.button_primary_active = active;
+        theme.colors.button_primary_foreground = foreground;
 
-            // Selection / hover highlight used by menus, lists and selects.
-            theme.colors.accent = accent;
-            theme.colors.accent_foreground = foreground;
+        // Selection / hover highlight used by menus, lists and selects.
+        theme.colors.accent = accent;
+        theme.colors.accent_foreground = foreground;
 
-            // Focus ring.
-            theme.colors.ring = accent;
-        }
-
-        if let Some(scale) = scale {
-            theme.font_size = px(f32::from(theme.font_size) * scale);
-            theme.mono_font_size = px(f32::from(theme.mono_font_size) * scale);
-        }
+        // Focus ring.
+        theme.colors.ring = accent;
     });
 }
 
@@ -170,31 +144,6 @@ fn accent_color() -> Option<Rgb> {
     }
 }
 
-/// Multiplier, relative to the platform's default UI font size, that the
-/// desktop has been configured with.
-///
-/// `None` when the platform exposes no readable setting.
-fn font_scale() -> Option<f32> {
-    #[cfg(target_os = "windows")]
-    {
-        windows_font_scale()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // macOS has no global UI font-size setting: the system font is a fixed
-        // 13pt and the per-app text size is not readable, so keep the default.
-        None
-    }
-    #[cfg(target_os = "linux")]
-    {
-        linux_font_scale()
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
-}
-
 // ── Windows ──────────────────────────────────────────────────────────────
 
 /// The Windows accent colour, which DWM stores as `0xAABBGGRR`.
@@ -218,19 +167,6 @@ fn windows_accent() -> Option<Rgb> {
         g: ((abgr >> 8) & 0xff) as u8,
         b: ((abgr >> 16) & 0xff) as u8,
     })
-}
-
-/// Settings ▸ Accessibility ▸ Text size ("Make text bigger"), stored as a
-/// percentage where `100` is the default.
-#[cfg(target_os = "windows")]
-fn windows_font_scale() -> Option<f32> {
-    use windows_registry::CURRENT_USER;
-
-    let percent = CURRENT_USER
-        .open(r"Software\Microsoft\Accessibility")
-        .ok()
-        .and_then(|key| key.get_u32("TextScaleFactor").ok())?;
-    Some(percent as f32 / 100.0)
 }
 
 // ── macOS ────────────────────────────────────────────────────────────────
@@ -279,16 +215,6 @@ fn linux_accent() -> Option<Rgb> {
     gtk_accent()
 }
 
-#[cfg(target_os = "linux")]
-fn linux_font_scale() -> Option<f32> {
-    if is_kde() {
-        if let Some(scale) = kde_font_scale() {
-            return Some(scale);
-        }
-    }
-    gtk_font_scale()
-}
-
 /// Linux desktops expose the light/dark preference in their own settings.
 #[cfg(target_os = "linux")]
 fn linux_prefers_dark() -> Option<bool> {
@@ -315,26 +241,6 @@ fn kde_prefers_dark() -> Option<bool> {
 #[cfg(target_os = "linux")]
 fn gtk_prefers_dark() -> Option<bool> {
     Some(gsettings_string("color-scheme")?.contains("dark"))
-}
-
-/// KDE keeps the UI font (family, point size, …) in `kdeglobals`; its default
-/// is 10pt.
-#[cfg(target_os = "linux")]
-fn kde_font_scale() -> Option<f32> {
-    let text = std::fs::read_to_string(config_home().join("kdeglobals")).ok()?;
-    Some(kde_font_points(ini_value(&text, "General", "Font")?) / 10.0)
-}
-
-/// GTK stores the UI font in `font-name` (`"<family> <points>"`) plus an extra
-/// `text-scaling-factor`; the GNOME default is 11pt and 1.0.
-#[cfg(target_os = "linux")]
-fn gtk_font_scale() -> Option<f32> {
-    let points = parse_points(&gsettings_string("font-name")?)?;
-    let scaling = gsettings_string("text-scaling-factor")
-        .and_then(|value| value.parse::<f32>().ok())
-        .filter(|value| *value > 0.0)
-        .unwrap_or(1.0);
-    Some(points / 11.0 * scaling)
 }
 
 #[cfg(target_os = "linux")]
@@ -441,18 +347,6 @@ fn run_command(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Trailing number of a GTK font name such as `"Cantarell 11"`.
-#[cfg(any(target_os = "linux", test))]
-fn parse_points(font_name: &str) -> Option<f32> {
-    font_name.split_whitespace().last()?.parse::<f32>().ok()
-}
-
-/// Second field of a KDE font entry such as `"Noto Sans,10,-1,5,…"`.
-#[cfg(any(target_os = "linux", test))]
-fn kde_font_points(value: &str) -> Option<f32> {
-    value.split(',').nth(1)?.trim().parse().ok()
-}
-
 /// Value of `key` inside `[section]` of an INI-style file, if present.
 #[cfg(any(target_os = "linux", test))]
 fn ini_value<'a>(text: &'a str, section: &str, key: &str) -> Option<&'a str> {
@@ -555,19 +449,5 @@ mod tests {
         let base = Hsla { h: 0.5, s: 0.5, l: 0.5, a: 1.0 };
         assert!(shade(base, 1.2).l > base.l);
         assert!(shade(base, 0.8).l < base.l);
-    }
-
-    #[test]
-    fn parses_gtk_font_name() {
-        assert_eq!(parse_points("Cantarell 11"), Some(11.0));
-        assert_eq!(parse_points("Ubuntu 11.5"), Some(11.5));
-        assert_eq!(parse_points("Cantarell"), None);
-    }
-
-    #[test]
-    fn parses_kde_font_entry() {
-        let text = "[General]\nFont=Noto Sans,10,-1,5,50,0,0,0,0,0\n";
-        let value = ini_value(text, "General", "Font").unwrap();
-        assert_eq!(kde_font_points(value), Some(10.0));
     }
 }

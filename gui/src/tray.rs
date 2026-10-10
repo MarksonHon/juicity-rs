@@ -9,6 +9,7 @@ pub enum TrayEvent {
     ShowEditServers,
     ShowPacSettings,
     ShowStartupSettings,
+    ShowLogs,
     ShowAbout,
     SetSystemProxy(SystemProxyMode),
     SetPacRuleMode(PacRuleMode),
@@ -422,6 +423,14 @@ impl ksni::Tray for LinuxTray {
             }
             .into(),
             StandardItem {
+                label: t!("tray.view_logs").to_string(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.event_tx.send(TrayEvent::ShowLogs);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: t!("tray.about").to_string(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.event_tx.send(TrayEvent::ShowAbout);
@@ -694,7 +703,9 @@ fn build_native_menu(
     // ── About ─────────────────────────────────────────────────────────────
     let about = MenuItem::new(&t!("tray.about").to_string(), true, None);
     ids.insert(about.id().clone(), TrayEvent::ShowAbout);
-
+    // ── View Logs ─────────────────────────────────────────────────────────
+    let view_logs = MenuItem::new(&t!("tray.view_logs").to_string(), true, None);
+    ids.insert(view_logs.id().clone(), TrayEvent::ShowLogs);
     // ── Quit ─────────────────────────────────────────────────────────────
     let quit = MenuItem::new(&t!("tray.quit").to_string(), true, None);
     ids.insert(quit.id().clone(), TrayEvent::QuitApp);
@@ -710,6 +721,7 @@ fn build_native_menu(
         &servers_sub,
         &PredefinedMenuItem::separator(),
         &startup_settings,
+        &view_logs,
         &about,
         &PredefinedMenuItem::separator(),
         &quit,

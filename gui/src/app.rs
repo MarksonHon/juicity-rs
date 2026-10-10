@@ -16,9 +16,9 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::IndexPath;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    actions, div, point, px, size, App, Bounds, ClickEvent, Context, ElementId, Entity, FontWeight,
-    Global, KeyBinding, SharedString, WeakEntity, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowHandle, WindowOptions,
+    actions, div, point, px, size, AnyWindowHandle, App, Bounds, ClickEvent, Context, ElementId,
+    Entity, FontWeight, Global, KeyBinding, SharedString, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions,
 };
 use rust_i18n::t;
 use std::sync::{Arc, Mutex};
@@ -805,6 +805,8 @@ impl AppView {
             return;
         }
         let config_snap = self.gui.config.clone();
+        // A new core restarts its byte counters, so start a fresh baseline.
+        crate::traffic::monitor().reset();
         match self.gui.core_manager.start_profile(&config_snap, &profile) {
             Ok(()) => {
                 self.announced_running = true;
@@ -828,6 +830,7 @@ impl AppView {
     }
 
     fn stop_core(&mut self, cx: &mut Context<Self>) {
+        crate::traffic::monitor().reset();
         match self.gui.core_manager.stop() {
             Ok(()) => {
                 self.announced_running = false;
@@ -1103,6 +1106,12 @@ impl AppView {
                 })
                 .detach();
             }
+            TrayEvent::ShowLogs => {
+                cx.spawn(async move |_this, cx| {
+                    let _ = cx.update(|app| crate::log_dialog::open(app));
+                })
+                .detach();
+            }
             TrayEvent::SetSystemProxy(mode) => {
                 self.gui.config.system_proxy_mode = mode;
                 let _ = self.flush_and_record();
@@ -1206,6 +1215,8 @@ impl AppView {
     // ── Periodic poll (runs every 300 ms from the spawned task) ───────────
 
     fn poll(&mut self, cx: &mut Context<Self>) {
+        // Sample the core's byte counters for the log window's chart.
+        crate::traffic::monitor().record(self.gui.core_manager.traffic());
         // ── Config hot-reload (debounced: ignore self-inflicted writes) ──
         if self.config_reload_rx.is_some() {
             // Drain ALL pending events from the watcher channel.
@@ -1329,16 +1340,19 @@ impl Render for AppView {
                 let name = p.display_name();
                 div()
                     .id(("server-row", i))
+                    .mx_1()
+                    .mb_0p5()
                     .px_2()
                     .py_1()
+                    .rounded_md()
                     .text_sm()
                     .cursor_pointer()
                     .when(selected, |s| {
-                        s.bg(colors.list_active).text_color(colors.link)
+                        s.bg(colors.accent).text_color(colors.accent_foreground)
                     })
                     .hover(|s| {
                         s.bg(if selected {
-                            colors.list_active
+                            colors.accent
                         } else {
                             colors.list_hover
                         })
@@ -1844,13 +1858,22 @@ pub fn run() -> anyhow::Result<()> {
 
         let _ = cx.on_window_closed({
             let view = view.downgrade();
-            move |cx, _window_id| {
-                // Main-window close is handled by `on_window_should_close` in
-                // `open_main_window`.  This observer is a safety net: if the
-                // flag was NOT set (e.g. the window was removed programmatically
-                // without going through the close-request path), handle it here.
-                let already_closed = cx.default_global::<AppRoot>().main_window_closed;
-                if already_closed {
+            move |cx, window_id| {
+                // Only the main window's close may quit the application.  Dialog
+                // windows (About, PAC, Logs, ...) are opened from the tray while
+                // the main window may be open, and closing one must not be
+                // mistaken for closing the main window.
+                //
+                // Main-window close is normally handled by `on_window_should_close`
+                // in `open_main_window`, which clears `main_window`; this observer
+                // is the safety net for a programmatic removal that skipped it.
+                let is_main_window = cx
+                    .default_global::<AppRoot>()
+                    .main_window
+                    .as_ref()
+                    .map(|handle| AnyWindowHandle::from(*handle).window_id())
+                    .is_some_and(|id| id == window_id);
+                if !is_main_window {
                     return;
                 }
                 let close_to_tray = view

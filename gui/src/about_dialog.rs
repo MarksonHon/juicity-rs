@@ -10,8 +10,8 @@ use crate::widgets;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, size, App, Bounds, ClickEvent, Context, ElementId, FontWeight, SharedString,
-    Window, WindowBounds, WindowOptions,
+    div, img, px, rems, size, App, Bounds, ClickEvent, Context, ElementId, FontWeight,
+    SharedString, Window, WindowBounds, WindowOptions,
 };
 use rust_i18n::t;
 
@@ -177,31 +177,41 @@ impl Render for AboutDialog {
     }
 }
 
-/// One left-aligned `label: value` row for the About dialog details block.
+/// One `label: value` row for the About dialog details block.
+///
+/// The row is laid out around the dialog's centre line: the label column is
+/// right-aligned and the value column left-aligned, with a gap two characters
+/// wide straddling the centre (`1rem` is the base font size, so 1rem is about
+/// two average characters at the small text size used here).
 fn row(colors: widgets::Palette, label: String, value: String) -> impl IntoElement {
     div()
         .w_full()
         .flex()
         .flex_row()
         .items_center()
-        .gap_3()
+        .gap(rems(CENTER_GAP_REMS))
         .child(
             div()
-                .w(px(160.))
-                .text_left()
+                .flex_1()
+                .text_right()
                 .text_sm()
                 .text_color(colors.muted_foreground)
                 .child(label),
         )
         .child(
             div()
-                .flex_grow(1.)
+                .flex_1()
+                .text_left()
                 .text_sm()
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(colors.foreground)
                 .child(value),
         )
 }
+
+/// Width of the gap straddling the centre line, in `rem` units. It is roughly
+/// two characters wide at the small text size used for the rows.
+const CENTER_GAP_REMS: f32 = 1.0;
 
 /// Build a gpui-kit `Button`.
 fn btn(
