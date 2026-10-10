@@ -145,36 +145,40 @@ impl AddrType {
 pub struct CachedAddr {
     pub addr_type: AddrType,
     /// Raw octets (for IPv4: first 4 bytes; for IPv6: all 16 bytes; for domain: the domain bytes)
-    pub host_bytes: [u8; 16],
-    /// Domain length (only meaningful when addr_type == Domain)
+    pub host_bytes: [u8; 255],
+    /// Encoded host length; zero marks an invalid host.
     pub host_len: u8,
     pub port: u16,
 }
 
 impl CachedAddr {
-    /// Parse from a `"host:port"`-style string pair.
-    ///
-    /// Determines the address type and stores the raw octets directly,
-    /// avoiding later re-parsing at build time.
+    /// Cache a host and port without panicking on invalid input.
+    /// Invalid hosts have zero length and are rejected when building a header.
     pub fn from_host_port(host: &str, port: u16) -> Self {
         let addr_type = AddrType::from_host(host);
-        let mut host_bytes = [0u8; 16];
+        let mut host_bytes = [0u8; 255];
         let host_len = match addr_type {
-            AddrType::V4 => {
-                let ip: std::net::Ipv4Addr = host.parse().expect("AddrType::V4 implies valid IPv4");
-                host_bytes[..4].copy_from_slice(&ip.octets());
-                4
-            }
-            AddrType::V6 => {
-                let ip: std::net::Ipv6Addr = host.parse().expect("AddrType::V6 implies valid IPv6");
-                host_bytes.copy_from_slice(&ip.octets());
-                16
-            }
-            AddrType::Domain => {
-                let b = host.as_bytes();
-                host_bytes[..b.len()].copy_from_slice(b);
-                b.len() as u8
-            }
+            AddrType::V4 => match host.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => {
+                    host_bytes[..4].copy_from_slice(&ip.octets());
+                    4
+                }
+                Err(_) => 0,
+            },
+            AddrType::V6 => match host.parse::<std::net::Ipv6Addr>() {
+                Ok(ip) => {
+                    host_bytes[..16].copy_from_slice(&ip.octets());
+                    16
+                }
+                Err(_) => 0,
+            },
+            AddrType::Domain => match u8::try_from(host.len()) {
+                Ok(len) if len > 0 => {
+                    host_bytes[..host.len()].copy_from_slice(host.as_bytes());
+                    len
+                }
+                _ => 0,
+            },
         };
         Self {
             addr_type,
@@ -188,14 +192,14 @@ impl CachedAddr {
     ///
     /// Extracts raw octets directly — no formatting or parsing round-trip.
     pub fn from_socket_addr(addr: SocketAddr) -> Self {
-        let mut host_bytes = [0u8; 16];
+        let mut host_bytes = [0u8; 255];
         let (addr_type, host_len) = match addr {
             SocketAddr::V4(v4) => {
                 host_bytes[..4].copy_from_slice(&v4.ip().octets());
                 (AddrType::V4, 4)
             }
             SocketAddr::V6(v6) => {
-                host_bytes.copy_from_slice(&v6.ip().octets());
+                host_bytes[..16].copy_from_slice(&v6.ip().octets());
                 (AddrType::V6, 16)
             }
         };
@@ -448,7 +452,9 @@ pub fn build_proxy_header(network: u8, addr: &str, port: u16) -> anyhow::Result<
         }
         ADDR_TYPE_DOMAIN => {
             let domain_bytes = addr.as_bytes();
-            buf.push(domain_bytes.len() as u8);
+            let len = u8::try_from(domain_bytes.len())
+                .map_err(|_| anyhow::anyhow!("proxy host too long: {}", domain_bytes.len()))?;
+            buf.push(len);
             buf.extend_from_slice(domain_bytes);
         }
         ADDR_TYPE_NONE => {}
@@ -524,6 +530,14 @@ pub fn gen_token_via_connection(
 /// This is the zero-allocation variant for hot paths (e.g. per-packet UDP relay).
 /// The caller is responsible for clearing the buffer if needed.
 pub fn build_trojanc_addr_cached(buf: &mut Vec<u8>, cached: &CachedAddr) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        match cached.addr_type {
+            AddrType::V4 => cached.host_len == 4,
+            AddrType::V6 => cached.host_len == 16,
+            AddrType::Domain => cached.host_len > 0,
+        },
+        "invalid cached host"
+    );
     buf.push(cached.addr_type.to_wire_byte());
 
     match cached.addr_type {
@@ -641,4 +655,77 @@ pub async fn read_trojanc_addr_into_async<R: tokio::io::AsyncReadExt + Unpin>(
     let mut port_buf = [0u8; 2];
     reader.read_exact(&mut port_buf).await?;
     Ok(u16::from_be_bytes(port_buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn address_encoding_boundaries() {
+        for len in [1, 15, 16, 17, 18, 255] {
+            let host = "a".repeat(len);
+            let cached = CachedAddr::from_host_port(&host, 443);
+            let mut encoded = Vec::new();
+            build_trojanc_addr_cached(&mut encoded, &cached).unwrap();
+            assert_eq!(encoded[0], ADDR_TYPE_DOMAIN);
+            assert_eq!(encoded[1] as usize, len);
+            assert_eq!(&encoded[2..2 + len], host.as_bytes());
+            assert_eq!(&encoded[2 + len..], &443u16.to_be_bytes());
+            assert_eq!(
+                read_trojanc_addr_async(&mut encoded.as_slice()).await.unwrap(),
+                (host.clone(), 443)
+            );
+            let proxy = build_proxy_header(NETWORK_TCP, &host, 443).unwrap();
+            assert_eq!(
+                read_proxy_header(&mut proxy.as_slice()).unwrap(),
+                (NETWORK_TCP, host.clone(), 443)
+            );
+            let metadata = ProxyMetadata {
+                network: Network::Udp,
+                hostname: host.clone(),
+                port: 443,
+                uuid: Uuid::nil(),
+            };
+            let mut underlay = Vec::new();
+            write_underlay_metadata_async(&mut underlay, &metadata).await.unwrap();
+            assert_eq!(
+                read_underlay_metadata_async(&mut underlay.as_slice()).await.unwrap(),
+                (host, 443)
+            );
+        }
+        for host in ["", "host:80", &"a".repeat(256)] {
+            let cached = CachedAddr::from_host_port(host, 80);
+            let mut encoded = Vec::new();
+            assert!(build_trojanc_addr_cached(&mut encoded, &cached).is_err());
+            assert!(encoded.is_empty());
+        }
+        let host = "a".repeat(256);
+        assert!(build_proxy_header(NETWORK_TCP, &host, 80).is_err());
+        let metadata = ProxyMetadata {
+            network: Network::Udp,
+            hostname: host,
+            port: 80,
+            uuid: Uuid::nil(),
+        };
+        assert!(write_underlay_metadata_async(&mut Vec::new(), &metadata).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cached_ip_addresses_round_trip() {
+        for host in ["192.0.2.1", "2001:db8::1"] {
+            let socket = SocketAddr::new(host.parse().unwrap(), 1234);
+            for cached in [
+                CachedAddr::from_host_port(host, 1234),
+                CachedAddr::from_socket_addr(socket),
+            ] {
+                let mut encoded = Vec::new();
+                build_trojanc_addr_cached(&mut encoded, &cached).unwrap();
+                assert_eq!(
+                    read_trojanc_addr_async(&mut encoded.as_slice()).await.unwrap(),
+                    (host.to_string(), 1234)
+                );
+            }
+        }
+    }
 }

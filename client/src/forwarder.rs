@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::client::JuicityClient;
+use crate::local::copy_direction;
 
 /// RAII guard: aborts the wrapped task when this guard is dropped.
 struct AbortOnDrop(tokio::task::AbortHandle);
@@ -170,7 +171,15 @@ async fn start_tcp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
         // Acquire a permit before accepting; this blocks new accepts when the
         // limit is reached, providing back-pressure at the OS TCP accept queue.
         let permit = sem.clone().acquire_owned().await?;
-        let (stream, peer_addr) = listener.accept().await?;
+        let (stream, peer_addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::warn!(error = %e, "Forward TCP accept error");
+                drop(permit);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let client = client.clone();
         let target = entry.target.clone();
 
@@ -215,8 +224,8 @@ async fn forward_tcp_connection(
     let mut quic_recv = tokio::io::BufReader::with_capacity(16 * 1024, quic_recv);
 
     let (r1, r2) = tokio::join!(
-        tokio::io::copy_buf(&mut local_rx, &mut quic_send),
-        tokio::io::copy_buf(&mut quic_recv, &mut local_tx),
+        copy_direction(&mut local_rx, &mut quic_send),
+        copy_direction(&mut quic_recv, &mut local_tx),
     );
     if let Err(e) = r1 {
         tracing::info!(
@@ -234,10 +243,6 @@ async fn forward_tcp_connection(
             "TCP forward quic->local error"
         );
     }
-
-    // Gracefully finish the send direction so quinn can clean up the stream
-    // state immediately instead of holding it until a timeout or stream reset.
-    let _ = quic_send.finish();
 
     Ok(())
 }
@@ -268,17 +273,17 @@ impl UdpSession {
         self.last_used_epoch_ms.store(now, Ordering::Relaxed);
     }
 
-    fn last_used(&self) -> Instant {
+    fn last_used(&self) -> Option<Instant> {
         let ms = self.last_used_epoch_ms.load(Ordering::Relaxed);
         // Convert epoch millis back to Instant via UNIX_EPOCH.
         // This is approximate but sufficient for idle detection.
-        Instant::now() - std::time::Duration::from_millis(
+        Instant::now().checked_sub(std::time::Duration::from_millis(
             (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64)
                 .saturating_sub(ms),
-        )
+        ))
     }
 }
 
@@ -315,8 +320,12 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
                     tokio::time::interval(consts::CLIENT_UDP_SESSION_CLEANUP_INTERVAL);
                 loop {
                     interval.tick().await;
-                    let idle_cutoff = Instant::now() - consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT;
-                    sessions.retain(|_, s| !s.tx.is_closed() && s.last_used() > idle_cutoff);
+                    let idle_cutoff = Instant::now().checked_sub(consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT);
+                    sessions.retain(|_, s| {
+                        !s.tx.is_closed() && idle_cutoff.is_none_or(|cutoff| {
+                            s.last_used().is_some_and(|last_used| last_used > cutoff)
+                        })
+                    });
                 }
             }
         })
@@ -327,11 +336,15 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
     let cancel = CancellationToken::new();
     let _cancel_guard = cancel.clone().drop_guard();
 
-    let mut buf = vec![0u8; consts::ETHERNET_MTU];
+    let mut buf = vec![0u8; consts::MAX_UDP_PAYLOAD];
 
     // ── Single-task event loop: no per-packet spawn ──
     loop {
         let (n, src_addr) = socket.recv_from(&mut buf).await?;
+        if n > consts::MAX_UDP_PAYLOAD {
+            tracing::warn!(len = n, "Dropping oversized UDP payload");
+            continue;
+        }
         let data = Bytes::copy_from_slice(&buf[..n]);
 
         // ── Fast path: session exists, try_send (non-blocking) ──
@@ -347,7 +360,7 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
         }
 
         // ── Slow path: create a new session (low frequency) ──
-        let (mut send, mut recv) = match client.open_udp_stream(&host, port, &data[..]).await {
+        let (send, mut recv) = match client.open_udp_stream(&host, port, &data[..]).await {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::info!(
@@ -361,23 +374,6 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
         let session_id = session_seq.fetch_add(1, Ordering::Relaxed);
-
-        // Send the first datagram directly on the send stream (already opened above).
-        // Reuse the scratch buffer approach from the old writer task.
-        {
-            let mut addr_buf = Vec::with_capacity(32);
-            if let Err(e) =
-                JuicityClient::send_udp_datagram(&mut send, &host, port, &data[..], &mut addr_buf)
-                    .await
-            {
-                tracing::info!(
-                    error = %e,
-                    protocol = "udp",
-                    "UDP forward first datagram send error"
-                );
-                continue;
-            }
-        }
 
         sessions.insert(
             src_addr,

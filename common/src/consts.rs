@@ -8,6 +8,8 @@ pub const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(180);
 pub const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(17);
 /// Ethernet MTU
 pub const ETHERNET_MTU: usize = 1500;
+/// Largest UDP payload supported by the two-byte relay length field.
+pub const MAX_UDP_PAYLOAD: usize = u16::MAX as usize;
 /// Authentication timeout
 pub const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10);
 /// In-flight underlay TTL
