@@ -1,7 +1,7 @@
 use super::controller::{traffic_view, LogsSnapshot};
 use super::{
     bind, fonts, prepare, AppState, Connection, MainWindow, NodeDraft, NodeRow, NodeStore, Notice,
-    PacRule, Page, Protocol, ProxyMode, SettingsStore, StartupConnection, Theme, Versions,
+    PacRule, Page, Protocol, ProxyMode, SettingsStore, StartupConnection, Theme,
 };
 use crate::i18n::UiLang;
 use crate::logging::LogLine;
@@ -94,19 +94,15 @@ fn fixture(window: &MainWindow) {
     settings.set_proxy_url("Loyalsoldier · proxy-list.txt".into());
     settings.set_update_hours(24);
     settings.set_pac_listen("127.0.0.1:1090".into());
-    settings.set_versions(Versions {
-        gui: "1.1.0".into(),
-        juicity: "1.1.0".into(),
-        shadowsocks: "1.24.0".into(),
-        tag: "v1.1.0".into(),
-        commit: "4c4f9f0".into(),
-    });
+    // Versions come from the linked crates, never hardcoded here.
+    bind::settings::set_versions(window);
     logs_fixture(window);
 }
 
 /// Fixed log lines (Logs page) and traffic history (Overview page).
 fn logs_fixture(window: &MainWindow) {
     use tracing::Level;
+    let app = crate::version::Versions::current().app;
     let line = |time: &str, level, target: &str, message: &str| LogLine {
         time: time.into(),
         level,
@@ -114,7 +110,12 @@ fn logs_fixture(window: &MainWindow) {
         message: message.into(),
     };
     let lines = vec![
-        line("00:00:00", Level::INFO, "juicity_gui", "juicity-gui 1.1.0 starting"),
+        line(
+            "00:00:00",
+            Level::INFO,
+            "juicity_gui",
+            &format!("juicity-gui {app} starting"),
+        ),
         line("00:00:00", Level::INFO, "juicity_gui::pac", "PAC server listening on 127.0.0.1:1090"),
         line("00:00:01", Level::INFO, "juicity_gui::core", "starting in-process Juicity core for profile Tokyo 01"),
         line("00:00:01", Level::INFO, "juicity_client", "listening on 127.0.0.1:1080 (SOCKS5 / HTTP)"),

@@ -10,7 +10,7 @@ mod desktop;
 pub(super) mod logs;
 mod nodes;
 mod overview;
-mod settings;
+pub(super) mod settings;
 
 pub use desktop::{request_activation, show_initial, start_tray, window_ready};
 

@@ -125,6 +125,12 @@ pub fn wire(ui: &MainWindow) {
 
     ui.global::<SettingsStore>()
         .set_autostart_supported(crate::desktop::autostart::SUPPORTED);
+    set_versions(ui);
+}
+
+/// Populate the About versions from the build-time dependency versions
+/// (injected by `build.rs` from `Cargo.lock`).
+pub fn set_versions(ui: &MainWindow) {
     let versions = crate::version::Versions::current();
     ui.global::<SettingsStore>()
         .set_versions(crate::ui::Versions {
