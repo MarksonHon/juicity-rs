@@ -39,11 +39,7 @@ impl Dialer for DefaultDialer {
         // We bind to a local ephemeral port without connecting, so the caller
         // can use send_to() to send packets to different targets if needed.
         // Pre-connecting via socket.connect(addr) would restrict us to a single target.
-        // Use "[::]:0" (IPv6 any) for dual-stack binding.
-        // On Linux, binding to "[::]" by default has IPV6_V6ONLY=false,
-        // accepting both IPv4 and IPv6 connections.
-        let socket = UdpSocket::bind("[::]:0").await?;
-        Ok(socket)
+        Ok(crate::udp::bind_dual_stack()?)
     }
 }
 

@@ -10,6 +10,42 @@ use moka::sync::Cache;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 
+pub(crate) fn bind_dual_stack() -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_only_v6(false)?;
+    socket.bind(&SocketAddr::from(([0u16; 8], 0)).into())?;
+    socket.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
+pub(crate) async fn send_to<A: tokio::net::ToSocketAddrs>(
+    socket: &tokio::net::UdpSocket,
+    payload: &[u8],
+    target: A,
+) -> std::io::Result<usize> {
+    let target = tokio::net::lookup_host(target)
+        .await?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no addresses to send data to",
+            )
+        })?;
+    // macOS requires IPv4-mapped destinations even on dual-stack IPv6 sockets.
+    let target = match target {
+        SocketAddr::V4(addr) if socket.local_addr()?.is_ipv6() => {
+            SocketAddr::new(addr.ip().to_ipv6_mapped().into(), addr.port())
+        }
+        addr => addr,
+    };
+    socket.send_to(payload, target).await
+}
+
 /// Relay UDP responses to a Juicity stream.
 pub(crate) async fn relay_responses<W: AsyncWrite + Unpin>(
     remote: &tokio::net::UdpSocket,
@@ -60,12 +96,8 @@ pub struct UdpEndpoint {
 
 impl UdpEndpoint {
     /// Create a new UDP endpoint bound to a random port.
-    /// Uses tokio::net::UdpSocket for async bind to avoid blocking the runtime.
     pub async fn new(options: UdpEndpointOptions) -> anyhow::Result<Self> {
-        // Use "[::]:0" (IPv6 any) for dual-stack binding.
-        // On Linux, binding to "[::]" by default has IPV6_V6ONLY=false,
-        // accepting both IPv4 and IPv6 connections.
-        let socket = tokio::net::UdpSocket::bind("[::]:0").await?;
+        let socket = bind_dual_stack()?;
         Ok(Self {
             socket: Arc::new(socket),
             dial_target: Arc::from(options.dial_target.as_str()),
@@ -345,6 +377,10 @@ mod tests {
         let relay = DefaultDialer.dial_udp("127.0.0.1:1").await.unwrap();
         let relay_port = relay.local_addr().unwrap().port();
         let source = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Darwin's default UDP send buffer is smaller than this test datagram.
+        socket2::SockRef::from(&source)
+            .set_send_buffer_size(65_535)
+            .unwrap();
         let source_addr = source.local_addr().unwrap();
         let (mut reader, mut writer) = tokio::io::duplex(65536);
         let relay_task = tokio::spawn(async move { relay_responses(&relay, &mut writer).await });
