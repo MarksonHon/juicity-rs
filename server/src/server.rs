@@ -65,6 +65,7 @@ fn create_reuseport_socket(
 pub struct JuicityServer {
     users: Arc<HashMap<Uuid, String>>,
     server_config: quinn::ServerConfig,
+    certificate_resolver: Arc<ReloadingCertificateResolver>,
     dialer: Arc<dyn crate::dialer::Dialer>,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_endpoint_pool: Arc<crate::udp::UdpEndpointPool>,
@@ -79,20 +80,17 @@ impl JuicityServer {
             users.insert(uuid, password.clone());
         }
 
-        // Load TLS certificates and private key via spawn_blocking to avoid
-        // blocking the async runtime with synchronous file I/O.
+        let tls_builder = rustls::ServerConfig::builder().with_no_client_auth();
+        let provider = tls_builder.crypto_provider().clone();
         let cert_path = config.certificate.clone();
         let key_path = config.private_key.clone();
-        let (certs, key) = tokio::try_join!(
-            tokio::task::spawn_blocking(move || load_certs(&cert_path)),
-            tokio::task::spawn_blocking(move || load_private_key(&key_path)),
-        )?;
-        let certs = certs?;
-        let key = key?;
-
-        let mut tls_server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
+        let certificate_resolver = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                ReloadingCertificateResolver::new(cert_path, key_path, provider)
+            })
+            .await??,
+        );
+        let mut tls_server_config = tls_builder.with_cert_resolver(certificate_resolver.clone());
 
         // Juicity spec requires ALPN to be h3.
         tls_server_config.alpn_protocols = vec![b"h3".to_vec()];
@@ -185,6 +183,7 @@ impl JuicityServer {
         Ok(Self {
             users: Arc::new(users),
             server_config,
+            certificate_resolver,
             dialer,
             in_flight: Arc::new(crate::inflight::InFlightUnderlayKey::new(
                 consts::IN_FLIGHT_UNDERLAY_TTL,
@@ -305,6 +304,22 @@ impl JuicityServer {
         );
         #[cfg(not(unix))]
         tracing::info!("Juicity server listening on {} (single socket)", log_addr,);
+
+        let certificate_resolver = self.certificate_resolver.clone();
+        let _certificate_guard = AbortOnDrop(
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let resolver = certificate_resolver.clone();
+                    match tokio::task::spawn_blocking(move || resolver.reload()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::warn!(%error, "TLS certificate reload failed; keeping previous certificate"),
+                        Err(error) => tracing::warn!(%error, "TLS certificate reload task failed"),
+                    }
+                }
+            })
+            .abort_handle(),
+        );
 
         // Spawn periodic cleanup task for in-flight underlay keys.
         // AbortOnDrop ensures the task is cancelled when serve() returns.
@@ -1409,6 +1424,96 @@ fn generate_salt_batch() -> Vec<[u8; 32]> {
         batch.push(salt);
     }
     batch
+}
+
+#[derive(Debug)]
+struct ReloadingCertificateResolver {
+    cert_path: String,
+    key_path: String,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    cached: std::sync::RwLock<CachedCertificate>,
+}
+
+#[derive(Debug)]
+struct CachedCertificate {
+    key: Arc<rustls::sign::CertifiedKey>,
+    modified: (std::time::SystemTime, std::time::SystemTime),
+}
+
+impl ReloadingCertificateResolver {
+    fn new(
+        cert_path: String,
+        key_path: String,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> anyhow::Result<Self> {
+        let modified = Self::modified(&cert_path, &key_path)?;
+        let key = rustls::sign::CertifiedKey::from_der(
+            load_certs(&cert_path)?,
+            load_private_key(&key_path)?,
+            &provider,
+        )?;
+        Ok(Self {
+            cert_path,
+            key_path,
+            provider,
+            cached: std::sync::RwLock::new(CachedCertificate {
+                key: Arc::new(key),
+                modified,
+            }),
+        })
+    }
+
+    fn modified(
+        cert_path: &str,
+        key_path: &str,
+    ) -> std::io::Result<(std::time::SystemTime, std::time::SystemTime)> {
+        Ok((
+            std::fs::metadata(cert_path)?.modified()?,
+            std::fs::metadata(key_path)?.modified()?,
+        ))
+    }
+
+    fn reload(&self) -> anyhow::Result<()> {
+        let modified = Self::modified(&self.cert_path, &self.key_path)?;
+        if self
+            .cached
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .modified
+            == modified
+        {
+            return Ok(());
+        }
+        // Publish the pair only after parsing and key matching succeed. A renewal
+        // may replace the files separately; failed loads must be retried.
+        let key = rustls::sign::CertifiedKey::from_der(
+            load_certs(&self.cert_path)?,
+            load_private_key(&self.key_path)?,
+            &self.provider,
+        )?;
+        *self.cached.write().unwrap_or_else(|e| e.into_inner()) = CachedCertificate {
+            key: Arc::new(key),
+            modified,
+        };
+        tracing::info!("TLS certificate reloaded");
+        Ok(())
+    }
+}
+
+impl rustls::server::ResolvesServerCert for ReloadingCertificateResolver {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        // Handshakes only read the cache; file I/O runs on the blocking pool.
+        Some(
+            self.cached
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .key
+                .clone(),
+        )
+    }
 }
 
 fn load_certs(path: &str) -> anyhow::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {

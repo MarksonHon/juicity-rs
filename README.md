@@ -104,6 +104,8 @@ The server and client each use their own JSON config format (see below). Both sh
 | `dialer_link` | string | `""` | Go-compatible dialer link |
 | `disable_outbound_udp443` | bool | `false` | Block outbound UDP on port 443 |
 
+The server checks certificate and private key file modification times every five seconds. Valid replacements apply to new TLS handshakes without restarting or interrupting existing connections. If reloading fails, the previous certificate remains active and the server retries. When using Docker, mount the containing directory so file replacements are visible. Clients using certificate pinning must update their pin when the certificate changes.
+
 ### Client (`client.json`)
 
 ```json
