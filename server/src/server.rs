@@ -559,10 +559,13 @@ async fn run_underlay_packet_loop(
                 // This is the hot path — most packets hit here.
                 let mut payload = packet.payload.clone();
                 if session.cipher.decrypt_in_place(&mut payload).is_ok() {
-                    if send_socket
-                        .send_to(&payload[juicity_underlay::SALT_LEN..], &*pool_target)
-                        .await
-                        .is_ok()
+                    if crate::udp::send_to(
+                        &send_socket,
+                        &payload[juicity_underlay::SALT_LEN..],
+                        &*pool_target,
+                    )
+                    .await
+                    .is_ok()
                     {
                         continue;
                     }
@@ -699,9 +702,12 @@ async fn handle_non_quic_underlay_packet(
                     .0
             }
         };
-        if let Err(e) = send_socket
-            .send_to(&payload[juicity_underlay::SALT_LEN..], &*pool_target)
-            .await
+        if let Err(e) = crate::udp::send_to(
+            &send_socket,
+            &payload[juicity_underlay::SALT_LEN..],
+            &*pool_target,
+        )
+        .await
         {
             udp_pool.remove(&source);
             // Remove the session and abort its relay task.
@@ -853,7 +859,10 @@ async fn handle_non_quic_underlay_packet(
                             break;
                         }
 
-                        if relay_back.send_to(&outbuf, source).await.is_err() {
+                        if crate::udp::send_to(&relay_back, &outbuf, source)
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -894,9 +903,12 @@ async fn handle_non_quic_underlay_packet(
 
     // Send first packet immediately — relay task is already running.
     // Plaintext is at &payload[SALT_LEN..] (salt prefix kept in place).
-    if let Err(e) = send_socket
-        .send_to(&payload[juicity_underlay::SALT_LEN..], &*dial_target)
-        .await
+    if let Err(e) = crate::udp::send_to(
+        &send_socket,
+        &payload[juicity_underlay::SALT_LEN..],
+        &*dial_target,
+    )
+    .await
     {
         udp_pool.remove(&source);
         if let Some(s) = sessions.get(&source) {
@@ -1193,7 +1205,7 @@ async fn handle_udp_relay(
     let mut data = Vec::with_capacity(consts::ETHERNET_MTU);
     data.resize(pkt_len, 0);
     recv_stream.read_exact(&mut data).await?;
-    remote.send_to(&data, first_target_addr).await?;
+    crate::udp::send_to(&remote, &data, first_target_addr).await?;
 
     // Bidirectional relay
     let mut quic_to_remote = {
@@ -1252,7 +1264,7 @@ async fn handle_udp_relay(
                     local_resolved.insert((t_addr_buf.clone(), t_port), resolved);
                     resolved
                 };
-                if let Err(e) = remote.send_to(&payload, target).await {
+                if let Err(e) = crate::udp::send_to(&remote, &payload, target).await {
                     tracing::debug!("UDP relay write error: {:?}", e);
                     break;
                 }
