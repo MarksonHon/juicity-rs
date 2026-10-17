@@ -107,6 +107,7 @@ pub fn wire(ui: &MainWindow) {
         update(move |c, now| c.set_appearance(appearance_from(index), now))
     });
     actions.on_set_autostart(|on| update(move |c, now| c.set_autostart(on, now)));
+    actions.on_install_app_icon(|| update(|c, _| c.install_app_icon()));
     actions.on_set_hide_on_start(|on| update(move |c, now| c.set_hide_on_start(on, now)));
     actions.on_set_close_to_tray(|on| update(move |c, now| c.set_close_to_tray(on, now)));
     actions.on_set_startup_connection(|state| {
@@ -125,6 +126,8 @@ pub fn wire(ui: &MainWindow) {
 
     ui.global::<SettingsStore>()
         .set_autostart_supported(crate::desktop::autostart::SUPPORTED);
+    ui.global::<SettingsStore>()
+        .set_app_icon_supported(crate::desktop::integration::SUPPORTED);
     set_versions(ui);
 }
 

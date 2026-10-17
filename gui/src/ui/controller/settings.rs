@@ -208,6 +208,16 @@ impl Controller {
         Changes::SETTINGS | self.mark_dirty(ConfigFile::Runtime, now)
     }
 
+    /// Install the desktop entry or Start Menu shortcut; the Banner reports it.
+    pub fn install_app_icon(&mut self) -> Changes {
+        match self.effects.install_app_icon() {
+            Ok(()) => Changes::SETTINGS | self.set_notice(Notice::AppIconInstalled),
+            Err(err) => {
+                Changes::SETTINGS | self.set_notice(Notice::AppIconFailed(format!("{err:#}")))
+            }
+        }
+    }
+
     /// Stored now; it takes effect once the tray exists (M4).
     pub fn set_hide_on_start(&mut self, hide: bool, now: Instant) -> Changes {
         if self.gui.runtime.hide_window_on_startup == hide {
@@ -519,6 +529,21 @@ mod tests {
         assert!(changes.settings && changes.notice);
         assert!(!c.settings().autostart);
         assert!(matches!(c.notice().0, Notice::SaveFailed(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_app_icon_reports_success_and_failure() {
+        let dir = temp_dir("settings-app-icon");
+        let (mut c, fake) = controller(&dir);
+        let changes = c.install_app_icon();
+        assert!(changes.settings && changes.notice);
+        assert_eq!(fake.0.borrow().app_icon, 1);
+        assert!(matches!(c.notice().0, Notice::AppIconInstalled));
+        fake.0.borrow_mut().app_icon_error = Some("read-only".into());
+        let changes = c.install_app_icon();
+        assert!(changes.settings && changes.notice);
+        assert!(matches!(c.notice().0, Notice::AppIconFailed(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

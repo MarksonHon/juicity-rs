@@ -98,6 +98,8 @@ pub fn sync_notice(ui: &MainWindow, notice: &CtlNotice) {
         CtlNotice::SaveInvalid => (Notice::SaveInvalid, String::new()),
         CtlNotice::NodeIncomplete(name, _) => (Notice::NodeIncomplete, name.clone()),
         CtlNotice::ProfilesChanged => (Notice::ProfilesChanged, String::new()),
+        CtlNotice::AppIconInstalled => (Notice::AppIconInstalled, String::new()),
+        CtlNotice::AppIconFailed(d) => (Notice::AppIconFailed, d.clone()),
     };
     let state = ui.global::<AppState>();
     state.set_notice(kind);

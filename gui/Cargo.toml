@@ -18,6 +18,8 @@ tracing-subscriber.workspace = true
 tokio.workspace = true
 url.workspace = true
 base64.workspace = true
+# Encodes the share links the QR share sheet shows.
+qrcode.workspace = true
 ureq = "2.9"
 
 slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "renderer-software", "compat-1-2", "accessibility", "unstable-fontique-011", "unstable-winit-030"] }
@@ -37,6 +39,8 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 [target.'cfg(target_os = "windows")'.dependencies]
 # Writes the autostart entry under the Run registry key.
 windows-registry = "0.5"
+# COM bindings for the Start Menu shortcut (IShellLinkW, IPersistFile).
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 # Single instance for the Slint UI: named mutex, named pipe, foreground rights.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 

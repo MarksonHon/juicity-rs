@@ -118,6 +118,14 @@ msgid "Nodes were changed outside juicity; saving will overwrite that change"
 msgstr "节点文件已被其他程序修改，保存会覆盖该修改"
 
 #: gui/ui/state.slint:73
+msgid "App icon installed"
+msgstr "程序图标已安装"
+
+#: gui/ui/state.slint:73
+msgid "Could not install the app icon: {}"
+msgstr "无法安装程序图标：{}"
+
+#: gui/ui/state.slint:73
 msgid "Today {}"
 msgstr "今天 {}"
 
@@ -247,11 +255,11 @@ msgstr "设置"
 msgid "In use"
 msgstr "使用中"
 
-#: gui/ui/components/sheet.slint:40 gui/ui/components/sheet.slint:84
+#: gui/ui/components/sheet.slint:44 gui/ui/components/sheet.slint:88
 msgid "Cancel"
 msgstr "取消"
 
-#: gui/ui/components/sheet.slint:41
+#: gui/ui/components/sheet.slint:9
 msgid "Done"
 msgstr "完成"
 
@@ -339,6 +347,18 @@ msgstr "复制"
 #: gui/ui/pages/node_editor.slint:122
 msgid "Export link"
 msgstr "导出链接"
+
+#: gui/ui/pages/node_editor.slint:133
+msgid "QR code"
+msgstr "二维码分享"
+
+#: gui/ui/pages/node_editor.slint:257
+msgid "Share QR code"
+msgstr "分享二维码"
+
+#: gui/ui/pages/node_editor.slint:258
+msgid "Close"
+msgstr "关闭"
 
 #: gui/ui/pages/node_editor.slint:127 gui/ui/pages/nodes.slint:64
 msgid "Delete"
@@ -484,6 +504,22 @@ msgstr "开启"
 #: gui/ui/pages/settings.slint:112 gui/ui/pages/settings.slint:116
 msgid "Last state"
 msgstr "保持上次状态"
+
+#: gui/ui/pages/settings.slint:141
+msgid "System integration"
+msgstr "系统集成"
+
+#: gui/ui/pages/settings.slint:143
+msgid "Program icon"
+msgstr "程序图标"
+
+#: gui/ui/pages/settings.slint:144
+msgid "Show the icon in the system app menu"
+msgstr "在系统应用菜单中显示图标"
+
+#: gui/ui/pages/settings.slint:146
+msgid "Install app icon to the system"
+msgstr "安装程序图标到系统"
 
 #: gui/ui/pages/settings.slint:128
 msgid "SOCKS5 and HTTP share this port"

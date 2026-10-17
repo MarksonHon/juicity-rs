@@ -47,6 +47,8 @@ pub trait Effects {
     fn paste_text(&mut self) -> anyhow::Result<String>;
     /// Enable or disable starting at login.
     fn set_autostart(&mut self, enabled: bool) -> anyhow::Result<()>;
+    /// Install the desktop entry (Linux) or the Start Menu shortcut (Windows).
+    fn install_app_icon(&mut self) -> anyhow::Result<()>;
     /// Cumulative `(tx, rx)` byte counters of the running core.
     fn traffic(&mut self, core: &mut CoreManager) -> Option<(u64, u64)>;
 }
@@ -93,6 +95,10 @@ impl Effects for NativeEffects {
         crate::desktop::autostart::apply(enabled)
     }
 
+    fn install_app_icon(&mut self) -> anyhow::Result<()> {
+        crate::desktop::integration::install()
+    }
+
     fn traffic(&mut self, core: &mut CoreManager) -> Option<(u64, u64)> {
         core.traffic()
     }
@@ -136,6 +142,10 @@ pub enum Notice {
     NodeIncomplete(String, Vec<RequiredField>),
     /// profiles.json changed on disk while nodes had unsaved edits.
     ProfilesChanged,
+    /// The desktop entry / Start Menu shortcut was installed.
+    AppIconInstalled,
+    /// Installing the desktop entry / Start Menu shortcut failed.
+    AppIconFailed(String),
 }
 
 impl Notice {
@@ -156,6 +166,7 @@ impl Notice {
                 | Self::SaveInvalid
                 | Self::NodeIncomplete(..)
                 | Self::ProfilesChanged
+                | Self::AppIconFailed(_)
         )
     }
 }
@@ -467,6 +478,9 @@ pub mod testing {
         /// Autostart requests, in order.
         pub autostart: Vec<bool>,
         pub autostart_error: Option<String>,
+        /// How often the app icon install was requested.
+        pub app_icon: usize,
+        pub app_icon_error: Option<String>,
         /// Counters returned to the traffic sampler.
         pub traffic: Option<(u64, u64)>,
         /// How often the traffic counters were read.
@@ -538,6 +552,15 @@ pub mod testing {
                 let exe = std::path::Path::new("/usr/bin/juicity-gui");
                 return crate::desktop::autostart::apply_in(dir, enabled, exe);
             }
+            Ok(())
+        }
+
+        fn install_app_icon(&mut self) -> anyhow::Result<()> {
+            let mut state = self.0.borrow_mut();
+            if let Some(err) = state.app_icon_error.clone() {
+                anyhow::bail!("{err}");
+            }
+            state.app_icon += 1;
             Ok(())
         }
 

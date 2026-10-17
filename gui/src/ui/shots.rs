@@ -26,6 +26,10 @@ const MIN_HEIGHT: u32 = 640;
 /// A render fails when more than this share of its pixels differ from the
 /// golden in any channel.
 const GOLDEN_TOLERANCE: f64 = 0.002;
+/// The share link of the node the fixture editor shows, as
+/// `link::export_share_link` builds it from the values in [`fixture`].
+const SHARE_LINK: &str = "juicity://8f3c2a71-5b9e-4d0a-9c6f-2e7b1d4a6c90:correct-pass@\
+                          tokyo.example.com:443?congestion_control=bbr#%E6%9D%B1%E4%BA%AC%2001";
 
 struct HeadlessPlatform {
     window: Rc<MinimalSoftwareWindow>,
@@ -346,6 +350,8 @@ fn shots() -> anyhow::Result<()> {
                 // Unsaved node edits: the enabled footer, then the prompt.
                 (Page::Nodes, "nodes-dirty", HEIGHT),
                 (Page::Nodes, "save-prompt", HEIGHT),
+                // The share sheet over the editor.
+                (Page::Nodes, "share", HEIGHT),
                 (Page::Logs, "logs", HEIGHT),
                 (Page::Settings, "settings", SETTINGS_HEIGHT),
             ] {
@@ -355,6 +361,14 @@ fn shots() -> anyhow::Result<()> {
                     .set_dirty(page_name == "nodes-dirty" || page_name == "save-prompt");
                 ui.global::<AppState>()
                     .set_save_prompt(page_name == "save-prompt");
+                let share = page_name == "share";
+                if share {
+                    let mask = crate::qr::mask(SHARE_LINK)?;
+                    let store = ui.global::<NodeStore>();
+                    store.set_qr_link(SHARE_LINK.into());
+                    store.set_qr_image(crate::qr::image(&mask));
+                }
+                ui.global::<NodeStore>().set_qr_open(share);
                 let mut pixels = SharedPixelBuffer::<Rgb8Pixel>::new(WIDTH, height);
                 window.request_redraw();
                 anyhow::ensure!(
@@ -374,15 +388,11 @@ fn shots() -> anyhow::Result<()> {
                     image::ColorType::Rgb8,
                 )?;
                 println!("Rendered {}", path.display());
-                if matches!(language, UiLang::En | UiLang::ZhTw | UiLang::Ru)
-                    || page == Page::Settings
-                {
-                    failures.extend(compare_golden(
-                        &root.join("tests/golden").join(&filename),
-                        &output.join(format!("diff--golden--{filename}")),
-                        &pixels,
-                    )?);
-                }
+                failures.extend(compare_golden(
+                    &root.join("tests/golden").join(&filename),
+                    &output.join(format!("diff--golden--{filename}")),
+                    &pixels,
+                )?);
                 // Only these pages have mockups.
                 if language == UiLang::ZhTw
                     && ["overview", "nodes", "settings"].contains(&page_name)

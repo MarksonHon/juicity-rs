@@ -2,7 +2,7 @@ import { Theme, Icons } from "theme.slint";
 import { Sidebar } from "components/nav.slint";
 import { OverviewPage } from "pages/overview.slint";
 import { NodesPage } from "pages/nodes.slint";
-import { AdvancedSheet } from "pages/node_editor.slint";
+import { AdvancedSheet, ShareSheet } from "pages/node_editor.slint";
 import { SettingsPage, SettingSheet } from "pages/settings.slint";
 import { LogsPage } from "pages/logs.slint";
 import { Page, AppState, NodeStore, SettingsStore, Actions, Fmt, TrayText } from "state.slint";
@@ -30,7 +30,7 @@ export component MainWindow inherits Window {
             // Cmd-Q is the accelerator of Quit in the macOS application
             // menu (desktop/tray/native.rs), so it is not handled here.
             // Ctrl/Cmd+S saves nodes while the Nodes page has no sheet open.
-            if event.modifiers.control && event.text.to-lowercase() == "s" && AppState.page == Page.nodes && !NodeStore.advanced-open && !AppState.save-prompt {
+            if event.modifiers.control && event.text.to-lowercase() == "s" && AppState.page == Page.nodes && !NodeStore.advanced-open && !NodeStore.qr-open && !AppState.save-prompt {
                 Actions.save-nodes();
                 return accept;
             }
@@ -73,6 +73,7 @@ export component MainWindow inherits Window {
             height: root.height;
         }
         if NodeStore.advanced-open: AdvancedSheet { }
+        if NodeStore.qr-open: ShareSheet { }
         if SettingsStore.sheet-open: SettingSheet { }
         // Shown before closing or quitting with unsaved node edits.
         if AppState.save-prompt: Prompt {

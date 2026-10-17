@@ -7,6 +7,7 @@
 use super::{Changes, Controller, Notice};
 use crate::config::{normalize_congestion_control, ProxyProfile, ProxyProtocol};
 use crate::link;
+use crate::qr::{self, QrMask};
 use crate::state::{non_empty_text, GuiState};
 use crate::util::format_host_port;
 use crate::validate::{missing_fields, RequiredField};
@@ -256,6 +257,14 @@ impl DraftData {
     }
 }
 
+/// The share sheet: the selected node's share link and its QR code, both
+/// captured when the sheet opens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QrShare {
+    pub link: String,
+    pub mask: QrMask,
+}
+
 /// One row of the node list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowData {
@@ -276,6 +285,8 @@ pub struct NodesSnapshot {
     pub reconnect_required: bool,
     /// The Advanced sheet draft while the sheet is open.
     pub advanced: Option<DraftData>,
+    /// The share sheet while it is open.
+    pub qr: Option<QrShare>,
     /// The working list differs from the saved one.
     pub dirty: bool,
     /// The unsaved-changes prompt is open.
@@ -288,6 +299,8 @@ pub(super) struct NodesState {
     pub(super) errors: Vec<(DraftField, DraftError)>,
     pub(super) advanced: Option<DraftData>,
     pub(super) advanced_errors: Vec<(DraftField, DraftError)>,
+    /// The share sheet: the link and its QR code, captured when it opens.
+    pub(super) qr: Option<QrShare>,
     /// The profile the running core was started with.
     pub(super) started_with: Option<ProxyProfile>,
 }
@@ -307,6 +320,7 @@ impl NodesState {
             errors: Vec::new(),
             advanced: None,
             advanced_errors: Vec::new(),
+            qr: None,
             started_with: None,
         }
     }
@@ -345,6 +359,7 @@ impl Controller {
                 && state.selected == active
                 && state.started_with.as_ref() != self.saved.profiles.profiles.get(active),
             advanced: state.advanced.clone(),
+            qr: state.qr.clone(),
             dirty: self.nodes_dirty(),
             prompt: self.prompt_open(),
         }
@@ -367,6 +382,8 @@ impl Controller {
             .map(DraftData::from_profile)
             .unwrap_or_default();
         state.errors.clear();
+        // The share sheet belongs to the node it was opened for.
+        state.qr = None;
         Changes::EDITOR
     }
 
@@ -566,19 +583,51 @@ impl Controller {
 
     /// Export link: copy the selected node's share link.
     pub fn export_link(&mut self) -> Changes {
-        // The stored profile would not match what the editor shows.
-        if !self.nodes.errors.is_empty() {
-            return self.set_notice(Notice::ExportInvalid);
+        match self.share_link() {
+            Some(Ok(link)) => match self.effects.copy_text(&link) {
+                Ok(()) => self.set_notice(Notice::LinkCopied),
+                Err(err) => self.set_notice(Notice::ExportFailed(format!("{err:#}"))),
+            },
+            Some(Err(notice)) => self.set_notice(notice),
+            None => Changes::NONE,
         }
-        let Some(profile) = self.gui.profiles.profiles.get(self.nodes.selected) else {
-            return Changes::NONE;
+    }
+
+    /// Share QR code: open the sheet that shows the selected node's share
+    /// link as a QR code, so another client can scan it.
+    pub fn share_qr_code(&mut self) -> Changes {
+        let link = match self.share_link() {
+            Some(Ok(link)) => link,
+            Some(Err(notice)) => return self.set_notice(notice),
+            None => return Changes::NONE,
         };
-        let copied =
-            link::export_share_link(profile).and_then(|link| self.effects.copy_text(&link));
-        match copied {
-            Ok(()) => self.set_notice(Notice::LinkCopied),
+        match qr::mask(&link) {
+            Ok(mask) => {
+                self.nodes.qr = Some(QrShare { link, mask });
+                Changes::NODES
+            }
             Err(err) => self.set_notice(Notice::ExportFailed(format!("{err:#}"))),
         }
+    }
+
+    /// Close the share sheet (Done, Esc or a click on the scrim).
+    pub fn close_qr_code(&mut self) -> Changes {
+        self.nodes.qr = None;
+        Changes::NODES
+    }
+
+    /// The selected node's share link: `None` when there is no node to share,
+    /// `Err` with the notice to show when it cannot be built.
+    fn share_link(&self) -> Option<Result<String, Notice>> {
+        // The stored profile would not match what the editor shows.
+        if !self.nodes.errors.is_empty() {
+            return Some(Err(Notice::ExportInvalid));
+        }
+        let profile = self.gui.profiles.profiles.get(self.nodes.selected)?;
+        Some(
+            link::export_share_link(profile)
+                .map_err(|err| Notice::ExportFailed(format!("{err:#}"))),
+        )
     }
 
     pub fn open_advanced(&mut self) -> Changes {
@@ -826,6 +875,49 @@ mod tests {
         };
         assert!(!reason.contains("secret"), "{reason}");
         assert_eq!(c.node_count(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn share_qr_opens_with_the_selected_link() {
+        let dir = temp_dir("nodes-share-qr");
+        let (mut c, fake) = controller(&dir);
+        assert_eq!(c.nodes().qr, None);
+        assert!(c.share_qr_code().nodes);
+        let share = c.nodes().qr.expect("the share sheet is open");
+        assert!(share.link.starts_with("juicity://"), "{}", share.link);
+        assert!(
+            share.link.contains("tokyo.example.com:443"),
+            "{}",
+            share.link
+        );
+        // The sheet encodes exactly the link `Export link` copies.
+        assert_eq!(share.mask, qr::mask(&share.link).unwrap());
+        let _ = c.export_link();
+        assert_eq!(fake.0.borrow().copied, [share.link]);
+        assert!(c.close_qr_code().nodes);
+        assert_eq!(c.nodes().qr, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn share_qr_refuses_an_invalid_editor() {
+        let dir = temp_dir("nodes-share-qr-invalid");
+        let (mut c, _) = controller(&dir);
+        let _ = c.edit_node(DraftField::Server, "");
+        assert!(!c.share_qr_code().nodes);
+        assert_eq!(c.notice().0, Notice::ExportInvalid);
+        assert_eq!(c.nodes().qr, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selecting_another_node_closes_the_share_sheet() {
+        let (dir, mut c, _) = two_nodes("nodes-share-qr-select");
+        let _ = c.share_qr_code();
+        assert!(c.nodes().qr.is_some());
+        let _ = c.select_node(1);
+        assert_eq!(c.nodes().qr, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

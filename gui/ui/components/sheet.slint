@@ -4,6 +4,10 @@ import { Card, Button, Icon } from "primitives.slint";
 export component Sheet inherits Rectangle {
     in property <bool> open;
     in property <string> title;
+    // Footer: `accept-text` labels the commit button, `cancellable` adds the
+    // Cancel button beside it (a sheet that only closes hides it).
+    in property <string> accept-text: @tr("Done");
+    in property <bool> cancellable: true;
     // Bind this to the final field's has-focus property.
     in property <bool> last-field-focused;
     callback cancelled;
@@ -37,8 +41,8 @@ export component Sheet inherits Rectangle {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 8px;
-                    Button { text: @tr("Cancel"); clicked => { root.cancelled(); } }
-                    Button { text: @tr("Done"); clicked => { root.completed(); } }
+                    if root.cancellable: Button { text: @tr("Cancel"); clicked => { root.cancelled(); } }
+                    Button { text: root.accept-text; clicked => { root.completed(); } }
                 }
             }
         }

@@ -15,7 +15,9 @@ A [Slint](https://slint.dev) 1.18 desktop frontend (winit + FemtoVG) for the Jui
 - Single mixed inbound port per protocol (SOCKS5 and HTTP proxy on the same
   address); the system proxy and PAC both point at it
 - Profile/protocol selectors and a server editor with per-field validation
-- URL import/export entry for `juicity://` and `ss://` with parser validation
+- URL import/export entry for `juicity://` and `ss://` with parser validation,
+  and a **QR code** share sheet that shows the selected node's link for another
+  client to scan
 - System tray support:
   - Linux: StatusNotifierItem via `ksni` (background thread)
   - Windows/macOS: native tray via `tray-icon` (polled on the main loop)
@@ -72,10 +74,11 @@ with `include_bytes!`:
   SVG, set through `Window.icon` in `ui/app.slint`
 - `gui/macos/bundle.sh` builds `icon.icns` from the generated PNGs, so no SVG
   converter has to be installed to produce a bundled app
-- On Linux the app installs its desktop entry and hicolor icons into
-  `$XDG_DATA_HOME` (default `~/.local/share`) on start, so Wayland compositors,
-  which look the icon up by app id, show it; this is skipped when a system-wide
-  `io.juicity.gui.desktop` exists
+- The Settings page has an **Install app icon to the system** button: on Linux it
+  writes the desktop entry and hicolor icons into `$XDG_DATA_HOME` (default
+  `~/.local/share`), so Wayland compositors, which look the icon up by app id,
+  show it (skipped when a system-wide `io.juicity.gui.desktop` exists); on
+  Windows it writes a Start Menu shortcut to the executable
 
 ## Config directory
 

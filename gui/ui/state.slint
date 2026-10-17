@@ -5,7 +5,7 @@ export enum PacRule { bypass-china, gfw-list }
 export enum PacSource { local, online }
 export enum Protocol { juicity, shadowsocks }
 export enum StartupConnection { off, on, last }
-export enum Notice { none, imported, link-copied, start-failed, rules-updated, rules-failed, proxy-failed, save-failed, core-exited, no-node, missing-fields, import-failed, export-failed, import-partial, export-invalid, nodes-save-failed, save-invalid, node-incomplete, profiles-changed }
+export enum Notice { none, imported, link-copied, start-failed, rules-updated, rules-failed, proxy-failed, save-failed, core-exited, no-node, missing-fields, import-failed, export-failed, import-partial, export-invalid, nodes-save-failed, save-invalid, node-incomplete, profiles-changed, app-icon-installed, app-icon-failed }
 export enum NodeField { name, protocol, server, port, uuid, password, method, sni, allow-insecure, pinned-certchain-sha256, congestion-control, plugin, plugin-options, plugin-args, timeout, group }
 export enum SettingField { mixed-port, direct-url, proxy-url, update-hours, pac-listen, online-pac-url }
 export enum NodeCommand { move-up, move-down, duplicate, delete }
@@ -70,7 +70,7 @@ export global AppState {
     in-out property <bool> save-prompt;
     out property <string> connection-text: connection == Connection.running ? @tr("Connected · {}", active-name) : connection == Connection.starting ? @tr("Connecting…") : @tr("Disconnected");
     out property <string> proxy-text: proxy-mode == ProxyMode.pac ? @tr("System proxy · PAC") : proxy-mode == ProxyMode.global ? @tr("System proxy · Global") : @tr("System proxy · Off");
-    out property <string> notice-text: notice == Notice.imported ? @tr("Links imported") : notice == Notice.link-copied ? @tr("Link copied") : notice == Notice.start-failed ? @tr("Could not start proxy: {}", notice-detail) : notice == Notice.rules-updated ? @tr("Rules updated") : notice == Notice.rules-failed ? @tr("Could not update rules: {}", notice-detail) : notice == Notice.proxy-failed ? @tr("Could not set system proxy: {}", notice-detail) : notice == Notice.save-failed ? @tr("Could not save settings: {}", notice-detail) : notice == Notice.core-exited ? @tr("Proxy stopped: {}", notice-detail) : notice == Notice.no-node ? @tr("Add a node first") : notice == Notice.missing-fields ? @tr("Missing fields: {}", notice-detail) : notice == Notice.import-failed ? @tr("Could not import link: {}", notice-detail) : notice == Notice.export-failed ? @tr("Could not export link: {}", notice-detail) : notice == Notice.import-partial ? @tr("Links imported: {}, skipped: {}", notice-detail, notice-extra) : notice == Notice.export-invalid ? @tr("Fix the invalid fields before exporting") : notice == Notice.nodes-save-failed ? @tr("Could not save nodes: {}", notice-detail) : notice == Notice.save-invalid ? @tr("Fix the invalid fields before saving") : notice == Notice.node-incomplete ? @tr("Missing fields in {}: {}", notice-detail, notice-extra) : notice == Notice.profiles-changed ? @tr("Nodes were changed outside juicity; saving will overwrite that change") : "";
+    out property <string> notice-text: notice == Notice.imported ? @tr("Links imported") : notice == Notice.link-copied ? @tr("Link copied") : notice == Notice.start-failed ? @tr("Could not start proxy: {}", notice-detail) : notice == Notice.rules-updated ? @tr("Rules updated") : notice == Notice.rules-failed ? @tr("Could not update rules: {}", notice-detail) : notice == Notice.proxy-failed ? @tr("Could not set system proxy: {}", notice-detail) : notice == Notice.save-failed ? @tr("Could not save settings: {}", notice-detail) : notice == Notice.core-exited ? @tr("Proxy stopped: {}", notice-detail) : notice == Notice.no-node ? @tr("Add a node first") : notice == Notice.missing-fields ? @tr("Missing fields: {}", notice-detail) : notice == Notice.import-failed ? @tr("Could not import link: {}", notice-detail) : notice == Notice.export-failed ? @tr("Could not export link: {}", notice-detail) : notice == Notice.import-partial ? @tr("Links imported: {}, skipped: {}", notice-detail, notice-extra) : notice == Notice.export-invalid ? @tr("Fix the invalid fields before exporting") : notice == Notice.nodes-save-failed ? @tr("Could not save nodes: {}", notice-detail) : notice == Notice.save-invalid ? @tr("Fix the invalid fields before saving") : notice == Notice.node-incomplete ? @tr("Missing fields in {}: {}", notice-detail, notice-extra) : notice == Notice.profiles-changed ? @tr("Nodes were changed outside juicity; saving will overwrite that change") : notice == Notice.app-icon-installed ? @tr("App icon installed") : notice == Notice.app-icon-failed ? @tr("Could not install the app icon: {}", notice-detail) : "";
     out property <string> rules-updated-at: rules-age-days == 0 ? @tr("Today {}", rules-time) : rules-age-days == 1 ? @tr("Yesterday {}", rules-time) : rules-time;
 }
 export global NodeStore {
@@ -90,6 +90,10 @@ export global NodeStore {
     in-out property <int> draft-serial;
     // Bumped when the Advanced sheet opens; its text fields reload only then.
     in-out property <int> advanced-serial;
+    // The share sheet: the QR code of `qr-link`, rendered by Rust.
+    in-out property <bool> qr-open;
+    in-out property <string> qr-link;
+    in-out property <image> qr-image;
     in-out property <string> server-error;
     in-out property <string> uuid-error;
     in-out property <string> password-error;
@@ -102,6 +106,8 @@ export global SettingsStore {
     in-out property <bool> autostart;
     // False where starting at login is not implemented yet.
     in-out property <bool> autostart-supported: true;
+    // False where installing the app icon is not implemented yet.
+    in-out property <bool> app-icon-supported: true;
     in-out property <bool> hide-on-start;
     in-out property <bool> close-to-tray;
     in-out property <StartupConnection> startup-connection: StartupConnection.off;
@@ -167,6 +173,8 @@ export global Actions {
     callback edit-node(NodeField, string);
     callback set-active-node;
     callback export-link;
+    callback share-qr-code;
+    callback close-qr-code;
     callback open-advanced;
     callback edit-advanced(NodeField, string);
     callback commit-advanced;
@@ -178,6 +186,7 @@ export global Actions {
     callback prompt-discard;
     callback prompt-cancel;
     callback set-autostart(bool);
+    callback install-app-icon;
     callback set-language(int);
     callback set-appearance(int);
     callback set-hide-on-start(bool);
