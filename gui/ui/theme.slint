@@ -33,6 +33,12 @@ export global Theme {
     // Orange dark enough to read as text on a light card.
     out property <color> warn-text: dark ? #FF9F0A : #B25000;
     out property <color> scrim: #00000066;
+    // The share QR code follows the theme: dark modules on a white tile in the
+    // light theme, light modules on a dark tile in the dark one. Scanners on
+    // phones read the inverted symbol too, strict decoders (zbar) only read
+    // the light-theme one.
+    out property <color> qr-surface: dark ? #1C1C1E : #FFFFFF;
+    out property <color> qr-ink: dark ? #F5F5F7 : #1C1C1E;
     in-out property <string> cjk: "Noto Sans CJK TC";
     // Faces for the 简体中文 and 繁體中文 language names: in a Latin UI the
     // system fallback may pick a Japanese face that lacks simplified glyphs.

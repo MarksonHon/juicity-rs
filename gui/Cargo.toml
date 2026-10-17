@@ -18,6 +18,8 @@ tracing-subscriber.workspace = true
 tokio.workspace = true
 url.workspace = true
 base64.workspace = true
+# Encodes the share links the QR share sheet shows.
+qrcode.workspace = true
 ureq = "2.9"
 
 slint = { version = "=1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "renderer-software", "compat-1-2", "accessibility", "unstable-fontique-011", "unstable-winit-030"] }

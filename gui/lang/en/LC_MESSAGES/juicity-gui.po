@@ -255,11 +255,11 @@ msgstr "Settings"
 msgid "In use"
 msgstr "In use"
 
-#: gui/ui/components/sheet.slint:40 gui/ui/components/sheet.slint:84
+#: gui/ui/components/sheet.slint:44 gui/ui/components/sheet.slint:88
 msgid "Cancel"
 msgstr "Cancel"
 
-#: gui/ui/components/sheet.slint:41
+#: gui/ui/components/sheet.slint:9
 msgid "Done"
 msgstr "Done"
 
@@ -348,6 +348,18 @@ msgstr "Duplicate"
 #: gui/ui/pages/node_editor.slint:122
 msgid "Export link"
 msgstr "Export link"
+
+#: gui/ui/pages/node_editor.slint:133
+msgid "QR code"
+msgstr "QR code"
+
+#: gui/ui/pages/node_editor.slint:257
+msgid "Share QR code"
+msgstr "Share QR code"
+
+#: gui/ui/pages/node_editor.slint:258
+msgid "Close"
+msgstr "Close"
 
 #: gui/ui/pages/node_editor.slint:127 gui/ui/pages/nodes.slint:64
 msgid "Delete"

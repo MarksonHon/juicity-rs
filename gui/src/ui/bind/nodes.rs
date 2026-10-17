@@ -122,6 +122,8 @@ pub fn wire(ui: &MainWindow) {
     });
     actions.on_set_active_node(|| update(|c, now| c.set_active_node(now)));
     actions.on_export_link(|| update(|c, _| c.export_link()));
+    actions.on_share_qr_code(|| update(|c, _| c.share_qr_code()));
+    actions.on_close_qr_code(|| update(|c, _| c.close_qr_code()));
     actions.on_open_advanced(|| update(|c, _| c.open_advanced()));
     actions.on_edit_advanced(|field, value| {
         update(|c, _| c.edit_advanced(field_from(field), &value));
@@ -237,6 +239,21 @@ pub fn sync(ui: &MainWindow, snapshot: &NodesSnapshot, editor: bool) {
         }
         None => store.set_advanced_open(false),
     }
+    sync_qr(&store, snapshot);
+}
+
+/// Push the share sheet. The image holds one pixel per module and is rebuilt
+/// only when the link changes, so the QR code is not re-encoded on every sync.
+fn sync_qr(store: &NodeStore, snapshot: &NodesSnapshot) {
+    let Some(share) = &snapshot.qr else {
+        store.set_qr_open(false);
+        return;
+    };
+    if store.get_qr_link().as_str() != share.link.as_str() {
+        store.set_qr_link(share.link.as_str().into());
+        store.set_qr_image(crate::qr::image(&share.mask));
+    }
+    store.set_qr_open(true);
 }
 
 #[cfg(test)]
@@ -391,6 +408,37 @@ mod tests {
                 text: Key::Control.into(),
             });
         }
+    }
+
+    #[test]
+    fn share_qr_sheet_opens_with_an_image_and_closes() {
+        let (ui, dir) = setup("bind-nodes-share-qr");
+        let store = ui.global::<NodeStore>();
+        let actions = ui.global::<Actions>();
+        assert!(!store.get_qr_open());
+        actions.invoke_share_qr_code();
+        assert!(store.get_qr_open());
+        assert!(store.get_qr_link().starts_with("juicity://"));
+        // One pixel per module, drawn at 240 px by the sheet.
+        assert!(store.get_qr_image().size().width >= 21);
+        actions.invoke_close_qr_code();
+        assert!(!store.get_qr_open());
+        teardown(&dir);
+    }
+
+    /// The sheet takes the focus when it opens, which is what makes Esc
+    /// close it (and keeps keys away from the editor behind the scrim).
+    #[test]
+    fn escape_closes_the_share_qr_sheet() {
+        use slint::platform::Key;
+        let (ui, dir) = setup("bind-nodes-share-qr-escape");
+        let store = ui.global::<NodeStore>();
+        ui.global::<Actions>().invoke_share_qr_code();
+        assert!(store.get_qr_open());
+        let escape: SharedString = Key::Escape.into();
+        press(&ui, &escape, false);
+        assert!(!store.get_qr_open());
+        teardown(&dir);
     }
 
     #[test]

@@ -263,6 +263,15 @@ msgstr "Дублировать"
 msgid "Export link"
 msgstr "Экспорт"
 
+msgid "QR code"
+msgstr "QR-код"
+
+msgid "Share QR code"
+msgstr "Поделиться QR-кодом"
+
+msgid "Close"
+msgstr "Закрыть"
+
 msgid "Delete"
 msgstr "Удалить"
 

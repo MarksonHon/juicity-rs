@@ -3883,6 +3883,7 @@ dependencies = [
  "juicity-common",
  "ksni",
  "notify",
+ "qrcode",
  "resvg 0.44.0",
  "serde",
  "serde_json",

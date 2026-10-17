@@ -90,6 +90,10 @@ export global NodeStore {
     in-out property <int> draft-serial;
     // Bumped when the Advanced sheet opens; its text fields reload only then.
     in-out property <int> advanced-serial;
+    // The share sheet: the QR code of `qr-link`, rendered by Rust.
+    in-out property <bool> qr-open;
+    in-out property <string> qr-link;
+    in-out property <image> qr-image;
     in-out property <string> server-error;
     in-out property <string> uuid-error;
     in-out property <string> password-error;
@@ -169,6 +173,8 @@ export global Actions {
     callback edit-node(NodeField, string);
     callback set-active-node;
     callback export-link;
+    callback share-qr-code;
+    callback close-qr-code;
     callback open-advanced;
     callback edit-advanced(NodeField, string);
     callback commit-advanced;

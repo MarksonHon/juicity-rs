@@ -15,7 +15,9 @@ A [Slint](https://slint.dev) 1.18 desktop frontend (winit + FemtoVG) for the Jui
 - Single mixed inbound port per protocol (SOCKS5 and HTTP proxy on the same
   address); the system proxy and PAC both point at it
 - Profile/protocol selectors and a server editor with per-field validation
-- URL import/export entry for `juicity://` and `ss://` with parser validation
+- URL import/export entry for `juicity://` and `ss://` with parser validation,
+  and a **QR code** share sheet that shows the selected node's link for another
+  client to scan
 - System tray support:
   - Linux: StatusNotifierItem via `ksni` (background thread)
   - Windows/macOS: native tray via `tray-icon` (polled on the main loop)

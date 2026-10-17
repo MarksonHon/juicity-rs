@@ -130,6 +130,7 @@ export component NodeEditor inherits Card {
                     spacing: 8px;
                     Button { text: @tr("Set as active"); clicked => { Actions.set-active-node(); } }
                     Button { text: @tr("Export link"); clicked => { Actions.export-link(); } }
+                    Button { text: @tr("QR code"); clicked => { Actions.share-qr-code(); } }
                     Rectangle { horizontal-stretch: 1; }
                     more := IconButton {
                         icon: Icons.more;
@@ -245,4 +246,52 @@ export component AdvancedSheet inherits Sheet {
         }
     }
     if NodeStore.timeout-error != "": Caption { text: NodeStore.timeout-error; color: Theme.red; }
+}
+
+// Share sheet: the node's share link as a QR code another client can scan.
+// The code is inverted with the theme (see `Theme.qr-surface`/`qr-ink`); the
+// image is one pixel per module, which is why it is scaled with
+// `image-rendering: pixelated`.
+export component ShareSheet inherits Sheet {
+    open: true;
+    title: @tr("Share QR code");
+    accept-text: @tr("Close");
+    cancellable: false;
+    cancelled => { Actions.close-qr-code(); }
+    completed => { Actions.close-qr-code(); }
+    // Take the focus so Esc and the scrim close the sheet and the editor
+    // behind it stops receiving keys; `open` is a constant here, so the
+    // Sheet's own focus-on-open never runs.
+    init => { self.focus(); }
+    VerticalLayout {
+        spacing: 12px;
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 256px;
+                height: 256px;
+                background: Theme.qr-surface;
+                border-radius: 12px;
+                Image {
+                    x: 8px;
+                    y: 8px;
+                    width: 240px;
+                    height: 240px;
+                    source: NodeStore.qr-image;
+                    image-rendering: pixelated;
+                    colorize: Theme.qr-ink;
+                }
+            }
+        }
+        Text {
+            text: NodeStore.qr-link;
+            font-family: Theme.mono;
+            font-size: 11px;
+            color: Theme.secondary;
+            horizontal-alignment: center;
+            wrap: char-wrap;
+            overflow: elide;
+            height: 32px;
+        }
+    }
 }

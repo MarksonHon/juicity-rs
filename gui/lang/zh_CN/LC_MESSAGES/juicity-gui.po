@@ -255,11 +255,11 @@ msgstr "设置"
 msgid "In use"
 msgstr "使用中"
 
-#: gui/ui/components/sheet.slint:40 gui/ui/components/sheet.slint:84
+#: gui/ui/components/sheet.slint:44 gui/ui/components/sheet.slint:88
 msgid "Cancel"
 msgstr "取消"
 
-#: gui/ui/components/sheet.slint:41
+#: gui/ui/components/sheet.slint:9
 msgid "Done"
 msgstr "完成"
 
@@ -347,6 +347,18 @@ msgstr "复制"
 #: gui/ui/pages/node_editor.slint:122
 msgid "Export link"
 msgstr "导出链接"
+
+#: gui/ui/pages/node_editor.slint:133
+msgid "QR code"
+msgstr "二维码分享"
+
+#: gui/ui/pages/node_editor.slint:257
+msgid "Share QR code"
+msgstr "分享二维码"
+
+#: gui/ui/pages/node_editor.slint:258
+msgid "Close"
+msgstr "关闭"
 
 #: gui/ui/pages/node_editor.slint:127 gui/ui/pages/nodes.slint:64
 msgid "Delete"

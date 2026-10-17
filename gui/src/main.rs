@@ -13,6 +13,7 @@ mod i18n;
 mod link;
 mod logging;
 mod pac;
+mod qr;
 mod state;
 mod system_proxy;
 mod traffic;
