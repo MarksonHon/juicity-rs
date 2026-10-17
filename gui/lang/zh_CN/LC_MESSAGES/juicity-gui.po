@@ -118,6 +118,14 @@ msgid "Nodes were changed outside juicity; saving will overwrite that change"
 msgstr "节点文件已被其他程序修改，保存会覆盖该修改"
 
 #: gui/ui/state.slint:73
+msgid "App icon installed"
+msgstr "程序图标已安装"
+
+#: gui/ui/state.slint:73
+msgid "Could not install the app icon: {}"
+msgstr "无法安装程序图标：{}"
+
+#: gui/ui/state.slint:73
 msgid "Today {}"
 msgstr "今天 {}"
 
@@ -484,6 +492,22 @@ msgstr "开启"
 #: gui/ui/pages/settings.slint:112 gui/ui/pages/settings.slint:116
 msgid "Last state"
 msgstr "保持上次状态"
+
+#: gui/ui/pages/settings.slint:141
+msgid "System integration"
+msgstr "系统集成"
+
+#: gui/ui/pages/settings.slint:143
+msgid "Program icon"
+msgstr "程序图标"
+
+#: gui/ui/pages/settings.slint:144
+msgid "Show the icon in the system app menu"
+msgstr "在系统应用菜单中显示图标"
+
+#: gui/ui/pages/settings.slint:146
+msgid "Install app icon to the system"
+msgstr "安装程序图标到系统"
 
 #: gui/ui/pages/settings.slint:128
 msgid "SOCKS5 and HTTP share this port"

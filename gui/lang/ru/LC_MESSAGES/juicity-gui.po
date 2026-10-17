@@ -88,6 +88,12 @@ msgstr "Заполните поля узла {}: {}"
 msgid "Nodes were changed outside juicity; saving will overwrite that change"
 msgstr "Узлы изменены вне juicity; сохранение перезапишет это изменение"
 
+msgid "App icon installed"
+msgstr "Значок программы установлен"
+
+msgid "Could not install the app icon: {}"
+msgstr "Не удалось установить значок программы: {}"
+
 msgid "Today {}"
 msgstr "сегодня {}"
 
@@ -367,6 +373,18 @@ msgstr "Вкл."
 
 msgid "Last state"
 msgstr "Последнее состояние"
+
+msgid "System integration"
+msgstr "Системная интеграция"
+
+msgid "Program icon"
+msgstr "Значок программы"
+
+msgid "Show the icon in the system app menu"
+msgstr "Показывать значок в системном меню приложений"
+
+msgid "Install app icon to the system"
+msgstr "Установить значок программы в систему"
 
 msgid "SOCKS5 and HTTP share this port"
 msgstr "Общий порт для SOCKS5 и HTTP"

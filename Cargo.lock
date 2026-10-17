@@ -3896,6 +3896,7 @@ dependencies = [
  "tray-icon",
  "ureq",
  "url",
+ "windows",
  "windows-registry",
  "windows-sys 0.61.2",
  "zbus",

@@ -1,6 +1,6 @@
 import { Theme, Icons } from "../theme.slint";
 import { AppState, SettingsStore, SettingField, StartupConnection, PacSource, Notice, Actions, MenuItem } from "../state.slint";
-import { Caption, HDivider, SettingRow, SettingSwitch, SettingValue, SettingsCard } from "../components/primitives.slint";
+import { Button, Caption, HDivider, SettingRow, SettingSwitch, SettingValue, SettingsCard } from "../components/primitives.slint";
 import { PageHeader } from "../components/nav.slint";
 import { Banner, Sheet } from "../components/sheet.slint";
 import { PopupMenu } from "../components/menu.slint";
@@ -133,6 +133,23 @@ export component SettingsPage inherits VerticalLayout {
                             ];
                             selected(index) => {
                                 Actions.set-startup-connection(index == 0 ? StartupConnection.off : index == 1 ? StartupConnection.on : StartupConnection.last);
+                            }
+                        }
+                    }
+                }
+                SettingsCard {
+                    title: @tr("System integration");
+                    SettingRow {
+                        label: @tr("Program icon");
+                        note: @tr("Show the icon in the system app menu");
+                        // Like SettingSwitch: centered, and inset from the card edge.
+                        VerticalLayout {
+                            alignment: center;
+                            padding-right: Theme.chevron-inset;
+                            Button {
+                                text: @tr("Install app icon to the system");
+                                enabled: SettingsStore.app-icon-supported;
+                                clicked => { Actions.install-app-icon(); }
                             }
                         }
                     }

@@ -1,29 +1,62 @@
-//! Install the desktop entry and icons so Wayland compositors show the icon.
+//! Desktop integration: the application icon in the system's menus.
 //!
-//! Wayland resolves the window icon from the app id: `io.juicity.gui` maps to
-//! a desktop file of that name and its `Icon=` in the icon theme. winit has no
-//! xdg-toplevel-icon support, so a binary that is not packaged would show no
-//! icon. On start the app writes both into `$XDG_DATA_HOME`.
+//! Linux writes an XDG desktop entry and hicolor icons for the current user,
+//! so Wayland compositors (which resolve the window icon from the app id
+//! `io.juicity.gui`) find it; this is skipped when a system-wide desktop file
+//! already exists. Windows writes a Start Menu shortcut to the executable.
+//! Both are installed on demand from the Settings page.
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use anyhow::Context as _;
 
+#[cfg(target_os = "linux")]
 use super::autostart::exec_argument;
 
 /// Application id; also the base name of the desktop file and the icons.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const APP_ID: &str = "io.juicity.gui";
+/// Display name of the application and its shortcut.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const APP_NAME: &str = "Juicity GUI";
+
+/// Whether the Settings button can install the app icon on this platform.
+pub const SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "windows"));
+
+/// Install the desktop entry and icons (Linux) or the Start Menu shortcut
+/// (Windows) for the current user.
+pub fn install() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        install_linux()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        install_windows()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("installing the app icon is not supported on this platform")
+    }
+}
 
 /// Directories of system-wide installs; when one has our desktop file, the
 /// package owns the integration.
+#[cfg(target_os = "linux")]
 const SYSTEM_DIRS: [&str; 2] = ["/usr/share/applications", "/usr/local/share/applications"];
 
+#[cfg(target_os = "linux")]
 const DESKTOP_TEMPLATE: &str = include_str!("../../linux/io.juicity.gui.desktop");
 
+#[cfg(target_os = "linux")]
 const SVG: &[u8] = include_bytes!("../../icon.svg");
 
 /// Raster icons rendered by `build.rs`, keyed by edge length in pixels.
+#[cfg(target_os = "linux")]
 const PNGS: [(u32, &[u8]); 7] = [
     (16, include_bytes!(concat!(env!("OUT_DIR"), "/16.png"))),
     (32, include_bytes!(concat!(env!("OUT_DIR"), "/32.png"))),
@@ -34,25 +67,21 @@ const PNGS: [(u32, &[u8]); 7] = [
     (512, include_bytes!(concat!(env!("OUT_DIR"), "/512.png"))),
 ];
 
-/// Install the desktop entry and icons for the current user; failures are
-/// logged and never abort the start.
-pub fn install() {
-    let result = data_home(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME")).and_then(
-        |data_home| {
-            let exe = std::env::current_exe().context("cannot resolve the current executable")?;
-            let system_dirs: Vec<&Path> = SYSTEM_DIRS.iter().map(Path::new).collect();
-            install_in(&data_home, &system_dirs, &exe)
-        },
-    );
-    match result {
-        Ok(true) => tracing::info!("desktop entry and icons installed"),
-        Ok(false) => {}
-        Err(err) => tracing::warn!("desktop integration failed: {err:#}"),
+/// Write the desktop entry and icons below `$XDG_DATA_HOME`.
+#[cfg(target_os = "linux")]
+fn install_linux() -> anyhow::Result<()> {
+    let data_home = data_home(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))?;
+    let exe = std::env::current_exe().context("cannot resolve the current executable")?;
+    let system_dirs: Vec<&Path> = SYSTEM_DIRS.iter().map(Path::new).collect();
+    if install_in(&data_home, &system_dirs, &exe)? {
+        tracing::info!("desktop entry and icons installed");
     }
+    Ok(())
 }
 
 /// `$XDG_DATA_HOME`, or `$HOME/.local/share` when it is unset, empty or
 /// relative (XDG Base Directory rules).
+#[cfg(target_os = "linux")]
 fn data_home(xdg_data: Option<OsString>, home: Option<OsString>) -> anyhow::Result<PathBuf> {
     xdg_data
         .map(PathBuf::from)
@@ -67,6 +96,7 @@ fn data_home(xdg_data: Option<OsString>, home: Option<OsString>) -> anyhow::Resu
 /// Write the desktop file and icons below `data_home`. Returns whether
 /// anything was written; skips everything when a `system_dirs` entry already
 /// has the desktop file.
+#[cfg(target_os = "linux")]
 fn install_in(data_home: &Path, system_dirs: &[&Path], exe: &Path) -> anyhow::Result<bool> {
     let desktop_name = format!("{APP_ID}.desktop");
     if system_dirs
@@ -89,6 +119,7 @@ fn install_in(data_home: &Path, system_dirs: &[&Path], exe: &Path) -> anyhow::Re
 }
 
 /// The packaged desktop file with `Exec=` pointing at `exe`.
+#[cfg(target_os = "linux")]
 fn desktop_entry(exe: &Path) -> String {
     let exec = format!("Exec={}", exec_argument(&exe.to_string_lossy()));
     let mut out = String::new();
@@ -105,6 +136,7 @@ fn desktop_entry(exe: &Path) -> String {
 
 /// Write `content` to `path` through a temp file and a rename in the same
 /// directory, unless the file already holds it.
+#[cfg(target_os = "linux")]
 fn write_if_changed(path: &Path, content: &[u8]) -> anyhow::Result<bool> {
     if std::fs::read(path).is_ok_and(|current| current == content) {
         return Ok(false);
@@ -124,7 +156,59 @@ fn write_if_changed(path: &Path, content: &[u8]) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-#[cfg(test)]
+/// `%APPDATA%\Microsoft\Windows\Start Menu\Programs`.
+#[cfg(target_os = "windows")]
+fn start_menu_dir() -> anyhow::Result<PathBuf> {
+    let appdata =
+        std::env::var_os("APPDATA").ok_or_else(|| anyhow::anyhow!("APPDATA is not set"))?;
+    Ok(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs"))
+}
+
+/// Write a Start Menu shortcut to the current executable.
+#[cfg(target_os = "windows")]
+fn install_windows() -> anyhow::Result<()> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+
+    let programs = start_menu_dir()?;
+    std::fs::create_dir_all(&programs)
+        .with_context(|| format!("cannot create {}", programs.display()))?;
+    let exe = std::env::current_exe().context("cannot resolve the current executable")?;
+    let link = programs.join(format!("{APP_NAME}.lnk"));
+
+    // COM must be initialized on this thread before IShellLink can be created;
+    // S_FALSE means it already was, and then the apartment is not ours to close.
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    let result = write_shortcut(&exe, &link);
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    result.with_context(|| format!("cannot write {}", link.display()))?;
+    tracing::info!("Start Menu shortcut created at {}", link.display());
+    Ok(())
+}
+
+/// Create the `.lnk` at `link` pointing at `exe`.
+#[cfg(target_os = "windows")]
+fn write_shortcut(exe: &Path, link: &Path) -> anyhow::Result<()> {
+    use windows::core::{Interface as _, HSTRING};
+    use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    let shortcut: IShellLinkW =
+        unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)? };
+    unsafe {
+        shortcut.SetPath(&HSTRING::from(exe))?;
+        shortcut.SetDescription(&HSTRING::from(APP_NAME))?;
+        if let Some(dir) = exe.parent() {
+            shortcut.SetWorkingDirectory(&HSTRING::from(dir))?;
+        }
+    }
+    let file: IPersistFile = shortcut.cast()?;
+    unsafe { file.Save(&HSTRING::from(link), true)? };
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
