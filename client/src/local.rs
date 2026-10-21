@@ -1,16 +1,14 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use std::time::Instant;
-
 use bytes::Bytes;
+use dashmap::DashMap;
 use juicity_common::consts;
 use juicity_common::protocol;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::JuicityClient;
@@ -61,11 +59,24 @@ struct UdpOutboundDatagram {
 
 struct UdpSessionEntry {
     id: u64,
-    /// Last time a datagram was forwarded through this session.
-    /// Used by the cleanup task to detect zombie sessions whose tx channel
-    /// remains open but no data has flowed for CLIENT_UDP_SESSION_IDLE_TIMEOUT.
-    last_used: Instant,
+    /// Epoch milliseconds of the last forwarded datagram. Atomic so the hot
+    /// path can refresh it without re-locking the map shard.
+    last_used_epoch_ms: AtomicU64,
     tx: mpsc::Sender<UdpOutboundDatagram>,
+}
+
+impl UdpSessionEntry {
+    fn touch(&self) {
+        self.last_used_epoch_ms
+            .store(now_epoch_ms(), Ordering::Relaxed);
+    }
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl LocalServer {
@@ -274,8 +285,10 @@ async fn handle_socks5(
 
             let client_clone = client.clone();
             let bind_socket_clone = bind_socket.clone();
-            let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSessionEntry>>> =
-                Arc::new(Mutex::new(HashMap::new()));
+            // Sharded concurrent map: lookups and refreshes on the hot path do
+            // not serialise behind a single async mutex.
+            let sessions: Arc<DashMap<SocketAddr, UdpSessionEntry>> =
+                Arc::new(DashMap::new());
             let session_seq = Arc::new(AtomicU64::new(1));
 
             // ctrl_cancel is signalled when the TCP control connection drops.
@@ -300,12 +313,17 @@ async fn handle_socks5(
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
-                            let idle_cutoff = Instant::now().checked_sub(consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT);
-                            let mut guard = sessions_cleanup.lock().await;
-                            let before = guard.len();
-                            guard.retain(|_, s| !s.tx.is_closed() && idle_cutoff.is_none_or(|cutoff| s.last_used > cutoff));
-                            let after = guard.len();
-                            drop(guard);
+                            let now_ms = now_epoch_ms();
+                            let idle_ms =
+                                consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT.as_millis() as u64;
+                            let before = sessions_cleanup.len();
+                            sessions_cleanup.retain(|_, s| {
+                                !s.tx.is_closed()
+                                    && now_ms.saturating_sub(
+                                        s.last_used_epoch_ms.load(Ordering::Relaxed),
+                                    ) <= idle_ms
+                            });
+                            let after = sessions_cleanup.len();
                             if before != after {
                                 tracing::debug!(
                                     "UDP ASSOCIATE cleanup: removed {} orphaned session(s)",
@@ -353,21 +371,32 @@ async fn handle_socks5(
                                         continue;
                                     }
 
-                                    let existing = {
-                                        let guard = sessions.lock().await;
-                                        guard.get(&src).map(|s| (s.id, s.tx.clone()))
+                                    // Fast path: sharded lookup with no async lock.
+                                    // `try_send` keeps one stalled session from blocking
+                                    // the shared receive loop.
+                                    let closed_session = match sessions.get(&src) {
+                                        Some(session) => {
+                                            session.touch();
+                                            match session.tx.try_send(datagram.clone()) {
+                                                Ok(()) => continue,
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    // UDP semantics: drop instead of stalling.
+                                                    tracing::debug!(
+                                                        source = %src,
+                                                        "UDP session queue full; dropping datagram"
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    Some(session.id)
+                                                }
+                                            }
+                                        }
+                                        None => None,
                                     };
 
-                                    if let Some((session_id, tx)) = existing {
-                                        if tx.send(datagram.clone()).await.is_ok() {
-                                            // Update last_used so the cleanup task does not
-                                            // consider this session stale.
-                                            if let Some(s) = sessions.lock().await.get_mut(&src) {
-                                                s.last_used = Instant::now();
-                                            }
-                                            continue;
-                                        }
-                                        remove_session_if_match(&sessions, src, session_id).await;
+                                    if let Some(session_id) = closed_session {
+                                        remove_session_if_match(&sessions, src, session_id);
                                     }
 
                                     let new_session_id = session_seq.fetch_add(1, Ordering::Relaxed);
@@ -383,12 +412,13 @@ async fn handle_socks5(
                                     .await
                                     {
                                         Ok(tx) => {
-                                            let mut guard = sessions.lock().await;
-                                            guard.insert(
+                                            sessions.insert(
                                                 src,
                                                 UdpSessionEntry {
                                                     id: new_session_id,
-                                                    last_used: Instant::now(),
+                                                    last_used_epoch_ms: AtomicU64::new(
+                                                        now_epoch_ms(),
+                                                    ),
                                                     tx,
                                                 },
                                             );
@@ -406,15 +436,13 @@ async fn handle_socks5(
                         }
                         _ = &mut nat_timer => {
                             // NAT timeout — clean up all sessions before breaking
-                            let mut guard = sessions.lock().await;
-                            guard.clear();
+                            sessions.clear();
                             break;
                         }
                         _ = ctrl_cancel_clone.cancelled() => {
                             // TCP control connection dropped — clean up all sessions
                             tracing::info!("UDP ASSOCIATE control connection closed, cleaning up sessions");
-                            let mut guard = sessions.lock().await;
-                            guard.clear();
+                            sessions.clear();
                             break;
                         }
                     }
@@ -439,7 +467,7 @@ async fn handle_socks5(
 async fn start_udp_assoc_session(
     client: JuicityClient,
     bind_socket: Arc<UdpSocket>,
-    sessions: Arc<Mutex<HashMap<SocketAddr, UdpSessionEntry>>>,
+    sessions: Arc<DashMap<SocketAddr, UdpSessionEntry>>,
     local_client_addr: SocketAddr,
     session_id: u64,
     first_datagram: UdpOutboundDatagram,
@@ -477,24 +505,32 @@ async fn start_udp_assoc_session(
                 }
             }
             let mut guard = SendGuard { send: Some(send) };
+            // Reusable idle timer: one registration per session instead of one
+            // timer per datagram.
+            let idle = tokio::time::sleep(consts::DEFAULT_NAT_TIMEOUT);
+            tokio::pin!(idle);
             loop {
-                match tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, rx.recv()).await {
-                    Ok(Some(datagram)) => {
-                        if JuicityClient::send_udp_datagram(
-                            guard.send.as_mut().unwrap(),
-                            &datagram.addr,
-                            datagram.port,
-                            &datagram.payload[..],
-                            &mut addr_buf,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
+                let datagram = tokio::select! {
+                    item = rx.recv() => match item {
+                        Some(datagram) => datagram,
+                        None => break,
+                    },
+                    _ = &mut idle => break, // NAT timeout
+                };
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT);
+                let cached =
+                    protocol::CachedAddr::from_host_port(&datagram.addr, datagram.port);
+                if JuicityClient::send_udp_datagram(
+                    guard.send.as_mut().unwrap(),
+                    &cached,
+                    &datagram.payload[..],
+                    &mut addr_buf,
+                )
+                .await
+                .is_err()
+                {
+                    break;
                 }
             }
         });
@@ -538,7 +574,7 @@ async fn start_udp_assoc_session(
             }
         }
 
-        remove_session_if_match(&sessions_for_supervisor, local_client_addr, session_id).await;
+        remove_session_if_match(&sessions_for_supervisor, local_client_addr, session_id);
     });
 
     Ok(tx)
@@ -549,34 +585,30 @@ async fn read_one_udp_response(
     buf: &mut Vec<u8>,
 ) -> anyhow::Result<(String, u16)> {
     // Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
-    let (resp_addr, resp_port) = tokio::time::timeout(
-        consts::DEFAULT_NAT_TIMEOUT,
-        protocol::read_trojanc_addr_async(recv),
-    )
-    .await??;
+    // One deadline covers all three reads: a datagram registers a single timer.
+    let deadline = tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT;
+    let (resp_addr, resp_port) =
+        tokio::time::timeout_at(deadline, protocol::read_trojanc_addr_async(recv)).await??;
 
     let mut len_buf = [0u8; 2];
-    tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, recv.read_exact(&mut len_buf)).await??;
+    tokio::time::timeout_at(deadline, recv.read_exact(&mut len_buf)).await??;
     let pkt_len = u16::from_be_bytes(len_buf) as usize;
     buf.resize(pkt_len, 0);
-    tokio::time::timeout(
-        consts::DEFAULT_NAT_TIMEOUT,
-        recv.read_exact(&mut buf[..pkt_len]),
-    )
-    .await??;
+    tokio::time::timeout_at(deadline, recv.read_exact(&mut buf[..pkt_len])).await??;
 
     Ok((resp_addr, resp_port))
 }
 
-async fn remove_session_if_match(
-    sessions: &Arc<Mutex<HashMap<SocketAddr, UdpSessionEntry>>>,
+fn remove_session_if_match(
+    sessions: &DashMap<SocketAddr, UdpSessionEntry>,
     local_client_addr: SocketAddr,
     session_id: u64,
 ) {
-    let mut guard = sessions.lock().await;
-    if let Some(existing) = guard.get(&local_client_addr) {
+    if let Some(existing) = sessions.get(&local_client_addr) {
         if existing.id == session_id {
-            guard.remove(&local_client_addr);
+            // Release the read guard before taking the shard's write lock.
+            drop(existing);
+            sessions.remove(&local_client_addr);
         }
     }
 }
