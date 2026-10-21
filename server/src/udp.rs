@@ -22,23 +22,27 @@ pub(crate) fn bind_dual_stack() -> std::io::Result<tokio::net::UdpSocket> {
     tokio::net::UdpSocket::from_std(socket.into())
 }
 
-pub(crate) async fn send_to<A: tokio::net::ToSocketAddrs>(
+/// Returns whether the local socket is IPv6 (and therefore needs IPv4-mapped
+/// destinations on dual-stack platforms). Cached by callers: `local_addr()`
+/// is a `getsockname()` syscall and must not run per packet.
+pub(crate) fn socket_is_ipv6(socket: &tokio::net::UdpSocket) -> bool {
+    socket.local_addr().map(|addr| addr.is_ipv6()).unwrap_or(false)
+}
+
+/// Send a datagram to an already-resolved address.
+///
+/// Unlike a generic `ToSocketAddrs` helper this never resolves DNS and never
+/// performs a syscall per packet: `socket_is_ipv6` must be computed once when
+/// the socket is created (see [`socket_is_ipv6`]).
+pub(crate) async fn send_to_addr(
     socket: &tokio::net::UdpSocket,
     payload: &[u8],
-    target: A,
+    target: SocketAddr,
+    socket_is_ipv6: bool,
 ) -> std::io::Result<usize> {
-    let target = tokio::net::lookup_host(target)
-        .await?
-        .next()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "no addresses to send data to",
-            )
-        })?;
     // macOS requires IPv4-mapped destinations even on dual-stack IPv6 sockets.
     let target = match target {
-        SocketAddr::V4(addr) if socket.local_addr()?.is_ipv6() => {
+        SocketAddr::V4(addr) if socket_is_ipv6 => {
             SocketAddr::new(addr.ip().to_ipv6_mapped().into(), addr.port())
         }
         addr => addr,
@@ -53,23 +57,28 @@ pub(crate) async fn relay_responses<W: AsyncWrite + Unpin>(
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 65535];
     let mut frame = Vec::with_capacity(264 + buf.len());
+    // Reusable idle timer: reset on every datagram instead of registering a
+    // fresh timer for each `timeout()` call.
+    let idle = tokio::time::sleep(consts::DEFAULT_NAT_TIMEOUT);
+    tokio::pin!(idle);
 
     loop {
-        match tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, remote.recv_from(&mut buf)).await {
-            Ok(Ok((n, addr))) => {
-                frame.clear();
-                let response_addr = protocol::CachedAddr::from_socket_addr(SocketAddr::new(
-                    addr.ip().to_canonical(),
-                    addr.port(),
-                ));
-                protocol::build_trojanc_addr_cached(&mut frame, &response_addr)?;
-                frame.extend_from_slice(&(n as u16).to_be_bytes());
-                frame.extend_from_slice(&buf[..n]);
-                writer.write_all(&frame).await?;
-            }
-            Ok(Err(err)) => return Err(err.into()),
-            Err(_) => return Ok(()),
-        }
+        let (n, addr) = tokio::select! {
+            result = remote.recv_from(&mut buf) => result?,
+            _ = &mut idle => return Ok(()),
+        };
+        idle.as_mut()
+            .reset(tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT);
+
+        frame.clear();
+        let response_addr = protocol::CachedAddr::from_socket_addr(SocketAddr::new(
+            addr.ip().to_canonical(),
+            addr.port(),
+        ));
+        protocol::build_trojanc_addr_cached(&mut frame, &response_addr)?;
+        frame.extend_from_slice(&(n as u16).to_be_bytes());
+        frame.extend_from_slice(&buf[..n]);
+        writer.write_all(&frame).await?;
     }
 }
 
@@ -89,17 +98,50 @@ pub struct UdpEndpoint {
     /// Wrapped in `Arc` so that cloning on the hot path is just a
     /// refcount increment — no heap allocation and no `try_clone()` syscall.
     pub socket: Arc<tokio::net::UdpSocket>,
+    /// Destination resolved once at creation. Resolving per packet would issue
+    /// a DNS query (and a blocking-pool hop) for every datagram.
+    pub target: SocketAddr,
+    /// Cached result of `local_addr().is_ipv6()`.
+    pub socket_is_ipv6: bool,
     /// Stored as `Arc<str>` so that cloning on the fast path is just a
     /// refcount increment — no heap allocation per packet.
     pub dial_target: Arc<str>,
 }
 
+/// Cheap-to-clone snapshot of a pooled endpoint, used on the per-packet path.
+#[derive(Clone)]
+pub struct PooledUdpEndpoint {
+    pub socket: Arc<tokio::net::UdpSocket>,
+    pub target: SocketAddr,
+    pub socket_is_ipv6: bool,
+}
+
+impl PooledUdpEndpoint {
+    fn from_endpoint(endpoint: &UdpEndpoint) -> Self {
+        Self {
+            socket: endpoint.socket.clone(),
+            target: endpoint.target,
+            socket_is_ipv6: endpoint.socket_is_ipv6,
+        }
+    }
+}
+
 impl UdpEndpoint {
     /// Create a new UDP endpoint bound to a random port.
+    ///
+    /// The dial target is resolved exactly once here; the hot path then sends
+    /// to the cached `SocketAddr` without touching DNS.
     pub async fn new(options: UdpEndpointOptions) -> anyhow::Result<Self> {
         let socket = bind_dual_stack()?;
+        let socket_is_ipv6 = socket_is_ipv6(&socket);
+        let target = tokio::net::lookup_host(options.dial_target.as_str())
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no address found for {}", options.dial_target))?;
         Ok(Self {
             socket: Arc::new(socket),
+            target,
+            socket_is_ipv6,
             dial_target: Arc::from(options.dial_target.as_str()),
         })
     }
@@ -142,24 +184,22 @@ impl UdpEndpointPool {
         }
     }
 
-    /// Fast path: grab a cloned socket + dial_target of an existing endpoint.
+    /// Fast path: grab a cheap snapshot of an existing endpoint.
     ///
-    /// Returns `(Arc<tokio::net::UdpSocket>, Arc<str>)` — the socket is
-    /// already wrapped in tokio, **no** `from_std()` registration needed.
-    /// Both fields are `Arc`-wrapped, so cloning them is a refcount increment.
+    /// The returned struct only clones an `Arc` and copies a `SocketAddr`, so
+    /// the per-packet cost is a single refcount increment. The destination is
+    /// already resolved and the socket family is cached.
     ///
     /// Uses moka's sharded internal locking — concurrent reads to different
     /// keys proceed in parallel.
-    pub fn get_socket(&self, addr: &SocketAddr) -> Option<(Arc<tokio::net::UdpSocket>, Arc<str>)> {
+    pub fn get_socket(&self, addr: &SocketAddr) -> Option<PooledUdpEndpoint> {
         let endpoint = self.inner.get(addr)?;
-        let socket = endpoint.socket.clone();
-        let dial_target = endpoint.dial_target.clone();
-        Some((socket, dial_target))
+        Some(PooledUdpEndpoint::from_endpoint(&endpoint))
     }
 
     /// Get or create a UDP endpoint for the given address.
     ///
-    /// Returns `((Arc<tokio::net::UdpSocket>, Arc<str>), is_new)` where:
+    /// Returns `(PooledUdpEndpoint, is_new)` where:
     /// * The socket is a **tokio** socket, ready for immediate use without
     ///   `from_std()`.
     /// * `is_new` is `true` if a brand-new `UdpEndpoint` was created (so the
@@ -180,7 +220,7 @@ impl UdpEndpointPool {
         &self,
         addr: SocketAddr,
         options: UdpEndpointOptions,
-    ) -> anyhow::Result<((Arc<tokio::net::UdpSocket>, Arc<str>), bool)> {
+    ) -> anyhow::Result<(PooledUdpEndpoint, bool)> {
         struct CreationGuard<'a> {
             addr: SocketAddr,
             creating: &'a Mutex<HashSet<SocketAddr>>,
@@ -207,9 +247,7 @@ impl UdpEndpointPool {
         loop {
             // ── Fast path: check moka cache (sharded, no global lock). ──
             if let Some(endpoint) = self.inner.get(&addr) {
-                let socket = endpoint.socket.clone();
-                let dial_target = endpoint.dial_target.clone();
-                return Ok(((socket, dial_target), false));
+                return Ok((PooledUdpEndpoint::from_endpoint(&endpoint), false));
             }
 
             // ── Per-addr creation arbitration via Mutex<HashSet> ──
@@ -237,9 +275,7 @@ impl UdpEndpointPool {
                 // Double-check: another task may have inserted a fresh endpoint
                 // while we waited for the HashSet insert.
                 if let Some(endpoint) = self.inner.get(&addr) {
-                    let socket = endpoint.socket.clone();
-                    let dial_target = endpoint.dial_target.clone();
-                    return Ok(((socket, dial_target), false));
+                    return Ok((PooledUdpEndpoint::from_endpoint(&endpoint), false));
                 }
 
                 // Confirmed: no valid endpoint exists, safely create one.
@@ -247,10 +283,9 @@ impl UdpEndpointPool {
 
                 match result {
                     Ok(endpoint) => {
-                        let dial_target = endpoint.dial_target.clone();
-                        let socket = endpoint.socket.clone();
+                        let pooled = PooledUdpEndpoint::from_endpoint(&endpoint);
                         self.inner.insert(addr, Arc::new(endpoint));
-                        return Ok(((socket, dial_target), true));
+                        return Ok((pooled, true));
                     }
                     Err(e) => return Err(e),
                 }

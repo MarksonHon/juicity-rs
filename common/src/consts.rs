@@ -20,8 +20,13 @@ pub const IN_FLIGHT_UNDERLAY_TTL: Duration = Duration::from_secs(10);
 pub const IN_FLIGHT_UNDERLAY_EVICT_TIMEOUT: Duration = Duration::from_millis(100);
 /// Default congestion control window
 pub const DEFAULT_CWND: u64 = 10;
-/// Max open incoming streams
-pub const MAX_OPEN_INCOMING_STREAMS: u64 = 100;
+/// Max open incoming streams per QUIC connection.
+///
+/// All client traffic is multiplexed over a single QUIC connection, so this
+/// value caps concurrent TCP relays + UDP sessions. It must be at least
+/// `MAX_CONCURRENT_TCP_CONNECTIONS`, otherwise `open_bi()` blocks on stream
+/// credit once enough local connections are active.
+pub const MAX_OPEN_INCOMING_STREAMS: u64 = 512;
 /// Keep-alive period for QUIC
 pub const KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
 

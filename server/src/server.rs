@@ -234,16 +234,14 @@ impl JuicityServer {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow::anyhow!("no async runtime found for quinn"))?;
 
-        let (underlay_tx, underlay_rx) =
-            tokio::sync::mpsc::channel(crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY);
-
         #[cfg(unix)]
-        let (server_underlay_socket, endpoints, num_sockets) = {
+        let (server_underlay_socket, endpoints, num_sockets, underlay_receivers) = {
             let num_sockets = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
             let mut first_sidecar: Option<Arc<tokio::net::UdpSocket>> = None;
             let mut endpoints: Vec<quinn::Endpoint> = Vec::with_capacity(num_sockets);
+            let mut underlay_receivers = Vec::with_capacity(num_sockets);
 
             for i in 0..num_sockets {
                 let socket = create_reuseport_socket(&socket_addr, dual_stack)?;
@@ -255,10 +253,16 @@ impl JuicityServer {
                     first_sidecar = Some(Arc::new(tokio::net::UdpSocket::from_std(sidecar)?));
                 }
 
+                // One receiver per socket: non-QUIC traffic is processed by
+                // one worker per core instead of a single shared consumer.
+                let (underlay_tx, underlay_rx) =
+                    tokio::sync::mpsc::channel(crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY);
+                underlay_receivers.push(underlay_rx);
+
                 let wrapped = runtime.wrap_udp_socket(socket)?;
                 let demux = Arc::new(crate::underlay_socket::DemuxUdpSocket::new(
                     wrapped,
-                    underlay_tx.clone(),
+                    underlay_tx,
                 ));
                 let endpoint = Endpoint::new_with_abstract_socket(
                     EndpointConfig::default(),
@@ -271,21 +275,28 @@ impl JuicityServer {
 
             let server_underlay_socket =
                 first_sidecar.ok_or_else(|| anyhow::anyhow!("no sockets created"))?;
-            (server_underlay_socket, endpoints, num_sockets)
+            (
+                server_underlay_socket,
+                endpoints,
+                num_sockets,
+                underlay_receivers,
+            )
         };
 
         #[cfg(not(unix))]
-        let (server_underlay_socket, endpoints) = {
+        let (server_underlay_socket, endpoints, underlay_receivers) = {
             let socket = create_reuseport_socket(&socket_addr, dual_stack)?;
             socket.set_nonblocking(true)?;
             let sidecar = socket.try_clone()?;
             sidecar.set_nonblocking(true)?;
             let server_underlay_socket = Arc::new(tokio::net::UdpSocket::from_std(sidecar)?);
 
+            let (underlay_tx, underlay_rx) =
+                tokio::sync::mpsc::channel(crate::underlay_socket::UNDERLAY_CHANNEL_CAPACITY);
             let wrapped = runtime.wrap_udp_socket(socket)?;
             let demux = Arc::new(crate::underlay_socket::DemuxUdpSocket::new(
                 wrapped,
-                underlay_tx.clone(),
+                underlay_tx,
             ));
             let endpoint = Endpoint::new_with_abstract_socket(
                 EndpointConfig::default(),
@@ -293,7 +304,7 @@ impl JuicityServer {
                 demux,
                 runtime.clone(),
             )?;
-            (server_underlay_socket, vec![endpoint])
+            (server_underlay_socket, vec![endpoint], vec![underlay_rx])
         };
 
         #[cfg(unix)]
@@ -338,23 +349,34 @@ impl JuicityServer {
 
         let underlay_in_flight = self.in_flight.clone();
         let underlay_udp_pool = self.udp_endpoint_pool.clone();
+        let underlay_sessions = create_underlay_sessions(underlay_udp_pool.clone());
         let underlay_disable_443 = self.disable_outbound_udp443;
         let underlay_socket = server_underlay_socket.clone();
-        // The underlay loop self-terminates when underlay_rx closes (all endpoints dropped),
-        // but AbortOnDrop ensures it is also cancelled on any early serve() exit.
-        let _underlay_guard = AbortOnDrop(
-            tokio::spawn(async move {
-                run_underlay_packet_loop(
-                    underlay_rx,
-                    underlay_in_flight,
-                    underlay_udp_pool,
-                    underlay_socket,
-                    underlay_disable_443,
-                )
-                .await;
-            })
-            .abort_handle(),
-        );
+        // One underlay consumer per demultiplexed socket so that non-QUIC UDP
+        // traffic scales with cores instead of funneling through a single task.
+        // AbortOnDrop ensures all loops are cancelled on any early serve() exit.
+        let mut underlay_guards: Vec<AbortOnDrop> = Vec::with_capacity(underlay_receivers.len());
+        for underlay_rx in underlay_receivers {
+            let in_flight = underlay_in_flight.clone();
+            let udp_pool = underlay_udp_pool.clone();
+            let sessions = underlay_sessions.clone();
+            let socket = underlay_socket.clone();
+            underlay_guards.push(AbortOnDrop(
+                tokio::spawn(async move {
+                    run_underlay_packet_loop(
+                        underlay_rx,
+                        in_flight,
+                        udp_pool,
+                        sessions,
+                        socket,
+                        underlay_disable_443,
+                    )
+                    .await;
+                })
+                .abort_handle(),
+            ));
+        }
+        let _underlay_guards = underlay_guards;
 
         // Broadcast shutdown to all accept workers.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -518,46 +540,50 @@ impl JuicityServer {
 /// The loop exits when the channel `rx` is closed (i.e. the [`quinn::Endpoint`]
 /// is dropped), at which point all spawned subtasks are cancelled via
 /// [`AbortOnDrop`] guards.
+/// Shared cache of full-cone NAT underlay sessions.
+///
+/// Built once per server so that all demultiplexed sockets share the same
+/// session state and eviction listener.
+fn create_underlay_sessions(
+    udp_pool: Arc<crate::udp::UdpEndpointPool>,
+) -> Arc<Cache<SocketAddr, UnderlaySession>> {
+    // Moka cache with:
+    //   - time_to_idle: entries idle for > DEFAULT_NAT_TIMEOUT are auto-evicted
+    //   - max_capacity: LRU eviction when at MAX_UNDERLAY_SESSIONS
+    //   - eviction_listener: aborts relay-back tasks and removes from UDP pool
+    Arc::new(
+        Cache::builder()
+            .max_capacity(consts::MAX_UNDERLAY_SESSIONS as u64)
+            .time_to_idle(consts::DEFAULT_NAT_TIMEOUT)
+            .eviction_listener(move |_k: Arc<SocketAddr>, _v: UnderlaySession, _cause| {
+                if let Some(h) = _v.relay_abort {
+                    h.abort();
+                }
+                udp_pool.remove(&*_k);
+            })
+            .build(),
+    )
+}
+
 async fn run_underlay_packet_loop(
     mut rx: tokio::sync::mpsc::Receiver<crate::underlay_socket::UnderlayPacket>,
     in_flight: Arc<crate::inflight::InFlightUnderlayKey>,
     udp_pool: Arc<crate::udp::UdpEndpointPool>,
+    sessions: Arc<Cache<SocketAddr, UnderlaySession>>,
     server_socket: Arc<tokio::net::UdpSocket>,
     disable_udp_443: bool,
 ) {
-    // ══ Moka cache for underlay sessions ══════════════════════════════════
-    // Uses moka::sync::Cache with:
-    //   - time_to_idle: entries idle for > DEFAULT_NAT_TIMEOUT are auto-evicted
-    //   - max_capacity: LRU eviction when at MAX_UNDERLAY_SESSIONS
-    //   - eviction_listener: aborts relay-back tasks and removes from UDP pool
-    //
-    // This replaces the manual DashMap cleanup loop and capacity O(n) scan.
-    let sessions: Arc<Cache<SocketAddr, UnderlaySession>> = {
-        let udp_pool_for_evict = udp_pool.clone();
-        Arc::new(
-            Cache::builder()
-                .max_capacity(consts::MAX_UNDERLAY_SESSIONS as u64)
-                .time_to_idle(consts::DEFAULT_NAT_TIMEOUT)
-                .eviction_listener(move |_k: Arc<SocketAddr>, _v: UnderlaySession, _cause| {
-                    if let Some(h) = _v.relay_abort {
-                        h.abort();
-                    }
-                    udp_pool_for_evict.remove(&*_k);
-                })
-                .build(),
-        )
-    };
-
     // Limit concurrent underlay packet handler tasks to prevent unbounded task
     // accumulation under high traffic. Each handler may wait up to 100ms in
     // evict() for in-flight underlay auth, and without a cap, thousands of
     // tasks could pile up during a burst, consuming significant memory.
     // Use a fixed cap to keep memory predictable under burst traffic.
+    // The cap applies per consumer shard.
     let concurrency_limit = Arc::new(tokio::sync::Semaphore::new(
         consts::MAX_UNDERLAY_HANDLER_CONCURRENCY,
     ));
 
-    while let Some(packet) = rx.recv().await {
+    while let Some(mut packet) = rx.recv().await {
         if packet.payload.len() < consts::UNDERLAY_SALT_LEN {
             continue;
         }
@@ -565,34 +591,55 @@ async fn run_underlay_packet_loop(
         let source = packet.peer;
 
         // ── Fast path: existing session → decrypt + forward inline (no spawn) ──
-        // Only attempt inline processing when both session and endpoint are cached.
-        // This avoids modifying payload in-place when we might fall through to the
-        // slow path (which expects the original salt-prefixed payload).
+        // The payload is moved (not cloned) because this is the per-packet hot
+        // path; the rare failure branches restore/rebuild what they need.
         if let Some(session) = sessions.get(&source) {
-            if let Some((send_socket, pool_target)) = udp_pool.get_socket(&source) {
-                // Clone payload only when we're committed to the fast path.
-                // This is the hot path — most packets hit here.
-                let mut payload = packet.payload.clone();
+            if let Some(endpoint) = udp_pool.get_socket(&source) {
+                let mut payload = std::mem::take(&mut packet.payload);
+                // Save the salt before decrypting: the failure path restores
+                // the original salt-prefixed layout for the slow path.
+                let mut salt = [0u8; consts::UNDERLAY_SALT_LEN];
+                salt.copy_from_slice(&payload[..consts::UNDERLAY_SALT_LEN]);
                 if session.cipher.decrypt_in_place(&mut payload).is_ok() {
-                    if crate::udp::send_to(
-                        &send_socket,
+                    if crate::udp::send_to_addr(
+                        &endpoint.socket,
                         &payload[juicity_underlay::SALT_LEN..],
-                        &*pool_target,
+                        endpoint.target,
+                        endpoint.socket_is_ipv6,
                     )
                     .await
                     .is_ok()
                     {
                         continue;
                     }
-                    // send failed — clean up stale endpoint, fall through to slow path
-                    udp_pool.remove(&source);
+                    // Endpoint became unusable: invalidating the session also
+                    // aborts the relay task and removes the pool entry, so the
+                    // next packet rebuilds everything through the slow path.
+                    sessions.invalidate(&source);
+                    continue;
                 }
-                // decrypt or send failed — fall through to slow path
+                // Decryption failed for an existing session (e.g. the client
+                // re-keyed): restore the salt prefix and let the slow path
+                // re-authenticate this packet from scratch.
+                payload.splice(..0, salt);
+                packet.payload = payload;
             }
         }
 
         // ── Slow path: new session or recovery → spawn task for async auth/endpoint creation ──
-        let permit = concurrency_limit.clone().acquire_owned().await;
+        // `try_acquire_owned` instead of `acquire_owned`: a saturated handler
+        // pool must not stall the shard's receive loop (UDP semantics allow
+        // dropping under overload).
+        let permit = match concurrency_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::debug!(
+                    "underlay handler limit reached; dropping packet from {}",
+                    source
+                );
+                continue;
+            }
+        };
         let in_flight = in_flight.clone();
         let udp_pool = udp_pool.clone();
         let sessions = sessions.clone();
@@ -699,9 +746,9 @@ async fn handle_non_quic_underlay_packet(
             return Ok(());
         }
 
-        // Fast path: pool returns tokio::net::UdpSocket directly —
-        // no expensive from_std() syscall registration needed.
-        let (send_socket, pool_target) = match udp_pool.get_socket(&source) {
+        // Fast path: the pooled endpoint already carries a resolved target
+        // and cached socket family, so no per-packet DNS/syscall is needed.
+        let endpoint = match udp_pool.get_socket(&source) {
             Some(result) => result,
             None => {
                 // Pool endpoint expired — create a new one (rare).
@@ -717,10 +764,11 @@ async fn handle_non_quic_underlay_packet(
                     .0
             }
         };
-        if let Err(e) = crate::udp::send_to(
-            &send_socket,
+        if let Err(e) = crate::udp::send_to_addr(
+            &endpoint.socket,
             &payload[juicity_underlay::SALT_LEN..],
-            &*pool_target,
+            endpoint.target,
+            endpoint.socket_is_ipv6,
         )
         .await
         {
@@ -734,7 +782,7 @@ async fn handle_non_quic_underlay_packet(
             sessions.invalidate(&source);
             return Err(anyhow::anyhow!(
                 "underlay send_to {} failed: {:?}",
-                &*pool_target,
+                endpoint.target,
                 e
             ));
         }
@@ -784,7 +832,7 @@ async fn handle_non_quic_underlay_packet(
     // ── Create UDP endpoint and spawn relay-back task BEFORE inserting session ──
     // This eliminates the race window where the cleanup task could remove the session
     // between insertion and abort handle storage, which would orphan the relay task.
-    let ((udp_socket, dial_target), is_new) = udp_pool
+    let (endpoint, is_new) = udp_pool
         .get_or_create(
             source,
             crate::udp::UdpEndpointOptions {
@@ -798,14 +846,16 @@ async fn handle_non_quic_underlay_packet(
     // Convert BEFORE any spawn so a conversion failure
     // (e.g. kernel fd exhaustion) cannot produce an orphaned relay-back task.
     let recv_socket_for_relay = if is_new {
-        Some(udp_socket.clone())
+        Some(endpoint.socket.clone())
     } else {
         None
     };
-    let send_socket = udp_socket;
 
     let relay_abort = if let Some(recv_socket) = recv_socket_for_relay {
         let relay_back = server_socket.clone();
+        // The relay-back socket never changes family; cache it once instead of
+        // calling `local_addr()` for every response packet.
+        let relay_back_is_ipv6 = crate::udp::socket_is_ipv6(&relay_back);
         let session_cipher = cipher.clone();
         let sessions_for_task = sessions.clone();
         let udp_pool_for_task = udp_pool.clone();
@@ -845,10 +895,9 @@ async fn handle_non_quic_underlay_packet(
             let mut outbuf = Vec::with_capacity(max_out_len);
 
             // ── Pre-generated salt pool ──
-            // Generates 4096 salts upfront (single fill_bytes call) to amortise
-            // CSPRNG overhead.  When the pool is exhausted, a fresh batch is
-            // generated.  4096 × 32 bytes = 128 KB per task, acceptable for the
-            // 180-second NAT timeout window.
+            // A small batch amortises CSPRNG overhead while keeping memory per
+            // session low: 64 × 32 B = 2 KB (was 4096 × 32 B = 128 KB, which
+            // could reach hundreds of MB across many NAT sessions).
             let mut salt_pool = generate_salt_batch();
 
             loop {
@@ -874,9 +923,14 @@ async fn handle_non_quic_underlay_packet(
                             break;
                         }
 
-                        if crate::udp::send_to(&relay_back, &outbuf, source)
-                            .await
-                            .is_err()
+                        if crate::udp::send_to_addr(
+                            &relay_back,
+                            &outbuf,
+                            source,
+                            relay_back_is_ipv6,
+                        )
+                        .await
+                        .is_err()
                         {
                             break;
                         }
@@ -918,10 +972,11 @@ async fn handle_non_quic_underlay_packet(
 
     // Send first packet immediately — relay task is already running.
     // Plaintext is at &payload[SALT_LEN..] (salt prefix kept in place).
-    if let Err(e) = crate::udp::send_to(
-        &send_socket,
+    if let Err(e) = crate::udp::send_to_addr(
+        &endpoint.socket,
         &payload[juicity_underlay::SALT_LEN..],
-        &*dial_target,
+        endpoint.target,
+        endpoint.socket_is_ipv6,
     )
     .await
     {
@@ -934,7 +989,7 @@ async fn handle_non_quic_underlay_packet(
         sessions.invalidate(&source);
         return Err(anyhow::anyhow!(
             "underlay send_to {} failed: {:?}",
-            dial_target,
+            endpoint.target,
             e
         ));
     }
@@ -1210,6 +1265,9 @@ async fn handle_udp_relay(
         resolve_udp_target(&first_host, first_port, &dns_cache, &dns_resolving).await?;
     let remote = dialer.dial_udp(&first_target_addr.to_string()).await?;
     let remote = Arc::new(remote);
+    // Cache the socket family once; checking it per datagram would issue a
+    // `getsockname()` syscall on every packet.
+    let remote_is_ipv6 = crate::udp::socket_is_ipv6(&remote);
 
     let mut len_buf = [0u8; 2];
     recv_stream.read_exact(&mut len_buf).await?;
@@ -1220,11 +1278,12 @@ async fn handle_udp_relay(
     let mut data = Vec::with_capacity(consts::ETHERNET_MTU);
     data.resize(pkt_len, 0);
     recv_stream.read_exact(&mut data).await?;
-    crate::udp::send_to(&remote, &data, first_target_addr).await?;
+    crate::udp::send_to_addr(&remote, &data, first_target_addr, remote_is_ipv6).await?;
 
     // Bidirectional relay
     let mut quic_to_remote = {
         let remote = remote.clone();
+        let remote_is_ipv6 = remote_is_ipv6;
         let dns_cache = dns_cache.clone();
         let dns_resolving = dns_resolving.clone();
         tokio::spawn(async move {
@@ -1234,9 +1293,9 @@ async fn handle_udp_relay(
             // heap allocation on every UDP datagram in the hot loop.
             let mut t_addr_buf = String::with_capacity(64);
             // Local resolved-address cache: most UDP sessions talk to the same
-            // target, so this avoids repeated `Arc<str>` allocation + DNS lookup.
-            let mut local_resolved: std::collections::HashMap<(String, u16), SocketAddr> =
-                std::collections::HashMap::new();
+            // target, so this avoids repeated DNS lookups. Nested so that the
+            // lookup can borrow `t_addr_buf` instead of cloning it per packet.
+            let mut local_resolved: HashMap<String, HashMap<u16, SocketAddr>> = HashMap::new();
             loop {
                 // Each subsequent datagram: [trojanc_addr][len(2)][payload]
                 let t_port =
@@ -1257,9 +1316,13 @@ async fn handle_udp_relay(
                     break;
                 }
 
-                // Fast local cache: avoid DNS lookup + Arc<str> allocation for
-                // the common case where all datagrams go to the same target.
-                let target = if let Some(&cached) = local_resolved.get(&(t_addr_buf.clone(), t_port)) {
+                // Fast local cache: borrowed lookup avoids the per-packet
+                // `String` clone the previous flat map required.
+                let target = if let Some(cached) = local_resolved
+                    .get(t_addr_buf.as_str())
+                    .and_then(|ports| ports.get(&t_port))
+                    .copied()
+                {
                     cached
                 } else {
                     let resolved = match resolve_udp_target(
@@ -1276,10 +1339,15 @@ async fn handle_udp_relay(
                             break;
                         }
                     };
-                    local_resolved.insert((t_addr_buf.clone(), t_port), resolved);
+                    local_resolved
+                        .entry(t_addr_buf.clone())
+                        .or_default()
+                        .insert(t_port, resolved);
                     resolved
                 };
-                if let Err(e) = crate::udp::send_to(&remote, &payload, target).await {
+                if let Err(e) =
+                    crate::udp::send_to_addr(&remote, &payload, target, remote_is_ipv6).await
+                {
                     tracing::debug!("UDP relay write error: {:?}", e);
                     break;
                 }
@@ -1420,7 +1488,7 @@ async fn resolve_udp_target(
 /// to amortise CSPRNG overhead.  Each salt has bytes [0..=1] = 0 and
 /// bytes [2..32] filled with random data (matching `generate_underlay_salt`).
 fn generate_salt_batch() -> Vec<[u8; 32]> {
-    const BATCH_SIZE: usize = 4096;
+    const BATCH_SIZE: usize = 64;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     // Generate all random bytes in one shot (30 random bytes × 4096 = 122880).
     use rand::RngCore;

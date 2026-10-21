@@ -58,8 +58,12 @@ impl InFlightUnderlayKey {
     }
 
     /// Wait for auth, then consume it only if `authenticate` succeeds.
-    /// The callback runs under the lock so concurrent packets cannot reuse auth.
-    /// It must not block or re-enter this table.
+    ///
+    /// The callback runs **outside** the table mutex. Auth is cloned under the
+    /// lock and removed afterwards only when it is still the same entry, so
+    /// two packets cannot both consume it and a failed check leaves it in
+    /// place for a later packet. The callback must not block or re-enter this
+    /// table; it may do HKDF and decryption.
     pub async fn evict<T>(
         &self,
         key: &InFlightKey,
@@ -67,12 +71,36 @@ impl InFlightUnderlayKey {
     ) -> Option<(UnderlayAuth, T)> {
         let deadline = tokio::time::Instant::now() + self.evict_timeout;
         loop {
+            let claimed = {
+                let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((auth, inserted_at)) = map.auth.get(key) {
+                    Some((auth.clone(), *inserted_at))
+                } else {
+                    None
+                }
+            };
+            if let Some((auth, inserted_at)) = claimed {
+                // Decrypt / derive outside the lock. A failed check must not
+                // remove the entry: another packet may still authenticate it.
+                let Some(verified) = authenticate(&auth) else {
+                    return None;
+                };
+                let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+                match map.auth.get(key) {
+                    Some((_, stored_at)) if *stored_at == inserted_at => {
+                        map.auth.remove(key);
+                        return Some((auth, verified));
+                    }
+                    // Replaced, expired, or already consumed by a peer packet.
+                    _ => return None,
+                }
+            }
+
             let wait = {
                 let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((auth, _)) = map.auth.get(key) {
-                    let verified = authenticate(auth)?;
-                    let (auth, _) = map.auth.remove(key).unwrap();
-                    return Some((auth, verified));
+                // Auth may have arrived between the claim attempt and here.
+                if map.auth.contains_key(key) {
+                    continue;
                 }
                 if !map.waiting.contains_key(key)
                     && map.waiting.len() >= consts::MAX_IN_FLIGHT_UNDERLAY_ENTRIES

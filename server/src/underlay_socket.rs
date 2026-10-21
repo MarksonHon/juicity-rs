@@ -33,14 +33,16 @@ pub struct UnderlayPacket {
 pub const UNDERLAY_CHANNEL_CAPACITY: usize = 4096;
 
 /// Max recv batches processed in one `poll_recv` call before yielding.
-/// Prevents sustained non-QUIC traffic from monopolizing a runtime worker.
-const MAX_DEMUX_BATCHES_PER_POLL: usize = 8;
+///
+/// Two is enough to see a QUIC datagram queued behind a single non-QUIC one
+/// (they often arrive as separate `recvmmsg` results) without letting an
+/// underlay flood copy an unbounded number of packets inside Quinn's poll.
+const MAX_DEMUX_BATCHES_PER_POLL: usize = 2;
 
 /// Max consecutive polls with zero QUIC packets before yielding the runtime worker.
-/// Combined with [`MAX_DEMUX_BATCHES_PER_POLL`], this caps worst-case busy spins at
-/// `MAX_DEMUX_BATCHES_PER_POLL × MAX_IDLE_POLL_BEFORE_YIELD` (32) non-QUIC recv
-/// batches before yielding.
-const MAX_IDLE_POLL_BEFORE_YIELD: usize = 4;
+/// Combined with [`MAX_DEMUX_BATCHES_PER_POLL`], a pure underlay flood yields
+/// after one extra poll (2 batches) instead of spinning the worker.
+const MAX_IDLE_POLL_BEFORE_YIELD: usize = 1;
 
 /// Counts dropped non-QUIC packets when underlay channel is full.
 /// Used to rate-limit warning logs under burst traffic.
@@ -192,13 +194,10 @@ impl AsyncUdpSocket for DemuxUdpSocket {
 
         // Exhausted the per-call batch budget without finding any QUIC packet.
         //
-        // Under non-QUIC traffic flood the inner socket always has data ready,
-        // so every Quinn re-poll will burn through another 8 batches of non-QUIC
-        // packets and immediately wake itself again, causing a busy loop.
-        //
-        // We use an idle-poll counter to detect this situation and eventually
-        // yield the runtime worker without re-waking, allowing other tasks to
-        // make progress.
+        // Under a non-QUIC flood the inner socket stays ready, so re-waking
+        // Quinn on every poll busy-loops one worker on packet copies.
+        // After one such poll, yield without re-waking and let the runtime
+        // reschedule this task.
         let idle_count = self.idle_poll_count.fetch_add(1, Ordering::Relaxed);
         if idle_count >= MAX_IDLE_POLL_BEFORE_YIELD {
             // Too many consecutive idle polls — yield control.  The inner socket
