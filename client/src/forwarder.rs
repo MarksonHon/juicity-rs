@@ -256,9 +256,9 @@ struct UdpSession {
     /// Unique session ID, used by the supervisor to verify it is removing the
     /// correct entry from the sessions map (prevents races with session replacement).
     id: u64,
-    /// Last time a datagram was forwarded through this session.
-    /// Stored as epoch millis (AtomicU64) so updates don't need a Mutex.
-    last_used_epoch_ms: StdAtomicU64,
+    /// Milliseconds since [`now_millis`]' monotonic base at the last datagram.
+    /// Atomic so the hot path can refresh it without a mutex.
+    last_used_ms: StdAtomicU64,
     /// Sender channel to push outbound datagrams to the QUIC writer task.
     /// `try_send` is used on the hot path to avoid blocking the receive loop.
     tx: tokio::sync::mpsc::Sender<Bytes>,
@@ -266,25 +266,17 @@ struct UdpSession {
 
 impl UdpSession {
     fn touch(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_used_epoch_ms.store(now, Ordering::Relaxed);
+        self.last_used_ms.store(now_millis(), Ordering::Relaxed);
     }
+}
 
-    fn last_used(&self) -> Option<Instant> {
-        let ms = self.last_used_epoch_ms.load(Ordering::Relaxed);
-        // Convert epoch millis back to Instant via UNIX_EPOCH.
-        // This is approximate but sufficient for idle detection.
-        Instant::now().checked_sub(std::time::Duration::from_millis(
-            (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64)
-                .saturating_sub(ms),
-        ))
-    }
+/// Milliseconds since a process-wide monotonic base.
+///
+/// Avoids the two `SystemTime::now()` calls (plus epoch conversions) the
+/// previous implementation performed on every datagram and cleanup pass.
+fn now_millis() -> u64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Start a UDP forwarder for a single entry.
@@ -301,10 +293,13 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
     );
 
     let (host, port) = parse_target(&entry.target)?;
-    let host = Arc::from(host);
+    let host: Arc<str> = Arc::from(host);
 
     // DashMap: sharded concurrent HashMap, no global Mutex on the hot path.
     let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());
+    // Sources whose QUIC stream is being opened. The recv loop must not await
+    // that handshake, or one new session stalls every other datagram.
+    let opening: Arc<DashMap<SocketAddr, ()>> = Arc::new(DashMap::new());
 
     // Monotonically increasing session ID counter.
     let session_seq = AtomicU64::new(1);
@@ -320,11 +315,13 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
                     tokio::time::interval(consts::CLIENT_UDP_SESSION_CLEANUP_INTERVAL);
                 loop {
                     interval.tick().await;
-                    let idle_cutoff = Instant::now().checked_sub(consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT);
+                    let now_ms = now_millis();
+                    let idle_ms =
+                        consts::CLIENT_UDP_SESSION_IDLE_TIMEOUT.as_millis() as u64;
                     sessions.retain(|_, s| {
-                        !s.tx.is_closed() && idle_cutoff.is_none_or(|cutoff| {
-                            s.last_used().is_some_and(|last_used| last_used > cutoff)
-                        })
+                        !s.tx.is_closed()
+                            && now_ms.saturating_sub(s.last_used_ms.load(Ordering::Relaxed))
+                                <= idle_ms
                     });
                 }
             }
@@ -350,19 +347,95 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
         // ── Fast path: session exists, try_send (non-blocking) ──
         if let Some(session) = sessions.get(&src_addr) {
             session.touch();
-            if session.tx.try_send(data.clone()).is_ok() {
-                continue;
+            match session.tx.try_send(data) {
+                Ok(()) => continue,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // UDP semantics: drop instead of rebuilding the session
+                    // inline, which would stall the shared receive loop.
+                    tracing::debug!(
+                        source = %src_addr,
+                        "UDP forward queue full; dropping datagram"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(data)) => {
+                    let session_id = session.id;
+                    drop(session);
+                    if let Some(entry) = sessions.get(&src_addr) {
+                        if entry.id == session_id {
+                            drop(entry);
+                            sessions.remove(&src_addr);
+                        }
+                    }
+                    spawn_udp_forward_session(
+                        sessions.clone(),
+                        opening.clone(),
+                        socket.clone(),
+                        client.clone(),
+                        host.clone(),
+                        port,
+                        src_addr,
+                        data,
+                        &session_seq,
+                        cancel.clone(),
+                    );
+                    continue;
+                }
             }
-            // Channel full or closed — fall through to session recreation.
-            // The writer/reader tasks will detect the closed channel and exit
-            // on their own; we just replace the entry below.
-            drop(session); // release DashMap ref before insert
         }
 
-        // ── Slow path: create a new session (low frequency) ──
-        // `open_udp_stream` already writes the stream header *and* the first
-        // datagram, so there is nothing more to send here. Do not re-send the
-        // first packet or the target would receive a duplicate datagram.
+        // ── Slow path: open the stream off this loop (low frequency) ──
+        spawn_udp_forward_session(
+            sessions.clone(),
+            opening.clone(),
+            socket.clone(),
+            client.clone(),
+            host.clone(),
+            port,
+            src_addr,
+            data,
+            &session_seq,
+            cancel.clone(),
+        );
+    }
+}
+
+/// Open one UDP session without blocking the shared receive loop.
+///
+/// `open_udp_stream` already writes the stream header and the first datagram,
+/// so that packet is not sent again. Datagrams that arrive while the handshake
+/// is in progress are dropped; a second open for the same source is not started.
+fn spawn_udp_forward_session(
+    sessions: Arc<DashMap<SocketAddr, UdpSession>>,
+    opening: Arc<DashMap<SocketAddr, ()>>,
+    socket: Arc<UdpSocket>,
+    client: JuicityClient,
+    host: Arc<str>,
+    port: u16,
+    src_addr: SocketAddr,
+    data: Bytes,
+    session_seq: &AtomicU64,
+    cancel: CancellationToken,
+) {
+    if opening.insert(src_addr, ()).is_some() {
+        return;
+    }
+    let session_id = session_seq.fetch_add(1, Ordering::Relaxed);
+    tokio::spawn(async move {
+        struct OpeningGuard {
+            opening: Arc<DashMap<SocketAddr, ()>>,
+            src: SocketAddr,
+        }
+        impl Drop for OpeningGuard {
+            fn drop(&mut self) {
+                self.opening.remove(&self.src);
+            }
+        }
+        let _opening_guard = OpeningGuard {
+            opening,
+            src: src_addr,
+        };
+
         let (send, mut recv) = match client.open_udp_stream(&host, port, &data[..]).await {
             Ok(pair) => pair,
             Err(e) => {
@@ -371,33 +444,27 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
                     protocol = "udp",
                     "UDP forward stream open error"
                 );
-                continue;
+                return;
             }
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
-        let session_id = session_seq.fetch_add(1, Ordering::Relaxed);
-
         sessions.insert(
             src_addr,
             UdpSession {
                 id: session_id,
-                last_used_epoch_ms: StdAtomicU64::new(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                ),
-                tx: tx.clone(),
+                last_used_ms: StdAtomicU64::new(now_millis()),
+                tx,
             },
         );
 
-        // Spawn writer task: reads from channel and sends via QUIC.
-        // One task per session (not per packet).
         let writer_handle = tokio::spawn({
             let host = host.clone();
             async move {
                 let mut addr_buf = Vec::with_capacity(32);
+                // The forward target is fixed for the lifetime of the session,
+                // so parse it once instead of on every datagram.
+                let cached_addr = protocol::CachedAddr::from_host_port(&host, port);
                 // RAII guard: ensure send.finish() is called even when this task is
                 // aborted (e.g. via cancel).  Without this, the QUIC send stream
                 // would be left in a half-closed state until the connection idle
@@ -413,30 +480,35 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
                     }
                 }
                 let mut guard = SendGuard { send: Some(send) };
+                // Reusable idle timer: one registration per session instead of
+                // one timer per datagram.
+                let idle = tokio::time::sleep(consts::DEFAULT_NAT_TIMEOUT);
+                tokio::pin!(idle);
                 loop {
-                    match tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, rx.recv()).await {
-                        Ok(Some(datagram)) => {
-                            if JuicityClient::send_udp_datagram(
-                                guard.send.as_mut().unwrap(),
-                                &host,
-                                port,
-                                &datagram[..],
-                                &mut addr_buf,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(_) => break, // NAT timeout
+                    let datagram = tokio::select! {
+                        item = rx.recv() => match item {
+                            Some(datagram) => datagram,
+                            None => break,
+                        },
+                        _ = &mut idle => break, // NAT timeout
+                    };
+                    idle.as_mut()
+                        .reset(tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT);
+                    if JuicityClient::send_udp_datagram(
+                        guard.send.as_mut().unwrap(),
+                        &cached_addr,
+                        &datagram[..],
+                        &mut addr_buf,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
                     }
                 }
             }
         });
 
-        // Spawn reader task: reads responses from QUIC and sends back to local UDP.
         let reader_handle = tokio::spawn({
             let socket = socket.clone();
             async move {
@@ -458,7 +530,6 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
         // or abort both immediately if the parent forwarder has been cancelled.
         tokio::spawn({
             let sessions = sessions.clone();
-            let cancel_token = cancel.clone();
             async move {
                 let mut writer = writer_handle;
                 let mut reader = reader_handle;
@@ -471,7 +542,7 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
                         writer.abort();
                         let _ = writer.await;
                     }
-                    _ = cancel_token.cancelled() => {
+                    _ = cancel.cancelled() => {
                         writer.abort();
                         reader.abort();
                     }
@@ -486,7 +557,7 @@ async fn start_udp_forward(entry: ForwardEntry, client: JuicityClient) -> anyhow
                 }
             }
         });
-    }
+    });
 }
 
 /// Read one UDP response from a QUIC recv stream.
@@ -498,22 +569,17 @@ async fn read_one_udp_response(
     recv: &mut quinn::RecvStream,
     buf: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
+    // One deadline covers address + length + payload, so a datagram registers
+    // a single timer instead of three.
+    let deadline = tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT;
     // Discard the per-response address — the session already knows the target
-    tokio::time::timeout(
-        consts::DEFAULT_NAT_TIMEOUT,
-        protocol::read_trojanc_addr_async(recv),
-    )
-    .await??;
+    tokio::time::timeout_at(deadline, protocol::read_trojanc_addr_async(recv)).await??;
 
     let mut len_buf = [0u8; 2];
-    tokio::time::timeout(consts::DEFAULT_NAT_TIMEOUT, recv.read_exact(&mut len_buf)).await??;
+    tokio::time::timeout_at(deadline, recv.read_exact(&mut len_buf)).await??;
     let pkt_len = u16::from_be_bytes(len_buf) as usize;
     buf.resize(pkt_len, 0);
-    tokio::time::timeout(
-        consts::DEFAULT_NAT_TIMEOUT,
-        recv.read_exact(&mut buf[..pkt_len]),
-    )
-    .await??;
+    tokio::time::timeout_at(deadline, recv.read_exact(&mut buf[..pkt_len])).await??;
 
     Ok(())
 }
