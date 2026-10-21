@@ -13,6 +13,16 @@ use uuid::Uuid;
 struct ReconnectState {
     last_failure: Option<(std::time::Instant, Arc<anyhow::Error>)>,
     attempts: u32,
+    /// Set while one task is dialing. Other callers wait on [`ReconnectState::done`]
+    /// instead of starting a second handshake.
+    in_flight: bool,
+    /// True when any joined caller was a real `connect` (not only `preconnect`).
+    /// A preconnect-only attempt must not arm backoff.
+    record_failure: bool,
+    /// Woken when the in-flight attempt publishes a connection or a failure.
+    /// Registered before the reconnect lock is released so a completion cannot
+    /// be missed.
+    done: Option<Arc<tokio::sync::Notify>>,
 }
 
 fn parse_server(server: &str, sni: &str) -> anyhow::Result<(String, u16, String)> {
@@ -344,27 +354,112 @@ impl JuicityClient {
     }
 
     async fn connect_inner(&self, record_failure: bool) -> anyhow::Result<Connection> {
+        if let Some(conn) = self.live_connection().await {
+            return Ok(conn);
+        }
+
+        // Decide under the lock, then dial outside it. A burst of new streams
+        // shares one handshake instead of each holding the mutex across DNS.
+        // Looped so a preconnect that failed without backoff can be retried
+        // here without a recursive async call.
+        loop {
+            let notify = {
+                let mut reconnect = self.reconnect_lock.lock().await;
+                if let Some(conn) = self.live_connection().await {
+                    return Ok(conn);
+                }
+                if let Some((last, error)) = &reconnect.last_failure {
+                    if last.elapsed() < reconnect_delay(reconnect.attempts) {
+                        return Err(anyhow::anyhow!("{error:#}"));
+                    }
+                }
+                if reconnect.in_flight {
+                    let notify = reconnect
+                        .done
+                        .clone()
+                        .expect("in-flight reconnect always has a completion notify");
+                    // A real request joining a preconnect still records the failure.
+                    if record_failure {
+                        reconnect.record_failure = true;
+                    }
+                    // Subscribe before unlocking. Notify stores the permit if the
+                    // leader finishes (and notifies) before this future is polled.
+                    let notified = notify.notified_owned();
+                    drop(reconnect);
+                    match self.wait_for_reconnect(notified).await? {
+                        WaitReconnect::Ready(conn) => return Ok(conn),
+                        WaitReconnect::Retry => continue,
+                    }
+                }
+                let notify = Arc::new(tokio::sync::Notify::new());
+                reconnect.in_flight = true;
+                reconnect.record_failure = record_failure;
+                reconnect.done = Some(notify.clone());
+                notify
+            };
+
+            return self.lead_reconnect(notify).await;
+        }
+    }
+
+    async fn live_connection(&self) -> Option<Connection> {
+        let guard = self.connection.read().await;
+        guard
+            .as_ref()
+            .filter(|conn| conn.close_reason().is_none())
+            .cloned()
+    }
+
+    /// Wait until the leader publishes a connection or a failure.
+    ///
+    /// `notified` was registered while `reconnect_lock` was still held, so a
+    /// completion cannot land in the gap before this wait.
+    async fn wait_for_reconnect(
+        &self,
+        notified: tokio::sync::futures::OwnedNotified,
+    ) -> anyhow::Result<WaitReconnect> {
+        tokio::pin!(notified);
+        if let Some(conn) = self.live_connection().await {
+            return Ok(WaitReconnect::Ready(conn));
+        }
         {
-            let guard = self.connection.read().await;
-            if let Some(conn) = guard.as_ref().filter(|conn| conn.close_reason().is_none()) {
-                return Ok(conn.clone());
+            let reconnect = self.reconnect_lock.lock().await;
+            if !reconnect.in_flight {
+                if let Some(conn) = self.live_connection().await {
+                    return Ok(WaitReconnect::Ready(conn));
+                }
+                if let Some((_, error)) = reconnect.last_failure.as_ref() {
+                    return Err(anyhow::anyhow!("{error:#}"));
+                }
+                // Leader was a preconnect that failed without recording backoff.
+                return Ok(WaitReconnect::Retry);
             }
         }
-
-        let mut reconnect = self.reconnect_lock.lock().await;
-        {
-            let guard = self.connection.read().await;
-            if let Some(conn) = guard.as_ref().filter(|conn| conn.close_reason().is_none()) {
-                return Ok(conn.clone());
-            }
+        notified.await;
+        if let Some(conn) = self.live_connection().await {
+            return Ok(WaitReconnect::Ready(conn));
         }
-
-        if let Some((last, error)) = &reconnect.last_failure {
-            if last.elapsed() < reconnect_delay(reconnect.attempts) {
-                return Err(anyhow::anyhow!("{error:#}"));
-            }
+        let reconnect = self.reconnect_lock.lock().await;
+        if let Some((_, error)) = reconnect.last_failure.as_ref() {
+            return Err(anyhow::anyhow!("{error:#}"));
         }
+        // Failure was not recorded (preconnect). Retry as a real request.
+        Ok(WaitReconnect::Retry)
+    }
 
+    /// Dial without holding `reconnect_lock`. The guard clears `in_flight` if
+    /// this task is cancelled before it publishes a result.
+    async fn lead_reconnect(
+        &self,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> anyhow::Result<Connection> {
+        let guard = ReconnectGuard {
+            state: &self.reconnect_lock,
+            disarmed: false,
+        };
+
+        // Drop the stale connection before dialing. The reconnect lock is not
+        // held across these awaits.
         *self.connection.write().await = None;
         *self.auth_uni_stream.lock().await = None;
 
@@ -387,21 +482,33 @@ impl JuicityClient {
         let (quinn_conn, uni) = match connect_result {
             Ok(pair) => pair,
             Err(error) => {
-                if record_failure {
+                let mut reconnect = self.reconnect_lock.lock().await;
+                if reconnect.record_failure {
                     reconnect.last_failure =
                         Some((std::time::Instant::now(), Arc::new(anyhow::anyhow!("{error:#}"))));
                     reconnect.attempts = reconnect.attempts.saturating_add(1);
                 }
+                reconnect.in_flight = false;
+                reconnect.done = None;
+                drop(reconnect);
+                guard.disarm();
+                notify.notify_waiters();
                 return Err(error);
             }
         };
 
         tracing::info!("Authenticated as user {}", self.uuid);
 
-        // Publish only after the auth stream is available to concurrent callers.
+        // The auth stream must be stored before the connection is visible.
+        // Clearing `in_flight` in the same critical section as the publish
+        // stops a waiter from observing the connection and starting another dial.
         *self.auth_uni_stream.lock().await = Some(uni);
+        let mut reconnect = self.reconnect_lock.lock().await;
         *self.connection.write().await = Some(quinn_conn.clone());
         *reconnect = ReconnectState::default();
+        drop(reconnect);
+        guard.disarm();
+        notify.notify_waiters();
 
         Ok(quinn_conn)
     }
@@ -504,28 +611,21 @@ impl JuicityClient {
     /// Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
     /// No leading network byte — each datagram carries only its own address.
     ///
-    /// The `addr_buf` is a reusable scratch buffer to avoid per-packet heap
-    /// allocation. It is cleared before each use.
-    /// Send a subsequent UDP datagram on an existing stream.
-    ///
-    /// Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
-    /// No leading network byte — each datagram carries only its own address.
-    ///
-    /// The `addr_buf` is a reusable scratch buffer to avoid per-packet heap
+    /// `cached` is the pre-parsed destination address; callers should build it
+    /// once per session instead of re-parsing the host on every packet. The
+    /// `addr_buf` is a reusable scratch buffer to avoid per-packet heap
     /// allocation. All three wire segments are batched into a single
     /// `write_all` call to minimise QUIC stream lock acquisitions.
     /// Reject payloads above 65535 bytes without writing or changing `addr_buf`.
     pub async fn send_udp_datagram(
         send: &mut SendStream,
-        addr: &str,
-        port: u16,
+        cached: &protocol::CachedAddr,
         data: &[u8],
         addr_buf: &mut Vec<u8>,
     ) -> anyhow::Result<()> {
         let len = udp_packet_len(data)?;
-        let cached = protocol::CachedAddr::from_host_port(addr, port);
         addr_buf.clear();
-        protocol::build_trojanc_addr_cached(addr_buf, &cached)?;
+        protocol::build_trojanc_addr_cached(addr_buf, cached)?;
         // Batch address header + length + payload into a single write_all
         // to reduce QUIC stream lock acquisitions from 3 to 1.
         let total_len = addr_buf.len() + 2 + data.len();
@@ -534,6 +634,39 @@ impl JuicityClient {
         addr_buf.extend_from_slice(data);
         send.write_all(addr_buf).await?;
         Ok(())
+    }
+}
+
+/// Clears an in-flight reconnect when the leader is dropped before it
+/// publishes a result (task cancellation). Waiters then retry.
+enum WaitReconnect {
+    Ready(Connection),
+    /// The in-flight attempt ended without a connection and without backoff.
+    Retry,
+}
+
+struct ReconnectGuard<'a> {
+    state: &'a tokio::sync::Mutex<ReconnectState>,
+    disarmed: bool,
+}
+
+impl ReconnectGuard<'_> {
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for ReconnectGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if let Ok(mut reconnect) = self.state.try_lock() {
+            reconnect.in_flight = false;
+            if let Some(notify) = reconnect.done.take() {
+                notify.notify_waiters();
+            }
+        }
     }
 }
 
