@@ -1,8 +1,8 @@
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::watch;
 use tokio::time::Instant;
 
 /// Keep the reverse direction alive after EOF, and expire only when neither
@@ -20,21 +20,28 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (remote_reader, remote_writer) = tokio::io::split(remote);
-    let (activity, mut last_activity) = watch::channel(Instant::now());
+    // Last-progress timestamp encoded as "milliseconds since `base` + 1".
+    // A plain atomic keeps the per-chunk cost to one store; the previous
+    // `watch` channel took an internal lock on every read and write.
+    let base = Instant::now();
+    let activity = AtomicU64::new(1);
     let copy = async {
         tokio::try_join!(
-            copy_direction(reader, remote_writer, &activity),
-            copy_direction(remote_reader, writer, &activity),
+            copy_direction(reader, remote_writer, &activity, base),
+            copy_direction(remote_reader, writer, &activity, base),
         )?;
         Ok(())
     };
     let idle = async {
+        let mut last = activity.load(Ordering::Relaxed);
         loop {
-            let deadline = *last_activity.borrow_and_update() + idle_timeout;
+            let deadline = base + Duration::from_millis(last) + idle_timeout;
             tokio::time::sleep_until(deadline).await;
-            if !last_activity.has_changed().unwrap_or(false) {
+            let current = activity.load(Ordering::Relaxed);
+            if current == last {
                 break;
             }
+            last = current;
         }
     };
 
@@ -47,7 +54,8 @@ where
 async fn copy_direction<R, W>(
     mut reader: R,
     mut writer: W,
-    activity: &watch::Sender<Instant>,
+    activity: &AtomicU64,
+    base: Instant,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -59,14 +67,14 @@ where
         if n == 0 {
             return writer.shutdown().await;
         }
-        activity.send_replace(Instant::now());
+        activity.store(base.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
         let mut remaining = &buf[..n];
         while !remaining.is_empty() {
             let written = writer.write(remaining).await?;
             if written == 0 {
                 return Err(io::ErrorKind::WriteZero.into());
             }
-            activity.send_replace(Instant::now());
+            activity.store(base.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
             remaining = &remaining[written..];
         }
     }
