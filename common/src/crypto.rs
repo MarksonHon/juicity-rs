@@ -28,7 +28,7 @@ pub mod aead {
     use aes_gcm::aead::{AeadInPlace, KeyInit};
     use aes_gcm::{Aes128Gcm, Nonce};
     use hkdf::Hkdf;
-    use rand::RngCore;
+    use rand::RngExt;
     use sha2::Sha256;
 
     /// Derive a key using standard HKDF with SHA-256
@@ -95,7 +95,7 @@ pub mod aead {
     /// Generate random bytes
     pub fn random_bytes<const N: usize>() -> [u8; N] {
         let mut buf = [0u8; N];
-        rand::thread_rng().fill_bytes(&mut buf);
+        rand::rng().fill(&mut buf);
         buf
     }
 }
@@ -191,7 +191,7 @@ pub mod juicity_underlay {
     use chacha20poly1305::aead::Aead;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
     use hkdf::Hkdf;
-    use rand::RngCore;
+    use rand::RngExt;
     use sha1::Sha1;
 
     pub const SALT_LEN: usize = 32;
@@ -221,7 +221,7 @@ pub mod juicity_underlay {
         // Keep this behavior aligned with upstream implementation.
         salt[0] = 0;
         salt[1] = 0;
-        rand::thread_rng().fill_bytes(&mut salt[2..]);
+        rand::rng().fill(&mut salt[2..]);
         salt
     }
 

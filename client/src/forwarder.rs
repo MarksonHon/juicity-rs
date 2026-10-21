@@ -513,9 +513,19 @@ fn spawn_udp_forward_session(
             let socket = socket.clone();
             async move {
                 let mut recv_buf = Vec::with_capacity(65535);
+                // One idle timer for the whole reader, reset per datagram.
+                let idle = tokio::time::sleep(consts::DEFAULT_NAT_TIMEOUT);
+                tokio::pin!(idle);
                 loop {
-                    match read_one_udp_response(&mut recv, &mut recv_buf).await {
+                    let read = tokio::select! {
+                        result = read_one_udp_response(&mut recv, &mut recv_buf) => result,
+                        _ = &mut idle => break,
+                    };
+                    match read {
                         Ok(()) => {
+                            idle.as_mut().reset(
+                                tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT,
+                            );
                             if socket.send_to(&recv_buf, src_addr).await.is_err() {
                                 break;
                             }
@@ -569,17 +579,15 @@ async fn read_one_udp_response(
     recv: &mut quinn::RecvStream,
     buf: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
-    // One deadline covers address + length + payload, so a datagram registers
-    // a single timer instead of three.
-    let deadline = tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT;
-    // Discard the per-response address — the session already knows the target
-    tokio::time::timeout_at(deadline, protocol::read_trojanc_addr_async(recv)).await??;
+    // Idle timeout is enforced by the caller's reusable timer.
+    // Discard the per-response address — the session already knows the target.
+    protocol::read_trojanc_addr_async(recv).await?;
 
     let mut len_buf = [0u8; 2];
-    tokio::time::timeout_at(deadline, recv.read_exact(&mut len_buf)).await??;
+    recv.read_exact(&mut len_buf).await?;
     let pkt_len = u16::from_be_bytes(len_buf) as usize;
     buf.resize(pkt_len, 0);
-    tokio::time::timeout_at(deadline, recv.read_exact(&mut buf[..pkt_len])).await??;
+    recv.read_exact(&mut buf[..pkt_len]).await?;
 
     Ok(())
 }

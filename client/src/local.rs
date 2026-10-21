@@ -289,6 +289,9 @@ async fn handle_socks5(
             // not serialise behind a single async mutex.
             let sessions: Arc<DashMap<SocketAddr, UdpSessionEntry>> =
                 Arc::new(DashMap::new());
+            // Sources whose QUIC stream is being opened. The recv loop must not
+            // await that handshake, or one new target stalls every other source.
+            let opening: Arc<DashMap<SocketAddr, ()>> = Arc::new(DashMap::new());
             let session_seq = Arc::new(AtomicU64::new(1));
 
             // ctrl_cancel is signalled when the TCP control connection drops.
@@ -342,6 +345,7 @@ async fn handle_socks5(
                 // When this task exits (any path), cancel_guard fires and cancels all
                 // session supervisors, releasing their Arc references promptly.
                 let _cancel_guard = cancel_guard;
+                let opening = opening.clone();
                 let mut buf = vec![0u8; consts::MAX_UDP_PAYLOAD];
                 // Use a persistent sleep_until so the timer is only created once and
                 // can be reset on each received datagram without recreating the future.
@@ -399,34 +403,18 @@ async fn handle_socks5(
                                         remove_session_if_match(&sessions, src, session_id);
                                     }
 
-                                    let new_session_id = session_seq.fetch_add(1, Ordering::Relaxed);
-                                    match start_udp_assoc_session(
+                                    // Open off this loop. Datagrams that arrive
+                                    // during the handshake are dropped.
+                                    spawn_udp_assoc_session(
                                         client_clone.clone(),
                                         bind_socket_clone.clone(),
                                         sessions.clone(),
+                                        opening.clone(),
                                         src,
-                                        new_session_id,
                                         datagram,
+                                        session_seq.clone(),
                                         session_cancel.clone(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(tx) => {
-                                            sessions.insert(
-                                                src,
-                                                UdpSessionEntry {
-                                                    id: new_session_id,
-                                                    last_used_epoch_ms: AtomicU64::new(
-                                                        now_epoch_ms(),
-                                                    ),
-                                                    tx,
-                                                },
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::info!(error = %e, "UDP ASSOCIATE session open error");
-                                        }
-                                    }
+                                    );
                                 }
                                 Err(e) => {
                                     tracing::info!(error = %e, "UDP read error");
@@ -464,41 +452,81 @@ async fn handle_socks5(
     Ok(())
 }
 
-async fn start_udp_assoc_session(
+/// Open one UDP ASSOCIATE session without blocking the shared receive loop.
+///
+/// `open_udp_stream` already writes the stream header and the first datagram,
+/// so that packet is not sent again. A second open for the same source is not
+/// started while one is in progress.
+fn spawn_udp_assoc_session(
     client: JuicityClient,
     bind_socket: Arc<UdpSocket>,
     sessions: Arc<DashMap<SocketAddr, UdpSessionEntry>>,
+    opening: Arc<DashMap<SocketAddr, ()>>,
     local_client_addr: SocketAddr,
-    session_id: u64,
     first_datagram: UdpOutboundDatagram,
+    session_seq: Arc<AtomicU64>,
     cancel: CancellationToken,
-) -> anyhow::Result<mpsc::Sender<UdpOutboundDatagram>> {
-    let (send, mut recv) = client
-        .open_udp_stream(
-            &first_datagram.addr,
-            first_datagram.port,
-            &first_datagram.payload[..],
-        )
-        .await?;
-
-    let (tx, mut rx) = mpsc::channel::<UdpOutboundDatagram>(256);
-
-    let sessions_for_supervisor = sessions.clone();
-    let bind_socket_for_reader = bind_socket.clone();
-
+) {
+    if opening.insert(local_client_addr, ()).is_some() {
+        return;
+    }
+    let session_id = session_seq.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
-        // Reusable scratch buffer to avoid per-packet heap allocation for address headers.
-        let mut addr_buf = Vec::with_capacity(32);
-        let mut writer = tokio::spawn(async move {
-            // RAII guard: ensure send.finish() is called even when this task is
-            // aborted (e.g. via cancel).  Without this, the QUIC send stream
-            // would be left in a half-closed state until the connection idle
-            // timeout fires (up to 600s), holding stream resources unnecessarily.
-            struct SendGuard {
-                send: Option<quinn::SendStream>,
+        struct OpeningGuard {
+            opening: Arc<DashMap<SocketAddr, ()>>,
+            src: SocketAddr,
+        }
+        impl Drop for OpeningGuard {
+            fn drop(&mut self) {
+                self.opening.remove(&self.src);
             }
-            impl Drop for SendGuard {
-                fn drop(&mut self) {
+        }
+        let _opening_guard = OpeningGuard {
+            opening,
+            src: local_client_addr,
+        };
+
+        let (send, mut recv) = match client
+            .open_udp_stream(
+                &first_datagram.addr,
+                first_datagram.port,
+                &first_datagram.payload[..],
+            )
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::info!(error = %e, "UDP ASSOCIATE session open error");
+                return;
+            }
+        };
+
+        let (tx, mut rx) = mpsc::channel::<UdpOutboundDatagram>(256);
+        sessions.insert(
+            local_client_addr,
+            UdpSessionEntry {
+                id: session_id,
+                last_used_epoch_ms: AtomicU64::new(now_epoch_ms()),
+                tx,
+            },
+        );
+
+        let sessions_for_supervisor = sessions.clone();
+        let bind_socket_for_reader = bind_socket.clone();
+
+        tokio::spawn(async move {
+            // Reusable scratch buffer to avoid per-packet heap allocation for address headers.
+            let mut addr_buf = Vec::with_capacity(32);
+            let mut writer = tokio::spawn(async move {
+                // RAII guard: ensure send.finish() is called even when this task is
+                // aborted (e.g. via cancel).  Without this, the QUIC send stream
+                // would be left in a half-closed state until the connection idle
+                // timeout fires (up to 600s), holding stream resources unnecessarily.
+                struct SendGuard {
+                    send: Option<quinn::SendStream>,
+                }
+                impl Drop for SendGuard {
+                    fn drop(&mut self) {
                     if let Some(ref mut s) = self.send {
                         let _ = s.finish();
                     }
@@ -539,12 +567,20 @@ async fn start_udp_assoc_session(
             // Pre-allocate a reusable buffer (max UDP datagram size) to avoid
             // per-packet heap allocation inside the hot loop.
             let mut recv_buf = Vec::with_capacity(65535);
+            // One idle timer for the whole reader. Resetting it per datagram
+            // avoids registering a fresh timeout for every read.
+            let idle = tokio::time::sleep(consts::DEFAULT_NAT_TIMEOUT);
+            tokio::pin!(idle);
             loop {
-                let (resp_addr, resp_port) =
-                    match read_one_udp_response(&mut recv, &mut recv_buf).await {
+                let (resp_addr, resp_port) = tokio::select! {
+                    result = read_one_udp_response(&mut recv, &mut recv_buf) => match result {
                         Ok(v) => v,
                         Err(_) => break,
-                    };
+                    },
+                    _ = &mut idle => break,
+                };
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT);
 
                 let socks5_packet = build_socks5_udp_packet(&resp_addr, resp_port, &recv_buf);
                 if bind_socket_for_reader
@@ -576,8 +612,7 @@ async fn start_udp_assoc_session(
 
         remove_session_if_match(&sessions_for_supervisor, local_client_addr, session_id);
     });
-
-    Ok(tx)
+    });
 }
 
 async fn read_one_udp_response(
@@ -585,16 +620,15 @@ async fn read_one_udp_response(
     buf: &mut Vec<u8>,
 ) -> anyhow::Result<(String, u16)> {
     // Wire format (upstream-compatible): [trojanc_addr][len(2)][payload]
-    // One deadline covers all three reads: a datagram registers a single timer.
-    let deadline = tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT;
-    let (resp_addr, resp_port) =
-        tokio::time::timeout_at(deadline, protocol::read_trojanc_addr_async(recv)).await??;
+    // Idle timeout is enforced by the caller's reusable timer, so these reads
+    // do not each register one.
+    let (resp_addr, resp_port) = protocol::read_trojanc_addr_async(recv).await?;
 
     let mut len_buf = [0u8; 2];
-    tokio::time::timeout_at(deadline, recv.read_exact(&mut len_buf)).await??;
+    recv.read_exact(&mut len_buf).await?;
     let pkt_len = u16::from_be_bytes(len_buf) as usize;
     buf.resize(pkt_len, 0);
-    tokio::time::timeout_at(deadline, recv.read_exact(&mut buf[..pkt_len])).await??;
+    recv.read_exact(&mut buf[..pkt_len]).await?;
 
     Ok((resp_addr, resp_port))
 }

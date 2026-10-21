@@ -596,10 +596,6 @@ async fn run_underlay_packet_loop(
         if let Some(session) = sessions.get(&source) {
             if let Some(endpoint) = udp_pool.get_socket(&source) {
                 let mut payload = std::mem::take(&mut packet.payload);
-                // Save the salt before decrypting: the failure path restores
-                // the original salt-prefixed layout for the slow path.
-                let mut salt = [0u8; consts::UNDERLAY_SALT_LEN];
-                salt.copy_from_slice(&payload[..consts::UNDERLAY_SALT_LEN]);
                 if session.cipher.decrypt_in_place(&mut payload).is_ok() {
                     if crate::udp::send_to_addr(
                         &endpoint.socket,
@@ -618,11 +614,11 @@ async fn run_underlay_packet_loop(
                     sessions.invalidate(&source);
                     continue;
                 }
-                // Decryption failed for an existing session (e.g. the client
-                // re-keyed): restore the salt prefix and let the slow path
-                // re-authenticate this packet from scratch.
-                payload.splice(..0, salt);
-                packet.payload = payload;
+                // Decryption failed. `decrypt_in_place_detached` may have
+                // already overwritten the ciphertext, so the original packet
+                // cannot be rebuilt for the slow path. Drop it: a genuine
+                // re-key arrives as its own packet and is handled there.
+                continue;
             }
         }
 
@@ -898,22 +894,39 @@ async fn handle_non_quic_underlay_packet(
             // A small batch amortises CSPRNG overhead while keeping memory per
             // session low: 64 × 32 B = 2 KB (was 4096 × 32 B = 128 KB, which
             // could reach hundreds of MB across many NAT sessions).
-            let mut salt_pool = generate_salt_batch();
+            // Filled on the blocking pool: `rand::rng()` can block on entropy
+            // and must not stall a runtime worker.
+            let mut salt_pool = match tokio::task::spawn_blocking(generate_salt_batch).await {
+                Ok(batch) => batch,
+                Err(_) => return,
+            };
 
+            // One idle timer per session. `timeout()` would register and cancel
+            // a fresh timer for every response datagram.
+            let idle = tokio::time::sleep(consts::DEFAULT_NAT_TIMEOUT);
+            tokio::pin!(idle);
             loop {
-                match tokio::time::timeout(
-                    consts::DEFAULT_NAT_TIMEOUT,
-                    recv_socket.recv_from(&mut buf),
-                )
-                .await
-                {
-                    Ok(Ok((n, _))) => {
+                let recv = tokio::select! {
+                    result = recv_socket.recv_from(&mut buf) => result,
+                    _ = &mut idle => break,
+                };
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + consts::DEFAULT_NAT_TIMEOUT);
+                match recv {
+                    Ok((n, _)) => {
                         // Get a salt from the pre-generated pool; refill if empty.
-                        let salt = salt_pool.pop().unwrap_or_else(|| {
-                            let new_batch = generate_salt_batch();
-                            salt_pool = new_batch;
-                            salt_pool.pop().unwrap()
-                        });
+                        // Refill stays on the blocking pool so RNG seeding cannot
+                        // stall this worker.
+                        if salt_pool.is_empty() {
+                            salt_pool = match tokio::task::spawn_blocking(generate_salt_batch).await
+                            {
+                                Ok(batch) => batch,
+                                Err(_) => break,
+                            };
+                        }
+                        let Some(salt) = salt_pool.pop() else {
+                            break;
+                        };
                         // Pre-allocate with SALT_LEN headroom at front — avoids O(n) shift in encrypt_in_place
                         outbuf.clear();
                         outbuf.reserve(n + juicity_underlay::SALT_LEN + juicity_underlay::TAG_LEN);
@@ -935,11 +948,8 @@ async fn handle_non_quic_underlay_packet(
                             break;
                         }
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         tracing::debug!("underlay endpoint recv failed for {}: {:?}", source, e);
-                        break;
-                    }
-                    Err(_) => {
                         break;
                     }
                 }
@@ -1435,12 +1445,18 @@ async fn resolve_udp_target(
         let resolution = {
             let mut resolving = dns_resolving.lock().unwrap_or_else(|e| e.into_inner());
             {
+                // Copy the hit out and release the lock before the TTL check:
+                // every UDP stream of this connection shares this one mutex.
                 let mut cache = dns_cache.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((mapped, timestamp)) = cache.get(&key) {
-                    if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL {
-                        return Ok(*mapped);
+                let cached = cache.get(&key).copied();
+                match cached {
+                    Some((mapped, timestamp)) if timestamp.elapsed() < consts::UDP_DNS_CACHE_TTL => {
+                        return Ok(mapped);
                     }
-                    cache.swap_remove(&key);
+                    Some(_) => {
+                        cache.swap_remove(&key);
+                    }
+                    None => {}
                 }
             }
 
@@ -1484,16 +1500,18 @@ async fn resolve_udp_target(
     }
 }
 
-/// Pre-generate a batch of underlay salts using a single `fill_bytes` call
+/// Pre-generate a batch of underlay salts using a single `fill` call
 /// to amortise CSPRNG overhead.  Each salt has bytes [0..=1] = 0 and
 /// bytes [2..32] filled with random data (matching `generate_underlay_salt`).
+///
+/// Call from `spawn_blocking`: the RNG may block while seeding.
 fn generate_salt_batch() -> Vec<[u8; 32]> {
     const BATCH_SIZE: usize = 64;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
-    // Generate all random bytes in one shot (30 random bytes × 4096 = 122880).
-    use rand::RngCore;
+    // Generate all random bytes in one shot (30 random bytes × 64).
+    use rand::RngExt;
     let mut random_bytes = vec![0u8; BATCH_SIZE * 30];
-    rand::thread_rng().fill_bytes(&mut random_bytes);
+    rand::rng().fill(&mut random_bytes);
 
     for i in 0..BATCH_SIZE {
         let mut salt = [0u8; 32];

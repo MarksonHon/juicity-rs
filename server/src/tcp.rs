@@ -61,13 +61,19 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0; 16 * 1024];
+    // 64 KiB matches a typical QUIC stream chunk and cuts syscall/write
+    // round-trips versus the previous 16 KiB buffer on bulk transfers.
+    let mut buf = vec![0; 64 * 1024];
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             return writer.shutdown().await;
         }
         activity.store(base.elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+        // Write in chunks instead of one `write_all`: a slow peer can take
+        // longer than the idle timeout to drain a full buffer, and progress
+        // has to be recorded on every successful write or the relay is killed
+        // while it is still moving data.
         let mut remaining = &buf[..n];
         while !remaining.is_empty() {
             let written = writer.write(remaining).await?;
